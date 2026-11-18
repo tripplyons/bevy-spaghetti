@@ -12,6 +12,7 @@ mod meadow;
 mod player;
 mod props;
 mod reeds;
+mod stone_grade;
 mod understory;
 
 #[cfg(test)]
@@ -99,6 +100,7 @@ fn add_scene(app: &mut App) {
             understory::bend_understory,
             props::select_prop_detail.after(follow_hiker),
             meadow::part_meadow,
+            stone_grade::grade_stones,
         ),
     );
 }
