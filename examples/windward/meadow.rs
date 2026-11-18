@@ -63,7 +63,8 @@ impl Blade {
             let cross = tangent.cross(normal);
             let rotation = Quat::from_mat3(&Mat3::from_cols(cross, tangent, normal));
             let t = (from + to) * 0.5;
-            let shade = 0.64 + 0.36 * t.sqrt();
+            // Dense grass shades its own lower stems.
+            let shade = 0.44 + 0.56 * t.sqrt();
             let color = self.color.lerp(self.tip, t * t * 0.65) * shade;
             let sigma = width * self.width * 0.72;
             let mass = 8.0 * sigma * a.distance(b);
@@ -153,12 +154,14 @@ pub fn cover(at: Vec2) -> f32 {
 fn blade_color(at: Vec2, rng: &mut Rng) -> (Vec3, Vec3) {
     let lush = Vec3::new(0.050, 0.092, 0.022);
     let olive = Vec3::new(0.105, 0.118, 0.036);
-    let straw = Vec3::new(0.255, 0.198, 0.092);
+    let straw = Vec3::new(0.215, 0.188, 0.098);
     let dead = Vec3::new(0.120, 0.090, 0.055);
     let moisture = noise(at * 0.13 + Vec2::new(-4.0, 2.0));
+    // Late-summer subalpine meadows stay mostly green, with cured patches
+    // on the drier knolls.
     let dryness = smoothstep(
-        0.30,
-        0.82,
+        0.40,
+        0.90,
         noise(at * 0.37) * 0.55 + (1.0 - moisture) * 0.45,
     );
     let mut color = lush.lerp(olive, rng.next() * 0.8);
