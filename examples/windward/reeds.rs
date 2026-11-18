@@ -104,7 +104,7 @@ impl Blade {
                 Vec3::new(width, width * 0.67, width),
                 Quat::from_rotation_arc(Vec3::Y, axis),
                 tip.distance(start) * width * 6.3,
-                Vec3::new(0.14, 0.063, 0.027),
+                Vec3::new(0.045, 0.025, 0.014),
             ));
         }
     }

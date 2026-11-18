@@ -20,8 +20,10 @@ use crate::{
     player::HikerCamera,
 };
 
-const CENTER: Vec3 = Vec3::new(1.0, 3.5, -25.0);
-const SIZE: Vec3 = Vec3::new(124.0, 12.0, 116.0);
+// The box reaches well above the hill crests, so its faces never cut the
+// view as a hard line.
+const CENTER: Vec3 = Vec3::new(1.0, 14.0, -25.0);
+const SIZE: Vec3 = Vec3::new(124.0, 34.0, 116.0);
 
 /// Volumetric fog for sun shafts, and distance fog for aerial perspective.
 pub fn camera_haze() -> impl Bundle {
@@ -121,7 +123,7 @@ pub fn spawn_atmosphere(mut commands: Commands, mut images: ResMut<Assets<Image>
         Name::new("Low valley atmosphere"),
         FogVolume {
             density_texture: Some(images.add(density_map())),
-            density_factor: 0.11,
+            density_factor: 0.095,
             absorption: 0.11,
             scattering: 0.31,
             scattering_asymmetry: 0.59,

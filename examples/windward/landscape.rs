@@ -450,8 +450,10 @@ fn spawn_rocks(commands: &mut Commands, server: &AssetServer, obstacles: &mut Ob
             .with_rotation(Quat::from_rotation_y(hash01(index as u32 + 14) * 6.0));
         let lighting = SpaghettiLighting {
             direction_to_light: SUN,
-            ambient: Vec3::new(0.20, 0.235, 0.27),
-            directional: Vec3::new(0.52, 0.44, 0.34),
+            // Cooler than the scan's warm albedo, so the rock reads as grey
+            // Cascade andesite rather than red sandstone.
+            ambient: Vec3::new(0.21, 0.245, 0.29),
+            directional: Vec3::new(0.47, 0.45, 0.42),
         };
         commands
             .spawn((

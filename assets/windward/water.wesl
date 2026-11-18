@@ -122,7 +122,8 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
     // Waves need open water to build, and they die in the shallows.
     let calm = smoothstep(0.0, 0.25, depth);
     let gust = (0.74 + 0.22 * front_phase) * (1.0 - 0.52 * near_bank) * calm;
-    let slope_total = (slope + ripples) * gust;
+    // A sheltered tarn at dusk: gentle slopes keep the reflection readable.
+    let slope_total = (slope + ripples) * gust * 0.5;
     surface.N = normalize(vec3(-slope_total.x, 1.0, -slope_total.y));
     let cos_theta = clamp(dot(surface.V, surface.N), 0.0, 1.0);
     // Refraction keeps the underwater ray closer to vertical than the viewing
@@ -172,7 +173,8 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
     // thin film stays a mirror, and the rough soil's sky sheen would read
     // as a pale rim along the far bank.
     let grazing = smoothstep(0.6, 0.92, 1.0 - cos_theta);
-    let sheet = mix(smoothstep(0.0, 0.12, depth), 1.0, grazing);
+    // The grazing mirror starts only once the water is a few centimetres deep.
+    let sheet = mix(smoothstep(0.0, 0.12, depth), 1.0, grazing * smoothstep(0.02, 0.08, depth));
     let fresnel = (0.0204 + 0.9796 * pow(1.0 - cos_theta, 5.0)) * sheet;
     color = vec4(mix(color.rgb, reflected_color, valid * fresnel * 0.94), color.a);
     var out: FragmentOutput;
