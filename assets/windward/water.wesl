@@ -146,7 +146,12 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
     let film = smoothstep(0.0, 0.035, depth);
     let water_roughness = 0.105 + 0.028 * gust + 0.065 * near_bank;
     surface.material.perceptual_roughness = mix(0.67, water_roughness, film);
-    surface.material.reflectance = vec3(mix(0.29, 0.36, film));
+    // The planar mirror below supplies the water's reflection. In the
+    // shallows, where that mirror fades in, the environment map's sky-only
+    // specular would read as a pale band, so keep it low there. Open water
+    // keeps full specular for the sun's glitter on the ripples.
+    let open_water = smoothstep(0.12, 0.45, depth);
+    surface.material.reflectance = vec3(mix(0.29, mix(0.12, 0.36, open_water), film));
     var color = apply_pbr_lighting(surface);
     let projected = lake.reflected_clip_from_world * vertex.world_position;
     let mirror_uv = projected.xy / max(0.01, projected.w) * vec2(0.5, -0.5) + 0.5;
@@ -174,7 +179,7 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
     // as a pale rim along the far bank.
     let grazing = smoothstep(0.6, 0.92, 1.0 - cos_theta);
     // The grazing mirror starts only once the water is a few centimetres deep.
-    let sheet = mix(smoothstep(0.0, 0.12, depth), 1.0, grazing * smoothstep(0.02, 0.08, depth));
+    let sheet = mix(smoothstep(0.0, 0.05, depth), 1.0, grazing * smoothstep(0.02, 0.06, depth));
     let fresnel = (0.0204 + 0.9796 * pow(1.0 - cos_theta, 5.0)) * sheet;
     color = vec4(mix(color.rgb, reflected_color, valid * fresnel * 0.94), color.a);
     var out: FragmentOutput;
