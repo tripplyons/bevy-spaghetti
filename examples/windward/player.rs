@@ -122,7 +122,8 @@ pub fn spawn_hiker(
             },
         ))
         .observe(crate::landscape::mark_reflected_meshes)
-        .observe(start_animation);
+        .observe(start_animation)
+        .observe(crate::hair::grow_hair);
 }
 
 fn start_animation(

@@ -6,6 +6,7 @@ mod debris;
 mod detail;
 mod fern;
 mod forest;
+mod hair;
 mod lake;
 mod landscape;
 mod meadow;

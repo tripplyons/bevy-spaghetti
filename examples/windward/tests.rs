@@ -190,7 +190,8 @@ fn turn_hiker_to_camera(app: &mut App) {
     let mut hiker = world.query_filtered::<&mut Transform, With<Hiker>>();
     let mut hiker = hiker.single_mut(world).unwrap();
     hiker.rotate_y(std::f32::consts::PI);
-    for _ in 0..24 {
+    // Frame readback can lag by more than 24 updates.
+    for _ in 0..48 {
         app.update();
     }
 }
