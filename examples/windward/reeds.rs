@@ -73,8 +73,7 @@ impl Blade {
             let end = start + axis * link_length;
             let width = self.width * if self.cat_tail { 1.0 } else { 1.07 - 0.91 * t };
             let rotation = Quat::from_rotation_arc(Vec3::Y, axis) * self.twist_rotation;
-            let mut tint =
-                self.color * (0.52 + 0.72 * t) + Vec3::new(0.018, 0.022, 0.005) * t * t;
+            let mut tint = self.color * (0.52 + 0.72 * t) + Vec3::new(0.018, 0.022, 0.005) * t * t;
             if !self.cat_tail {
                 // Uneven pigment along the blade, and sun-bleached tips.
                 let mottle = (self.root.x * 913.7 + self.root.z * 377.1 + t * 23.0).sin();

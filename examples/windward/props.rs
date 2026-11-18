@@ -94,6 +94,35 @@ pub struct PropDetail {
     level: usize,
 }
 
+/// Ground taken by props and logs, so the meadow can leave it bare.
+#[derive(Resource, Default)]
+pub struct PropFootprints {
+    /// Prop centers and reach radii.
+    pub circles: Vec<(Vec2, f32)>,
+    /// Log centerlines as segment end points.
+    pub logs: Vec<(Vec2, Vec2)>,
+}
+
+impl PropFootprints {
+    /// 0 on a prop's footprint, rising to 1 a little outside it.
+    pub fn keep(&self, at: Vec2) -> f32 {
+        let circles = self.circles.iter().fold(1.0_f32, |keep, &(center, reach)| {
+            keep.min(crate::landscape::smoothstep(
+                0.6 * reach,
+                1.05 * reach,
+                center.distance(at),
+            ))
+        });
+        self.logs.iter().fold(circles, |keep, &(a, b)| {
+            keep.min(crate::landscape::smoothstep(
+                0.18,
+                0.42,
+                segment_distance(at, a, b),
+            ))
+        })
+    }
+}
+
 /// Places of the things already on the ground that props must not overlap.
 struct Clearance {
     trees: Vec<Vec2>,
@@ -146,6 +175,10 @@ pub fn spawn_props(
     };
     let stumps = spawn_stumps(&mut commands, &server, &mut obstacles, &mut clearance);
     let stones = spawn_stones(&mut commands, &server, &mut obstacles, &mut clearance);
+    commands.insert_resource(PropFootprints {
+        circles: clearance.props.clone(),
+        logs: clearance.logs.clone(),
+    });
 
     // The ledges come from the landscape with only a shadow caster, so give
     // them the same opaque core as the props.

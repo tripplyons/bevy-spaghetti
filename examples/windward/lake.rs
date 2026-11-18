@@ -13,9 +13,7 @@ use bevy::{
 use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset};
 
 use crate::{
-    landscape::{
-        LAKE, SUN, SUN_COLOR, SUN_LUX, WATER_LEVEL, ground, load_tile, shore_distance,
-    },
+    landscape::{LAKE, SUN, SUN_COLOR, SUN_LUX, WATER_LEVEL, ground, load_tile, shore_distance},
     meadow::Meadow,
     player::HikerCamera,
     reeds::ReedPatch,
@@ -204,7 +202,12 @@ fn f16_bits(value: f32) -> u16 {
 type ShorePlants<'w, 's> = Query<
     'w,
     's,
-    (Entity, &'static Spaghetti3d, &'static Transform, Has<Meadow>),
+    (
+        Entity,
+        &'static Spaghetti3d,
+        &'static Transform,
+        Has<Meadow>,
+    ),
     (
         Or<(With<ReedPatch>, With<Meadow>)>,
         Without<RenderLayers>,

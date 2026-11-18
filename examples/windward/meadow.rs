@@ -8,6 +8,7 @@ use bevy_spaghetti::{
 use crate::{
     landscape::{ROCKS, SUN, WATER_LEVEL, ground, noise, smoothstep, trail_x},
     player::Hiker,
+    props::PropFootprints,
 };
 
 const CHUNK: f32 = 8.0;
@@ -183,13 +184,13 @@ fn petal_color(at: Vec2, rng: &mut Rng) -> Vec3 {
     color * (0.8 + 0.3 * rng.next())
 }
 
-fn chunk_blades(min: Vec2, seed: u32) -> Vec<Blade> {
+fn chunk_blades(min: Vec2, seed: u32, props: &PropFootprints) -> Vec<Blade> {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9) | 1);
     let mut blades = Vec::new();
     let clumps = (CHUNK * CHUNK * CLUMPS) as usize;
     for _ in 0..clumps {
         let center = min + Vec2::new(rng.next(), rng.next()) * CHUNK;
-        let keep = ground_mask(center);
+        let keep = ground_mask(center) * props.keep(center);
         if rng.next() >= keep {
             continue;
         }
@@ -220,7 +221,13 @@ fn chunk_blades(min: Vec2, seed: u32) -> Vec<Blade> {
     blades
 }
 
-pub fn spawn_meadow(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiAsset>>) {
+pub fn spawn_meadow(
+    mut commands: Commands,
+    mut clouds: ResMut<Assets<SpaghettiAsset>>,
+    props: Option<Res<PropFootprints>>,
+) {
+    let empty = PropFootprints::default();
+    let props = props.as_deref().unwrap_or(&empty);
     let lighting = SpaghettiLighting {
         direction_to_light: SUN,
         ambient: Vec3::new(0.40, 0.47, 0.49),
@@ -238,7 +245,7 @@ pub fn spawn_meadow(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiA
             let min = low + Vec2::new(column as f32, row as f32) * CHUNK;
             let center = min + Vec2::splat(CHUNK * 0.5);
             let near = center.cmpge(NEAR_REGION.0).all() && center.cmple(NEAR_REGION.1).all();
-            let blades = chunk_blades(min, (row * 977 + column) as u32 + 41);
+            let blades = chunk_blades(min, (row * 977 + column) as u32 + 41, props);
             if blades.is_empty() {
                 continue;
             }
