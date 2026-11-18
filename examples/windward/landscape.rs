@@ -316,6 +316,17 @@ fn terrain() -> Mesh {
             let moss = Vec3::new(0.40, 0.53, 0.31).lerp(Vec3::new(0.66, 0.63, 0.45), growth);
             let wet = 1.0 - smoothstep(0.17, 0.62, height);
             let tint = moss.lerp(Vec3::new(0.44, 0.42, 0.35), wet);
+            // Under the crowns, brown needle litter and duff with patches of
+            // dark moss, dimmed as if the closed canopy blocked the sky.
+            let canopy = crate::forest::canopy(at);
+            let duff =
+                Vec3::new(0.40, 0.24, 0.14).lerp(Vec3::new(0.27, 0.16, 0.09), noise(at * 1.3));
+            let moss = Vec3::new(0.20, 0.27, 0.12);
+            let floor = duff.lerp(
+                moss,
+                smoothstep(0.55, 0.8, noise(at * 0.45 + Vec2::new(5.0, 1.0))),
+            );
+            let tint = tint.lerp(floor, canopy * (1.0 - wet));
             // Shade the soil under the grass so gaps between blades read as depth.
             let tint = tint * (1.0 - 0.48 * crate::meadow::cover(at));
             positions.push([x, height, z]);

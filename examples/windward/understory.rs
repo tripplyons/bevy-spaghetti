@@ -110,6 +110,7 @@ pub fn spawn_understory(
             at,
             index as u32 + 24,
             true,
+            1.0,
         );
     }
     for seed in 1..174u32 {
@@ -122,25 +123,65 @@ pub fn spawn_understory(
         if ground(at) < WATER_LEVEL + 0.13 || noise(at * 0.27) < 0.44 {
             continue;
         }
-        let fern = shore_distance(at) < 1.5 && hash01(id + 2) < 0.52;
+        let shaded = crate::forest::canopy(at) > 0.5;
+        let fern = (shore_distance(at) < 1.5 || shaded) && hash01(id + 2) < 0.52;
         let variants = if fern { &ferns } else { &leaves };
         let variant = &variants[seed as usize % variants.len()];
-        add_plant(&mut commands, variant, at, id, fern);
+        add_plant(&mut commands, variant, at, id, fern, 1.0);
         if !fern && hash01(id + 3) < 0.46 {
             let near = at + Vec2::from_angle(hash01(id + 4) * std::f32::consts::TAU) * 0.45;
             if (near.x - trail_x(near.y)).abs() > 1.16 && ground(near) >= WATER_LEVEL + 0.13 {
-                add_plant(&mut commands, variant, near, id + 8, false);
+                add_plant(&mut commands, variant, near, id + 8, false, 1.0);
             }
+        }
+    }
+    // Sword ferns and low groundcover in the shade of the stands, around the
+    // drip line of each crown, where the lowest limbs no longer hide them.
+    for (index, tree) in crate::forest::forest().trees.iter().enumerate() {
+        let id = 70_001 + index as u32 * 41;
+        let trail = (tree.at.x - trail_x(tree.at.y)).abs();
+        if !tree.is_stand() || trail > 26.0 || hash01(id) > 0.62 {
+            continue;
+        }
+        for plant in 0..5 {
+            let seed = id + plant * 7;
+            let angle = std::f32::consts::TAU * hash01(seed + 1);
+            let reach = tree.crown() * (0.75 + 0.55 * hash01(seed + 2));
+            let at = tree.at + Vec2::from_angle(angle) * reach;
+            if (at.x - trail_x(at.y)).abs() < 1.5
+                || ground(at) < WATER_LEVEL + 0.13
+                || crate::forest::canopy(at) < 0.45
+            {
+                continue;
+            }
+            // Sword ferns grow larger in the shade than beside the trail.
+            let fern = plant < 2 || hash01(seed + 3) < 0.3;
+            let variants = if fern { &ferns } else { &leaves };
+            let variant = &variants[(seed / 7) as usize % variants.len()];
+            let size = if fern {
+                1.35 + 0.4 * hash01(seed + 4)
+            } else {
+                1.2
+            };
+            add_plant(&mut commands, variant, at, seed, fern, size);
         }
     }
 }
 
-fn add_plant(commands: &mut Commands, variant: &Variant, at: Vec2, seed: u32, fern: bool) {
-    let scale = if fern {
-        0.72 + 0.56 * hash01(seed)
-    } else {
-        0.50 + 0.66 * hash01(seed)
-    };
+fn add_plant(
+    commands: &mut Commands,
+    variant: &Variant,
+    at: Vec2,
+    seed: u32,
+    fern: bool,
+    size: f32,
+) {
+    let scale = size
+        * if fern {
+            0.72 + 0.56 * hash01(seed)
+        } else {
+            0.50 + 0.66 * hash01(seed)
+        };
     let rotation = Quat::from_rotation_y(std::f32::consts::TAU * hash01(seed + 1));
     // Understory sits in the forest shade, so it gets more sky than sun.
     let lighting = SpaghettiLighting {
