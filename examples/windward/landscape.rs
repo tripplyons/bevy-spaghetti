@@ -9,10 +9,12 @@ use bevy::{
     render::render_resource::AsBindGroup,
     shader::ShaderRef,
 };
-use bevy_spaghetti::{GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting};
+use bevy_spaghetti::{
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows,
+};
 
 use crate::{
-    detail::{CameraView, ScreenDetail},
+    detail::{CameraView, ScreenDetail, load_lit_cloud},
     lake::REFLECTED_LAYER,
 };
 
@@ -429,7 +431,7 @@ fn spawn_rocks(commands: &mut Commands, server: &AssetServer, obstacles: &mut Ob
             "windward/granite-far.spag",
         ],
     ]
-    .map(|paths| paths.map(|path| server.load::<SpaghettiAsset>(path)));
+    .map(|paths| paths.map(|path| load_lit_cloud(server, path)));
     let shadows = [
         server.load(GltfAssetLabel::Scene(0).from_asset("windward/basalt/rock4.gltf")),
         server.load(GltfAssetLabel::Scene(0).from_asset("windward/granite/boulder_01_1k.gltf")),
@@ -464,6 +466,7 @@ fn spawn_rocks(commands: &mut Commands, server: &AssetServer, obstacles: &mut Ob
                     level: 1,
                 },
                 lighting,
+                SpaghettiReceiveShadows,
                 placement,
             ))
             .with_children(|parent| {
@@ -474,6 +477,7 @@ fn spawn_rocks(commands: &mut Commands, server: &AssetServer, obstacles: &mut Ob
                     Name::new("Reflected stone"),
                     Spaghetti3d(clouds[2].clone()),
                     lighting,
+                    SpaghettiReceiveShadows,
                     RenderLayers::layer(REFLECTED_LAYER),
                 ));
             });

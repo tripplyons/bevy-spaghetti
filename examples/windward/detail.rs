@@ -1,4 +1,18 @@
-use bevy::{camera::MainPassResolutionOverride, prelude::*};
+use bevy::{asset::AssetPath, camera::MainPassResolutionOverride, prelude::*};
+use bevy_spaghetti::SpaghettiAsset;
+
+pub fn load_lit_cloud(
+    server: &AssetServer,
+    path: impl Into<AssetPath<'static>>,
+) -> Handle<SpaghettiAsset> {
+    server
+        .load_builder()
+        .with_settings(|bake: &mut Option<([f32; 3], f32)>| {
+            // Scan splats overlap to reconstruct one surface.
+            *bake = Some((crate::landscape::SUN.to_array(), 0.16));
+        })
+        .load(path)
+}
 
 pub type CameraView = (
     &'static Camera,

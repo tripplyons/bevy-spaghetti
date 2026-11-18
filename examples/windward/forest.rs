@@ -2,7 +2,8 @@ use bevy::prelude::*;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy_spaghetti::{
-    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting, SpaghettiNearFade,
+    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
+    SpaghettiLighting, SpaghettiNearFade, SpaghettiReceiveShadows,
 };
 
 use crate::{
@@ -181,6 +182,7 @@ fn tree_clouds(
 ) -> TreeClouds {
     let reflection = clouds.add(
         SpaghettiAsset::new(levels[conifer::LEVEL_COUNT - 1].clone())
+            .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.30))
             .expect("procedural firs are valid"),
     );
     let mut finer_end = 0;
@@ -194,6 +196,7 @@ fn tree_clouds(
     });
     let adaptive = clouds.add(
         SpaghettiAsset::with_detail(levels.into_iter().flatten().collect(), &transitions)
+            .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.30))
             .expect("procedural firs have valid detail levels"),
     );
     TreeClouds {
@@ -301,6 +304,7 @@ pub fn spawn_trees(
                 Spaghetti3d(detail.adaptive.clone()),
                 ForestDetail,
                 lighting,
+                SpaghettiReceiveShadows,
                 // Limbs between the follow camera and the hiker dissolve
                 // instead of smearing across the frame.
                 SpaghettiNearFade {
@@ -331,6 +335,7 @@ pub fn spawn_trees(
                     Name::new("Reflected conifer"),
                     Spaghetti3d(detail.reflection.clone()),
                     lighting,
+                    SpaghettiReceiveShadows,
                     RenderLayers::layer(REFLECTED_LAYER),
                 ));
             });

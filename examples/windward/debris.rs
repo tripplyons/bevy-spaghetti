@@ -4,10 +4,12 @@ use std::{
 };
 
 use bevy::{camera::visibility::RenderLayers, prelude::*};
-use bevy_spaghetti::{GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting};
+use bevy_spaghetti::{
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows,
+};
 
 use crate::{
-    detail::{CameraView, ScreenDetail},
+    detail::{CameraView, ScreenDetail, load_lit_cloud},
     lake::REFLECTED_LAYER,
     landscape::{SUN, WATER_LEVEL, ground, hash01, noise, trail_x},
     props,
@@ -60,7 +62,7 @@ pub fn spawn_debris(
     ];
     // The scan is 3.05 m long and about 0.28 m thick, lying along +X.
     let shadow = server.load(GltfAssetLabel::Scene(0).from_asset(TRUNK));
-    let clouds = TRUNK_CLOUDS.map(|path| server.load::<SpaghettiAsset>(path));
+    let clouds = TRUNK_CLOUDS.map(|path| load_lit_cloud(&server, path));
     for (index, (at, angle, length, radius)) in fallen.into_iter().enumerate() {
         let girth = radius / 0.14;
         let roll = hash01(197 + index as u32 * 15) * TAU;
@@ -84,6 +86,7 @@ pub fn spawn_debris(
                     level: 1,
                 },
                 LOG_LIGHTING,
+                SpaghettiReceiveShadows,
                 Transform::from_xyz(at.x, lowest + 0.02 * girth, at.y)
                     .with_rotation(
                         Quat::from_rotation_y(-angle) * Quat::from_rotation_x(roll * 0.15),
@@ -98,6 +101,7 @@ pub fn spawn_debris(
                     Name::new("Reflected deadfall"),
                     Spaghetti3d(clouds[2].clone()),
                     LOG_LIGHTING,
+                    SpaghettiReceiveShadows,
                     RenderLayers::layer(REFLECTED_LAYER),
                 ));
             })
@@ -119,8 +123,13 @@ pub fn spawn_debris(
     for patch in patches.into_values() {
         commands.spawn((
             Name::new("Path gravel"),
-            Spaghetti3d(splats.add(SpaghettiAsset::new(patch).expect("valid path gravel"))),
+            Spaghetti3d(splats.add(
+                SpaghettiAsset::new(patch)
+                    .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.16))
+                    .expect("valid path gravel"),
+            )),
             LIGHTING,
+            SpaghettiReceiveShadows,
             Transform::IDENTITY,
         ));
     }

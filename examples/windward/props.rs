@@ -11,11 +11,11 @@ use bevy::{
     prelude::*,
     world_serialization::WorldInstanceReady,
 };
-use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting};
+use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows};
 
 use crate::{
     debris::LogDetail,
-    detail::{CameraView, ScreenDetail},
+    detail::{CameraView, ScreenDetail, load_lit_cloud},
     forest::ForestDetail,
     lake::REFLECTED_LAYER,
     landscape::{
@@ -311,7 +311,7 @@ fn spawn_stumps(
 ) -> Vec<(Vec2, f32)> {
     let mut placed = Vec::new();
     let shadow = server.load(GltfAssetLabel::Scene(0).from_asset(STUMP));
-    let clouds = STUMP_CLOUDS.map(|path| server.load::<SpaghettiAsset>(path));
+    let clouds = STUMP_CLOUDS.map(|path| load_lit_cloud(server, path));
     for (index, anchor) in STUMP_ANCHORS.into_iter().enumerate() {
         let seed = 4100 + index as u32 * 37;
         let scale = 1.1 + 0.5 * hash01(seed);
@@ -364,7 +364,7 @@ fn spawn_stones(
             format!("windward/stone-{name}-mid.spag"),
             format!("windward/stone-{name}-far.spag"),
         ]
-        .map(|path| server.load::<SpaghettiAsset>(path));
+        .map(|path| load_lit_cloud(server, path));
         let shadow = server.load(
             GltfAssetLabel::Scene(0).from_asset(format!("windward/stones/stone_{name}.gltf")),
         );
@@ -445,6 +445,7 @@ fn spawn_prop(
                 level: 1,
             },
             LIGHTING,
+            SpaghettiReceiveShadows,
             transform,
         ))
         .with_children(|parent| {
@@ -456,6 +457,7 @@ fn spawn_prop(
                 Name::new("Reflected prop"),
                 Spaghetti3d(clouds[2].clone()),
                 LIGHTING,
+                SpaghettiReceiveShadows,
                 RenderLayers::layer(REFLECTED_LAYER),
             ));
         })
