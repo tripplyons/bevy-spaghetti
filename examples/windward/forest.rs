@@ -1,7 +1,9 @@
 use bevy::prelude::*;
 
 use bevy::camera::visibility::RenderLayers;
-use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiNearFade};
+use bevy_spaghetti::{
+    Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting, SpaghettiNearFade,
+};
 
 use crate::{
     conifer,
@@ -282,6 +284,9 @@ pub fn spawn_trees(
                     start: 1.0,
                     end: 3.4,
                 },
+                // Depth-writing cutouts skip the per-view sort and let the
+                // depth test reject hidden needles.
+                SpaghettiCutout,
             ))
             .with_children(|children| {
                 if near && let Some((scene, radius)) = variant.shadow {
