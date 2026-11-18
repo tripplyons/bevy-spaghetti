@@ -360,14 +360,14 @@ fn cutout_vertex(
     let across = vec2(-tangent.y, tangent.x);
     let midpoint = (a + b) * 0.5;
     let q = splat.rotation;
-    let width_axis = rotate(q, vec3(splat.sigma.x, 0.0, 0.0));
-    let tangent_axis = rotate(q, vec3(0.0, splat.sigma.y, 0.0));
-    let normal = rotate(q, vec3(0.0, 0.0, 1.0));
-    let x = project_axis(transform * vec4(width_axis, 0.0), midpoint, half_viewport);
-    let y = project_axis(transform * vec4(tangent_axis, 0.0), midpoint, half_viewport);
-    let z = project_axis(transform * vec4(normal * splat.sigma.z, 0.0), midpoint, half_viewport);
-    let cross_sigma = length(vec3(dot(across, x), dot(across, y), dot(across, z)));
-    let along_sigma = length(vec3(dot(tangent, x), dot(tangent, y), dot(tangent, z)));
+    let local_to_kernel = vec4(-q.xyz, q.w);
+    let jx = project_axis(transform[0], midpoint, half_viewport);
+    let jy = project_axis(transform[1], midpoint, half_viewport);
+    let jz = project_axis(transform[2], midpoint, half_viewport);
+    let cross_axis = vec3(dot(across, jx), dot(across, jy), dot(across, jz));
+    let along_axis = vec3(dot(tangent, jx), dot(tangent, jy), dot(tangent, jz));
+    let cross_sigma = length(rotate(local_to_kernel, cross_axis) * splat.sigma.xyz);
+    let along_sigma = length(rotate(local_to_kernel, along_axis) * splat.sigma.xyz);
     // The cross section's isocontour is where optical depth falls below one.
     let area = 2.506628 * splat.sigma.x
         * max(distance(splat.start_mass.xyz, splat.end.xyz), 2.506628 * splat.sigma.y);
@@ -399,6 +399,7 @@ fn cutout_vertex(
 
     var color = splat.color.rgb;
     if view.direction_to_light.w > 0.0 {
+        let normal = rotate(q, vec3(0.0, 0.0, 1.0));
         let unit = normalize(view.normal_from_local * normal);
         let facing = dot(unit, view.direction_to_light.xyz);
         let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);

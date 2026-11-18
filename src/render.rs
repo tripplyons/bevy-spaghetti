@@ -76,7 +76,7 @@ pub struct SpaghettiTransmission(pub f32);
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct SpaghettiCutout;
 
-/// Applies gusts and an optional spherical-footprint pusher in world space.
+/// Applies gusts and an optional pusher in world space.
 ///
 /// Set endpoint bend heights with [`crate::GaussianSegment::with_bend_heights`].
 /// Update this component to animate a cloud without changing its asset.
@@ -86,7 +86,7 @@ pub struct SpaghettiWind {
     pub time: f32,
     /// World-space position at the base of the pusher.
     pub pusher: Vec3,
-    /// Radius in world units. Zero disables contact.
+    /// Horizontal radius in world units. Zero disables contact.
     pub push_radius: f32,
 }
 
@@ -605,7 +605,18 @@ fn queue_clouds(
                 uniform.world_from_local = cloud.world_from_local.to_cols_array_2d();
                 uniform.local_from_world = [inverse.x_axis, inverse.y_axis, inverse.z_axis]
                     .map(|axis| axis.extend(0.0).to_array());
-                uniform.pusher = wind.pusher.extend(wind.push_radius.max(0.0)).to_array();
+                if wind.push_radius > 0.0 {
+                    let transform = cloud.world_from_local;
+                    let center = transform.transform_point3(gpu.bounds.center.into());
+                    let half = gpu.bounds.half_extents;
+                    let extent = transform.x_axis.truncate().abs() * half.x
+                        + transform.y_axis.truncate().abs() * half.y
+                        + transform.z_axis.truncate().abs() * half.z;
+                    let outside = ((wind.pusher - center).xz().abs() - extent.xz()).max(Vec2::ZERO);
+                    if outside.length_squared() < wind.push_radius * wind.push_radius {
+                        uniform.pusher = wind.pusher.extend(wind.push_radius).to_array();
+                    }
+                }
                 uniform.motion[0] = wind.time;
                 uniform.motion[1] = 1.0;
             }

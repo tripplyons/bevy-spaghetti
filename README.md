@@ -47,7 +47,9 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
 }
 ```
 
-The entity supports transforms, inherited visibility, render layers and frustum culling. Each 3D camera gets a separate segment depth order. Splats test against opaque Bevy depth and blend in the transparent pass. To create an asset in Rust, build a `Vec<GaussianSegment>`, pass it to `SpaghettiAsset::new`, and add it to `Assets<SpaghettiAsset>`. Equal endpoints produce a point splat. When splitting a straight segment with the same color and kernel, divide its optical mass in proportion to the child lengths to preserve opacity at the join.
+The entity supports transforms, inherited visibility, render layers, frustum culling and per-camera `VisibilityRange`. Each 3D camera gets a separate segment depth order. Splats test against opaque Bevy depth and blend in the transparent pass. To create an asset in Rust, build a `Vec<GaussianSegment>`, pass it to `SpaghettiAsset::new`, and add it to `Assets<SpaghettiAsset>`. Equal endpoints produce a point splat. When splitting a straight segment with the same color and kernel, divide its optical mass in proportion to the child lengths to preserve opacity at the join.
+
+Add `SpaghettiCutout` for dense surface splats that should write depth. The cutout pipeline tests a projected Gaussian cross section and draws directly from the segment buffer. Add `SpaghettiWind` and update its time and pusher to deform an existing buffer on the GPU. Set bend heights with `GaussianSegment::with_bend_heights`. For tapered grass, use `with_blade_profile` to set the blade height, endpoint fractions and end width together.
 
 ## Convert a model
 
@@ -68,7 +70,7 @@ To regenerate the sample, use Poly Haven's 2K glTF download and substitute `marb
 
 The GPU projects each segment's anisotropic kernel with a midpoint EWA Jacobian, adds a half-pixel Gaussian filter in screen space, and evaluates the Gaussian line integral in closed form. Beer–Lambert opacity and back-to-front premultiplied blending accumulate the segments. Segment depth ordering uses midpoints, so crossing translucent segments may sort approximately. Bevy sorts separate clouds and other transparent objects by entity center.
 
-The runtime uses the paper's Gaussian kernel and constant RGB emission. This implementation covers rendering and direct geometry conversion. It omits Beta kernels, photo-based training, spherical harmonics, and dynamic lighting or shadow casting. Long segments with strong perspective foreshortening benefit from subdivision. The renderer requires vertex-stage storage buffers. The format caps each asset at one million segments.
+The runtime uses the paper's Gaussian kernel and linear RGB colors. Optional `SpaghettiLighting` and `SpaghettiTransmission` shade the kernel's positive Z axis. This implementation covers rendering and direct geometry conversion. It omits Beta kernels, photo-based training, spherical harmonics and shadow casting. Long segments with strong perspective foreshortening benefit from subdivision. The renderer requires vertex-stage storage buffers. The format caps each asset at one million segments.
 
 ## File layout
 
@@ -77,10 +79,10 @@ Version 1 uses the eight bytes `SPAG\x01\x00\x00\x00`, followed by a little-endi
 | Vector | Fields |
 | --- | --- |
 | Start | XYZ endpoint and optical mass in squared asset units |
-| End | XYZ endpoint and reserved zero |
-| Kernel | XYZ principal-axis standard deviations and reserved zero |
+| End | XYZ endpoint and start bend height in world units, or zero |
+| Kernel | XYZ principal-axis standard deviations and end bend height in world units, or zero |
 | Rotation | Unit quaternion XYZW |
-| Color | Linear RGB and reserved zero |
+| Color | Linear RGB and optional packed blade profile, or zero |
 
 ## Checks
 
