@@ -37,6 +37,9 @@ const STUMP_CLOUDS: [&str; 3] = [
 /// from the trunk axis.
 const STUMP_SKIRT: f32 = 0.17;
 const STUMP_REACH: f32 = 0.8;
+/// The scan is a low, rotted stump. Old-growth stumps in the Cascades stand
+/// a meter or more, so stretch it upward without widening the footprint.
+const STUMP_STRETCH: f32 = 1.6;
 
 /// Rough positions for the stumps. Each one moves to the nearest clear spot.
 const STUMP_ANCHORS: [Vec2; 8] = [
@@ -332,9 +335,10 @@ fn spawn_stumps(
             continue;
         };
         let floor = footprint_floor(at, reach);
-        let transform = Transform::from_xyz(at.x, floor + STUMP_SKIRT * scale, at.y)
+        let height = scale * STUMP_STRETCH;
+        let transform = Transform::from_xyz(at.x, floor + STUMP_SKIRT * height, at.y)
             .with_rotation(Quat::from_rotation_y(hash01(seed + 2) * TAU))
-            .with_scale(Vec3::splat(scale));
+            .with_scale(Vec3::new(scale, height, scale));
         spawn_prop(
             commands,
             "Old-growth stump",
@@ -345,8 +349,8 @@ fn spawn_stumps(
         );
         clearance.props.push((at, reach));
         placed.push((at, scale));
-        // The cut trunk is about 0.32 m in radius and 0.55 m tall.
-        obstacles.add_boulder(at, 0.36 * scale, 0.55 * scale);
+        // The unstretched scan is about 0.32 m in radius and 0.55 m tall.
+        obstacles.add_boulder(at, 0.36 * scale, 0.55 * height);
     }
     placed
 }
