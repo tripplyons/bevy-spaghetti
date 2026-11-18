@@ -471,7 +471,7 @@ fn footprint_floor(at: Vec2, reach: f32) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
-fn segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f32 {
+pub fn segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f32 {
     let along = b - a;
     let t = ((point - a).dot(along) / along.length_squared().max(1e-6)).clamp(0.0, 1.0);
     point.distance(a + along * t)

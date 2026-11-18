@@ -123,7 +123,8 @@ impl Rng {
     }
 }
 
-/// Where grass may root: zero on the trail, in the lake and under stones.
+/// Where grass may root: zero on the trail, in the lake, under stones, and
+/// in the needle litter under the conifer crowns.
 fn ground_mask(at: Vec2) -> f32 {
     let height = ground(at);
     let shore = smoothstep(WATER_LEVEL + 0.03, WATER_LEVEL + 0.22, height);
@@ -136,7 +137,8 @@ fn ground_mask(at: Vec2) -> f32 {
             at.distance(Vec2::new(x, z)),
         ))
     });
-    shore * worn * stones
+    let shade = crate::forest::canopy(at);
+    shore * worn * stones * (1.0 - shade).powi(2)
 }
 
 /// Lush patches grow tall tufts; elsewhere the turf stays short.

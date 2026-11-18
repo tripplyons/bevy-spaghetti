@@ -49,7 +49,7 @@ pub fn spawn_debris(
     server: Res<AssetServer>,
     mut splats: ResMut<Assets<SpaghettiAsset>>,
 ) {
-    let fallen = [
+    let mut fallen = vec![
         (Vec2::new(-3.65, 7.4), 0.23, 3.4, 0.22),
         (Vec2::new(4.65, 5.6), -0.67, 1.85, 0.13),
         (Vec2::new(-6.6, -9.1), -0.80, 3.0, 0.22),
@@ -58,6 +58,7 @@ pub fn spawn_debris(
         (Vec2::new(8.3, -38.9), 0.87, 3.4, 0.29),
         (Vec2::new(-11.6, -44.7), 0.21, 2.8, 0.20),
     ];
+    fallen.extend(stand_logs(&fallen));
     // The scan is 3.05 m long and about 0.28 m thick, lying along +X.
     let shadow = server.load(GltfAssetLabel::Scene(0).from_asset(TRUNK));
     let clouds = TRUNK_CLOUDS.map(|path| server.load::<SpaghettiAsset>(path));
@@ -124,6 +125,50 @@ pub fn spawn_debris(
             Transform::IDENTITY,
         ));
     }
+}
+
+/// Finds a few clear spots for small windfall logs under the closed canopy,
+/// away from the trail, the lake, the trunks, and the other logs.
+fn stand_logs(fixed: &[(Vec2, f32, f32, f32)]) -> Vec<(Vec2, f32, f32, f32)> {
+    let forest = crate::forest::forest();
+    let mut logs: Vec<(Vec2, f32, f32, f32)> = Vec::new();
+    for seed in 0..400u32 {
+        if logs.len() >= 9 {
+            break;
+        }
+        let id = 8_803 + seed * 61;
+        let at = Vec2::new(-34.0 + 68.0 * hash01(id), -66.0 + 92.0 * hash01(id + 1));
+        let angle = TAU * hash01(id + 2);
+        let length = 1.9 + 1.4 * hash01(id + 3);
+        let radius = 0.11 + 0.07 * hash01(id + 4);
+        let half = Vec2::from_angle(angle) * length * 0.5;
+        let (a, b) = (at - half, at + half);
+        let samples = [a, at, b];
+        let clear =
+            |point: Vec2, gap: f32| samples.iter().all(|&sample| sample.distance(point) >= gap);
+        let all = fixed.iter().chain(logs.iter());
+        if samples.iter().any(|&p| {
+            forest.shade(p) < 0.6
+                || (p.x - trail_x(p.y)).abs() < 3.0
+                || crate::landscape::shore_distance(p) < 1.3
+                || ground(p) < WATER_LEVEL + 0.2
+        }) || (ground(a) - ground(b)).abs() > 0.35
+            || !forest
+                .trees
+                .iter()
+                .all(|tree| props::segment_distance(tree.at, a, b) >= 0.55)
+            || !crate::landscape::ROCKS
+                .iter()
+                .all(|&(x, z, scale)| clear(Vec2::new(x, z), 1.2 * scale + 0.4))
+            || !all
+                .into_iter()
+                .all(|&(other, ..)| other.distance(at) >= 4.0)
+        {
+            continue;
+        }
+        logs.push((at, angle, length, radius));
+    }
+    logs
 }
 
 /// Builds one pebble from a flattened body kernel and two tilted facets, so
