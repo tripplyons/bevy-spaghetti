@@ -1,10 +1,12 @@
 //! Procedural fir crowns built from Gaussian segments.
 //!
-//! Each tree has a tapered trunk, whorls of drooping branches, and flat
-//! needle sprays. The sprays are thin kernels whose local +Z is the spray
-//! normal, so the splat shader lights them as small leaves instead of as a
-//! flat card. Three detail levels share one layout and differ only in how
-//! finely the sprays are sampled.
+//! Each tree has a tapered trunk and uneven whorls of limbs. A limb droops
+//! from the trunk and, in firs, sweeps up at the tip. Side branchlets
+//! alternate along it and hang below it by species, and the finest level
+//! breaks them into tufted twigs. Needle sprays are thin kernels whose
+//! local +Z is the spray normal, so the splat shader lights them as small
+//! leaves instead of as a flat card. All four detail levels share one
+//! limb and branchlet layout and differ only in how finely they draw it.
 
 use bevy::prelude::*;
 use bevy_spaghetti::GaussianSegment;
@@ -36,12 +38,25 @@ impl Rng {
 }
 
 /// Sampling parameters for one level of detail.
+///
+/// Every level draws the same branchlets. Finer levels draw each one with
+/// its twigs; coarser levels merge neighbors on one side of a limb into a
+/// single wider spray.
 struct Level {
-    /// Distance between spray pairs along a branch.
-    spacing: f32,
-    /// Scale applied to spray width so coverage stays constant.
-    grow: f32,
+    /// Neighboring branchlets on one side of a limb merged into one spray.
+    group: usize,
+    /// Width of one spray.
+    width: f32,
+    /// Straight pieces along each spray.
+    bends: usize,
+    /// Twigs and needle tufts along each branchlet.
     twiglets: bool,
+    /// Needles along the limb axis itself.
+    clothe: bool,
+    /// Short interior shoots on the stem, which only matter up close.
+    interior: bool,
+    /// Scale applied to the leader and limb-tip sprays.
+    grow: f32,
     /// Number of bark strips around the trunk.
     strips: u32,
     trunk_step: f32,
@@ -50,33 +65,49 @@ struct Level {
 
 const LEVELS: [Level; 4] = [
     Level {
-        spacing: 0.07,
-        grow: 1.0,
+        group: 1,
+        width: 0.014,
+        bends: 2,
         twiglets: true,
+        clothe: true,
+        interior: true,
+        grow: 1.0,
         strips: 6,
         trunk_step: 0.22,
         wood: true,
     },
     Level {
-        spacing: 0.085,
-        grow: 1.75,
+        group: 1,
+        width: 0.05,
+        bends: 1,
         twiglets: false,
+        clothe: true,
+        interior: true,
+        grow: 1.75,
         strips: 4,
         trunk_step: 0.45,
         wood: true,
     },
     Level {
-        spacing: 0.3,
-        grow: 3.0,
+        group: 2,
+        width: 0.11,
+        bends: 1,
         twiglets: false,
+        clothe: false,
+        interior: true,
+        grow: 3.0,
         strips: 3,
         trunk_step: 1.1,
         wood: false,
     },
     Level {
-        spacing: 0.62,
-        grow: 4.6,
+        group: 4,
+        width: 0.16,
+        bends: 1,
         twiglets: false,
+        clothe: false,
+        interior: false,
+        grow: 4.6,
         strips: 2,
         trunk_step: 2.2,
         wood: false,
@@ -88,13 +119,18 @@ pub const LEVEL_COUNT: usize = LEVELS.len();
 /// Growth habit of one species.
 #[derive(Clone, Copy)]
 pub struct Habit {
-    /// Limb climb near the leader and how much it drops toward the base.
+    /// Limb angle above horizontal, in radians, near the leader, and how
+    /// much it drops toward the base of the crown.
     climb_top: f32,
     climb_drop: f32,
-    /// Sag of a limb as a fraction of its length.
+    /// How far a limb bends down along its length, in radians.
     sag: f32,
-    /// Upturn (positive) or droop (negative) at the limb tip.
+    /// Angle of the limb tip relative to the limb base, in radians. Positive
+    /// tips turn up; negative tips hang.
     tip: f32,
+    /// How steeply the branchlets hang below their limb. Zero keeps them
+    /// level; one drops them into a vertical curtain.
+    hang: f32,
     old: Vec3,
     young: Vec3,
     /// Sideways bend of the leader in meters.
@@ -103,39 +139,43 @@ pub struct Habit {
     profile: f32,
 }
 
-/// Grand fir: stiff upturned limbs and dark blue-green needles.
+/// Grand and Douglas-fir: limbs droop from the trunk and sweep up at the
+/// tips, with curtains of branchlets on the older lower limbs.
 pub const FIR: Habit = Habit {
-    climb_top: 0.55,
-    climb_drop: 0.85,
-    sag: 0.26,
-    tip: 0.12,
+    climb_top: 0.5,
+    climb_drop: 0.95,
+    sag: 0.62,
+    tip: 0.78,
+    hang: 0.5,
     old: Vec3::new(0.050, 0.082, 0.056),
     young: Vec3::new(0.105, 0.145, 0.068),
     nod: 0.0,
     profile: 0.92,
 };
 
-/// Western hemlock: soft pendulous limbs, a nodding leader, and yellower
-/// green foliage.
+/// Western hemlock: soft limbs that arch down, hanging branchlet sprays,
+/// a nodding leader, and yellower green foliage.
 pub const HEMLOCK: Habit = Habit {
-    climb_top: 0.30,
-    climb_drop: 0.62,
-    sag: 0.42,
-    tip: -0.10,
+    climb_top: 0.42,
+    climb_drop: 0.72,
+    sag: 0.72,
+    tip: -0.12,
+    hang: 0.9,
     old: Vec3::new(0.056, 0.090, 0.046),
     young: Vec3::new(0.125, 0.165, 0.062),
     nod: 0.55,
     profile: 0.92,
 };
 
-/// Subalpine fir: a very narrow spire with short, stiff limbs and grey
-/// blue-green needles. Build it with a crown radius about half that of a
-/// grand fir of the same height.
+/// Subalpine fir: a very narrow spire with short, stiff limbs, a drooping
+/// lower skirt, and grey blue-green needles. Build it with a crown radius
+/// about half that of a grand fir of the same height.
 pub const SUBALPINE: Habit = Habit {
-    climb_top: 0.62,
-    climb_drop: 0.95,
-    sag: 0.20,
-    tip: 0.16,
+    climb_top: 0.55,
+    climb_drop: 1.1,
+    sag: 0.3,
+    tip: 0.6,
+    hang: 0.18,
     old: Vec3::new(0.046, 0.074, 0.068),
     young: Vec3::new(0.088, 0.132, 0.110),
     nod: 0.0,
@@ -225,18 +265,32 @@ pub fn fir(
         detail,
     );
     if form.broken_at < 1.0 {
-        splinters(&mut out, &mut rng.fork(), height, top, trunk_radius, form.snag);
+        splinters(
+            &mut out,
+            &mut rng.fork(),
+            height,
+            top,
+            trunk_radius,
+            form.snag,
+        );
     }
 
     // Annual whorls get closer together near the leader, where growth is
     // recent and the shoots are short.
     let lean = rng.range(0.0, std::f32::consts::TAU);
     let toward = Vec3::new(lean.cos(), 0.0, lean.sin());
+    // Neighbors and old damage push the crown out of round: two broad
+    // lobes make one side fuller than the other.
+    let lobes = [
+        rng.range(0.0, std::f32::consts::TAU),
+        rng.range(0.0, std::f32::consts::TAU),
+    ];
+    let lobe = rng.range(0.06, 0.15);
     let mut y = base;
     let mut whorl = 0u32;
     while y < top - 0.25 {
         let rel = ((y - base) / (height - base)).clamp(0.0, 1.0);
-        let reach = crown_radius * (1.0 - rel).powf(habit.profile) * rng.range(0.86, 1.08) + 0.12;
+        let reach = crown_radius * (1.0 - rel).powf(habit.profile) * rng.range(0.8, 1.12) + 0.12;
         let foliage = if y / height > form.dead_above {
             &dead
         } else {
@@ -254,9 +308,9 @@ pub fn fir(
         let turn = whorl as f32 * 2.399 + rng.range(0.0, 0.6);
         // Crowding and old storm damage leave short or missing limbs, and
         // one side of the crown usually reaches further toward the light.
-        let vigor = rng.range(0.85, 1.12);
+        let vigor = rng.range(0.8, 1.14);
         for branch in 0..count {
-            if rng.next() < 0.1 + thin {
+            if rng.next() < 0.13 + thin {
                 continue;
             }
             let azimuth = turn
@@ -265,9 +319,16 @@ pub fn fir(
             if azimuth.cos() < -1.0 + 1.6 * exposure {
                 continue;
             }
-            let toward_light = 1.0 + 0.12 * (azimuth - lean).cos();
-            let stunted = if rng.next() < 0.12 { 0.55 } else { 1.0 };
-            let length = reach * rng.range(0.72, 1.08) * vigor * toward_light * stunted;
+            let toward_light = 1.0
+                + 0.12 * (azimuth - lean).cos()
+                + lobe * (azimuth + lobes[0]).sin()
+                + 0.6 * lobe * (2.0 * azimuth + lobes[1]).sin();
+            let stunted = if rng.next() < 0.16 {
+                rng.range(0.4, 0.7)
+            } else {
+                1.0
+            };
+            let length = reach * rng.range(0.7, 1.1) * vigor * toward_light * stunted;
             if form.snag {
                 // Only short, broken stubs of the old limbs remain.
                 if rng.next() < 0.6 {
@@ -301,9 +362,17 @@ pub fn fir(
         }
         // Shorter internodal shoots fill the gaps between whorls.
         let step = (0.42 - 0.18 * rel) * height / 9.0;
+        // A poor growing year leaves a short internode; a good one, a long
+        // gap between whorls.
+        let step = step
+            * if rng.next() < 0.14 {
+                rng.range(1.4, 1.75)
+            } else {
+                rng.range(0.7, 1.2)
+            };
         for _ in 0..3 {
-            let at = y + step * rng.range(0.3, 0.75);
-            let length = reach * rng.range(0.38, 0.62);
+            let at = y + step * rng.range(0.25, 0.8);
+            let length = reach * rng.range(0.3, 0.62);
             let azimuth = rng.range(0.0, std::f32::consts::TAU);
             if form.snag
                 || at > top - 0.2
@@ -325,7 +394,30 @@ pub fn fir(
                 detail,
             );
         }
-        y += step * rng.range(0.85, 1.15);
+        // Short interior shoots on the stem fill the inner crown, so the
+        // trunk hides behind foliage above the clear bole.
+        for _ in 0..2 {
+            let at = y + step * rng.range(0.0, 0.9);
+            let length = (reach * rng.range(0.18, 0.3)).min(0.6) + 0.15;
+            let azimuth = rng.range(0.0, std::f32::consts::TAU);
+            let mut stream = rng.fork();
+            if form.snag || at > top - 0.3 || rng.next() < thin || !detail.interior {
+                continue;
+            }
+            limb(
+                &mut out,
+                &mut stream,
+                foliage,
+                habit.bend(at, height, toward),
+                at,
+                azimuth,
+                length,
+                rel,
+                height,
+                detail,
+            );
+        }
+        y += step;
         whorl += 1;
     }
 
@@ -421,7 +513,7 @@ fn trunk(
             // Ridged bark: dark grey with warm fissures.
             let fissure = rng.next();
             // The crown shades the stem above the lowest live limbs.
-            let shade = if y > base && !snag { 0.42 } else { 1.0 };
+            let shade = if y > base && !snag { 0.32 } else { 1.0 };
             let tone = (0.75 + 0.5 * rng.next()) * shade;
             // Sun and wind bleach the bare wood of a snag silver-grey.
             let (ridge, groove) = if snag {
@@ -523,6 +615,31 @@ fn stub(
     }
 }
 
+/// Number of straight pieces in a limb's center line.
+const LIMB_NODES: usize = 10;
+
+/// One side branch of a limb, bent down by its own weight.
+struct Branchlet {
+    base: Vec3,
+    mid: Vec3,
+    tip: Vec3,
+    /// Faces the open side of the needle spray.
+    normal: Vec3,
+    /// Fraction of the way from trunk to limb tip.
+    s: f32,
+    sign: f32,
+    hang: f32,
+}
+
+impl Branchlet {
+    /// Point on the curve through base, mid and tip.
+    fn at(&self, t: f32) -> Vec3 {
+        let a = self.base.lerp(self.mid, t);
+        let b = self.mid.lerp(self.tip, t);
+        a.lerp(b, t)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn limb(
     out: &mut Vec<GaussianSegment>,
@@ -538,100 +655,189 @@ fn limb(
 ) {
     let outward = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
     let side = Vec3::Y.cross(outward).normalize();
-    // Upper shoots climb; lower limbs droop and lift again at the tip.
-    let climb = habit.climb_top - habit.climb_drop * (1.0 - rel) + rng.range(-0.1, 0.1);
-    let sag = habit.sag * (1.0 - 0.6 * rel) * length;
+    // The limb leaves the trunk at `start` and bends down along its length
+    // under its weight. Near the tip new growth turns up toward the light,
+    // or, in hemlock, keeps arching down. Bending by angle keeps the limb's
+    // length fixed however far it droops.
+    let start = habit.climb_top - habit.climb_drop * (1.0 - rel) + rng.range(-0.12, 0.12);
+    let sag = habit.sag
+        * (1.0 - 0.55 * rel)
+        * (0.6 + 0.4 * (length / 2.5).min(1.4))
+        * rng.range(0.8, 1.2);
+    // Young upper limbs already climb, so only older limbs sweep up.
+    // Short limbs bend less either way.
+    let tip = habit.tip
+        * (1.0 - rel).powf(0.7)
+        * (0.45 + 0.55 * (length / 2.0).min(1.0))
+        * rng.range(0.75, 1.25);
+    let mut nodes = [Vec3::ZERO; LIMB_NODES + 1];
+    nodes[0] = shift + Vec3::Y * y + outward * 0.05;
+    for node in 0..LIMB_NODES {
+        let s = (node as f32 + 0.5) / LIMB_NODES as f32;
+        let turn = ((s - 0.45) / 0.55).clamp(0.0, 1.0);
+        let angle = start - sag * s + (sag + tip) * turn * turn * (3.0 - 2.0 * turn);
+        let direction = outward * angle.cos() + Vec3::Y * angle.sin();
+        nodes[node + 1] = nodes[node] + direction * (length * 1.06 / LIMB_NODES as f32);
+    }
     let point = |s: f32| {
-        let lift = climb * s - sag / length.max(0.1) * s * s + habit.tip * (1.0 - rel) * s.powi(4);
-        shift + Vec3::Y * y + outward * (0.05 + length * s) + Vec3::Y * (lift * length)
+        let at = s.clamp(0.0, 1.0) * LIMB_NODES as f32;
+        let node = (at as usize).min(LIMB_NODES - 1);
+        nodes[node].lerp(nodes[node + 1], at - node as f32)
+    };
+    let tangent = |s: f32| {
+        let node = ((s.clamp(0.0, 1.0) * LIMB_NODES as f32) as usize).min(LIMB_NODES - 1);
+        (nodes[node + 1] - nodes[node]).normalize_or(outward)
     };
     let shade_scale = 1.0 - 0.35 * (1.0 - rel);
 
+    // Branchlets alternate along the limb, longest near the trunk. They
+    // fill the inner limb too, so the crown hides the trunk. This layout
+    // draws the same samples at every level.
+    let mut branchlets = Vec::new();
+    let gap = 0.085 * rng.range(0.85, 1.15);
+    let mut s = 0.05;
+    let mut sign = if rng.next() > 0.5 { 1.0f32 } else { -1.0 };
+    let reach = (length / 2.0).clamp(0.4, 1.0);
+    while s < 0.96 {
+        let here = point(s);
+        let along = tangent(s);
+        let skip = rng.next() < (1.0 - s / 0.3).max(0.0) * 0.3;
+        let size = (0.1 + 0.46 * (1.0 - s).powf(0.8)) * reach * rng.range(0.75, 1.2);
+        let angle = rng.range(0.85, 1.2);
+        let hang = habit.hang
+            * (0.35 + 0.65 * (1.0 - rel))
+            * (0.4 + 0.6 * (s / 0.6).min(1.0))
+            * rng.range(0.7, 1.3);
+        let roll = rng.range(-0.35, 0.35);
+        let flick = rng.range(0.0, 0.2) * habit.tip.max(0.0);
+        if !skip {
+            let lateral = (along * angle.cos() + side * sign * angle.sin()).normalize();
+            let mid = here + (lateral - Vec3::Y * hang * 0.15).normalize() * size * 0.5;
+            let bend = (lateral * 0.8 + along * 0.25 - Vec3::Y * hang * 1.35 + Vec3::Y * flick)
+                .normalize();
+            let tip = mid + bend * size * 0.5;
+            let chord = (tip - here).normalize_or(lateral);
+            let mut normal = along.cross(chord).normalize_or(Vec3::Y);
+            if normal.y < 0.0 {
+                normal = -normal;
+            }
+            let normal = (Quat::from_axis_angle(chord, roll) * normal + outward * 0.25).normalize();
+            branchlets.push(Branchlet {
+                base: here,
+                mid,
+                tip,
+                normal,
+                s,
+                sign,
+                hang,
+            });
+        }
+        sign = -sign;
+        s += gap / length.max(0.3) * rng.range(0.8, 1.2);
+    }
+
+    // Everything below varies by level, so it may draw any number of
+    // samples from `rng`.
     if detail.wood {
-        let links = 5;
+        // The outer limb is a thin twig hidden in its own needles.
+        let links = 4;
         for link in 0..links {
-            let s0 = link as f32 / links as f32;
-            let s1 = (link + 1) as f32 / links as f32;
-            let width = 0.006 + 0.02 * (1.0 - s0) * (length / 2.5).min(1.0);
+            let s0 = 0.8 * link as f32 / links as f32;
+            let s1 = 0.8 * (link + 1) as f32 / links as f32;
+            let width = 0.005 + 0.018 * (1.0 - s0) * (length / 2.5).min(1.0);
             out.push(GaussianSegment::new(
                 point(s0),
                 point(s1),
                 Vec3::splat(width),
                 Quat::from_rotation_arc(Vec3::Z, Vec3::Y),
-                5.0 * width * length / links as f32,
-                Vec3::new(0.07, 0.05, 0.036),
+                4.0 * width * length / links as f32,
+                Vec3::new(0.055, 0.042, 0.032),
             ));
         }
     }
 
-    // Side shoots spread the limb into a flat, ragged plate that is widest
-    // near the trunk. Needles thin out on the shaded inner third.
-    let mut s = 0.05;
-    let mut sign = if rng.next() > 0.5 { 1.0f32 } else { -1.0 };
-    let plates = !detail.wood;
-    while s < 1.0 {
-        let here = point(s);
-        let tangent = (point((s + 0.02).min(1.0)) - here).normalize_or(outward);
-        let inner = (1.0 - s / 0.35).max(0.0);
-        let step = detail.spacing / length * rng.range(0.8, 1.2);
-        if rng.next() < inner * 0.65 {
-            s += step;
-            sign = -sign;
-            continue;
-        }
-        // Light reaches the outer shell; the interior stays dark.
-        let depth = 0.42 + 0.58 * s.powf(0.7);
-        let brightness = depth * shade_scale + 0.12 * (y / height);
-        let tip_growth = (s - 0.72).max(0.0) * 2.5;
-        let normal_up = tangent.cross(side).normalize();
-        let shoot = (0.10 + 0.42 * (1.0 - s).powf(0.8))
-            * (length / 2.0).clamp(0.4, 1.0)
-            * rng.range(0.8, 1.15);
-        let sides: &[f32] = if plates { &[-1.0, 1.0] } else { &[1.0] };
-        for &flip in sides {
-            let sign = sign * flip;
-            let direction =
-                (tangent * 0.5 + side * sign * 0.86 - Vec3::Y * rng.range(0.05, 0.25)).normalize();
-            let roll = Quat::from_axis_angle(tangent, sign * rng.range(-0.15, 0.45));
-            let normal = (roll * normal_up + outward * 0.25).normalize();
-            if detail.twiglets {
-                let across = normal.cross(direction).normalize();
-                let color = needle_color(rng, habit, brightness, tip_growth);
-                frond(
-                    out,
-                    here,
-                    here + direction * shoot,
-                    normal,
-                    0.016,
-                    color * 0.8,
-                );
-                let mut t = 0.0;
-                while t < 1.0 {
-                    let at = here + direction * shoot * t;
-                    let reach = 0.10 * (1.0 - 0.45 * t) * rng.range(0.8, 1.2);
-                    for lean in [-1.0f32, 1.0] {
-                        let twig = (direction * 0.62 + across * lean * 0.78).normalize();
-                        let tint = needle_color(rng, habit, brightness, tip_growth + t * 0.3);
-                        frond(out, at, at + twig * reach, normal, 0.017, tint);
-                    }
-                    t += 0.06 / shoot * rng.range(0.85, 1.15);
+    let brightness = |b: &Branchlet| {
+        // Light reaches the outer shell; the interior and the undersides of
+        // hanging sprays stay dark.
+        let depth = (0.42 + 0.58 * b.s.powf(0.7)) * (1.0 - 0.18 * b.hang.min(1.0));
+        depth * shade_scale + 0.12 * (y / height)
+    };
+    let growth = |b: &Branchlet| (b.s - 0.72).max(0.0) * 2.5;
+
+    if detail.twiglets {
+        for b in &branchlets {
+            let light = brightness(b);
+            let size = b.base.distance(b.tip);
+            for bend in 0..detail.bends {
+                let t0 = bend as f32 / detail.bends as f32;
+                let t1 = (bend + 1) as f32 / detail.bends as f32;
+                let color = needle_color(rng, habit, light, growth(b)) * 0.8;
+                frond(out, b.at(t0), b.at(t1), b.normal, detail.width, color);
+            }
+            // Short twigs on both sides, each rolled its own way, so the
+            // needles gather in tufts instead of one flat plane.
+            let mut t = 0.08;
+            while t < 1.0 {
+                let at = b.at(t);
+                let axis =
+                    (b.at((t + 0.05).min(1.0)) - b.at((t - 0.05).max(0.0))).normalize_or(b.normal);
+                let across = b.normal.cross(axis).normalize_or(side);
+                let twig_reach = 0.1 * (1.0 - 0.45 * t) * reach.sqrt() * rng.range(0.75, 1.2);
+                for lean in [-1.0f32, 1.0] {
+                    let twig =
+                        (axis * 0.6 + across * lean * 0.75 - Vec3::Y * b.hang * 0.25).normalize();
+                    let normal = Quat::from_axis_angle(twig, rng.range(-0.6, 0.6)) * b.normal;
+                    let tint = needle_color(rng, habit, light, growth(b) + t * 0.3);
+                    frond(out, at, at + twig * twig_reach, normal, 0.017, tint);
                 }
-            } else {
-                let color = needle_color(rng, habit, brightness, tip_growth);
-                let width = if plates { 0.12 } else { 0.05 };
-                frond(out, here, here + direction * shoot, normal, width, color);
+                if rng.next() < 0.22 {
+                    // A tuft of needles standing up off the twig.
+                    let up = (b.normal * 0.8 + axis * 0.5).normalize();
+                    let tint = needle_color(rng, habit, light * 1.05, growth(b) + t * 0.4);
+                    frond(out, at, at + up * twig_reach * 0.6, across, 0.015, tint);
+                }
+                t += 0.06 / size.max(0.05) * rng.range(0.85, 1.15);
             }
         }
-        sign = -sign;
-        s += step;
+    } else {
+        // Merge each run of neighbors on one side into one spray from the
+        // first base out to their mean tip.
+        for flip in [-1.0f32, 1.0] {
+            let one_side: Vec<&Branchlet> = branchlets.iter().filter(|b| b.sign == flip).collect();
+            for run in one_side.chunks(detail.group) {
+                let n = run.len() as f32;
+                let base = run[0].base;
+                let mid = run.iter().map(|b| b.mid).sum::<Vec3>() / n;
+                let tip = run.iter().map(|b| b.tip).sum::<Vec3>() / n;
+                let normal = run
+                    .iter()
+                    .map(|b| b.normal)
+                    .sum::<Vec3>()
+                    .normalize_or(Vec3::Y);
+                let lead = run[run.len() / 2];
+                let light = brightness(lead);
+                // Wider runs cover the gaps between the merged branchlets.
+                let width = detail.width * (0.75 + 0.25 * n);
+                let points = [base, mid, tip];
+                for bend in 0..detail.bends {
+                    let (from, to) = if detail.bends == 1 {
+                        (points[0], points[2])
+                    } else {
+                        (points[bend], points[bend + 1])
+                    };
+                    let color = needle_color(rng, habit, light, growth(lead));
+                    frond(out, from, to, normal, width, color);
+                }
+            }
+        }
     }
     // Needles also clothe the limb itself.
-    if !plates {
+    if detail.clothe {
         let links = (length / 0.25).ceil().max(2.0) as u32;
         for link in 0..links {
             let s0 = link as f32 / links as f32;
             let s1 = (link + 1) as f32 / links as f32;
-            if s1 < 0.3 {
+            if s1 < 0.15 {
                 continue;
             }
             let normal = (point(s0) - point(s1)).cross(side).normalize_or(Vec3::Y) * -1.0;
@@ -642,10 +848,12 @@ fn limb(
                 (0.42 + 0.58 * s1) * shade_scale,
                 (s1 - 0.72).max(0.0) * 2.5,
             );
+            // Needles stand up off the top of the limb and hide the wood.
+            let lift = normal * 0.02 * detail.grow.sqrt();
             frond(
                 out,
-                point(s0),
-                point(s1),
+                point(s0) + lift,
+                point(s1) + lift,
                 normal,
                 0.045 * detail.grow.sqrt(),
                 color,
@@ -654,13 +862,13 @@ fn limb(
     }
     // A terminal bud spray continues the limb past the last pair.
     let end = point(1.0);
-    let tangent = (end - point(0.95)).normalize_or(outward);
+    let along = (tangent(1.0) + outward * 0.6).normalize();
     // Keep it narrow and only slightly lighter, or the tips read as dots.
     let color = needle_color(rng, habit, shade_scale, 0.45);
     spray(
         out,
         end,
-        end + tangent * 0.26 * detail.grow.sqrt(),
+        end + along * 0.26 * detail.grow.sqrt(),
         side,
         0.028 * detail.grow,
         color,
