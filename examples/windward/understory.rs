@@ -4,7 +4,7 @@
 //! shadows, so each fern keeps the old glTF fern as a shadow-only child.
 
 use bevy::prelude::*;
-use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting};
+use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiTransmission};
 
 use crate::{
     detail::{CameraView, ScreenDetail},
@@ -157,6 +157,8 @@ fn add_plant(commands: &mut Commands, variant: &Variant, at: Vec2, seed: u32, fe
             level: 1,
         },
         lighting,
+        // Thin fronds glow when the low sun is behind them, like the grass.
+        SpaghettiTransmission(0.5),
         Transform::from_xyz(at.x, ground(at) - 0.02, at.y)
             .with_scale(Vec3::splat(scale))
             .with_rotation(rotation),
