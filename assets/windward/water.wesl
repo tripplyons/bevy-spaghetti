@@ -3,6 +3,7 @@ import bevy_pbr::render::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
 };
+import super::shore::{BANK_SOIL_TINT, GRAVEL_TINT, GRAVEL_SCALE, gravel_coverage, gravel_normal};
 
 struct Lake {
     reflected_clip_from_world: mat4x4<f32>,
@@ -16,9 +17,9 @@ var reflected_scene: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(102)
 var reflected_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(103)
-var depth_map: texture_2d<f32>;
+var lakebed_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(104)
-var depth_sampler: sampler;
+var lakebed_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(105)
 var sediment: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(106)
@@ -27,6 +28,8 @@ var sediment_sampler: sampler;
 var bank_color: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(108)
 var bank_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(109)
+var sediment_normal: texture_2d<f32>;
 
 const WIND: vec2<f32> = vec2(0.50, 0.866);
 
@@ -108,7 +111,8 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
         wave(q, pixel, vec2(0.98, 0.20), 21.17, 0.012, 3.3);
     let uv = (p - vec2(10.0, -14.0)) / vec2(28.0, 42.0) + 0.5;
     // Signed depth in meters; it reaches zero on the waterline.
-    let depth = max(textureSample(depth_map, depth_sampler, uv).r, 0.0);
+    let lakebed = textureSample(lakebed_map, lakebed_sampler, uv);
+    let depth = max(lakebed.r, 0.0);
     let near_bank = 1.0 - smoothstep(0.04, 0.62, depth);
     // Wind ripples. Slow patches of stronger wind ("cat's paws") drift
     // across the lake and modulate them.
@@ -124,8 +128,8 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
     let gust = (0.74 + 0.22 * front_phase) * (1.0 - 0.52 * near_bank) * calm;
     // A sheltered tarn at dusk: gentle slopes keep the reflection readable.
     let slope_total = (slope + ripples) * gust * 0.5;
-    surface.N = normalize(vec3(-slope_total.x, 1.0, -slope_total.y));
-    let cos_theta = clamp(dot(surface.V, surface.N), 0.0, 1.0);
+    let water_normal = normalize(vec3(-slope_total.x, 1.0, -slope_total.y));
+    let cos_theta = clamp(dot(surface.V, water_normal), 0.0, 1.0);
     // Refraction keeps the underwater ray closer to vertical than the viewing
     // ray. Absorption removes red first as its path through the water grows.
     let ratio = 1.0 / 1.333;
@@ -133,17 +137,40 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) front: bool) -> Fragmen
     let travel = depth / max(0.2, transmitted_cos);
     let transmission = exp(-vec3(2.7, 1.55, 1.1) * travel);
     let refracted = p - surface.V.xz * (travel * ratio);
-    let sediment_color = textureSample(sediment, sediment_sampler, refracted * 0.49).rgb * 0.44;
-    // At the waterline the bed is the same soil as the bank: the terrain's
-    // albedo tile times its wet vertex tint (see `landscape::terrain`).
-    let soil = textureSample(bank_color, bank_sampler, refracted * 0.41).rgb * vec3(0.44, 0.42, 0.35);
-    // Soaked soil is darker, and the darkening starts within a few centimeters.
-    let soaked = smoothstep(0.0, 0.025, depth);
-    let bed = mix(soil, sediment_color, smoothstep(0.03, 0.45, depth)) * (1.0 - 0.38 * soaked);
+    let gravel_uv = refracted * GRAVEL_SCALE;
+    let gravel_dx = dpdx(gravel_uv);
+    let gravel_dy = dpdy(gravel_uv);
+    let gravel = textureSample(sediment, sediment_sampler, gravel_uv).rgb * GRAVEL_TINT;
+    var gravel_weight = 1.0;
+    var substrate = gravel;
+    if depth < 0.46 {
+        let soil_scale = 0.41 / GRAVEL_SCALE;
+        let soil = textureSampleGrad(
+            bank_color, bank_sampler, gravel_uv * soil_scale,
+            gravel_dx * soil_scale, gravel_dy * soil_scale,
+        ).rgb * BANK_SOIL_TINT;
+        gravel_weight = mix(gravel_coverage(refracted), 1.0, smoothstep(0.10, 0.46, depth));
+        substrate = mix(soil, gravel, gravel_weight);
+    }
+    let soaked = smoothstep(0.0, 0.28, depth);
+    let bed = substrate * (1.0 - 0.52 * soaked);
     let pool = vec3(0.016, 0.038, 0.037);
     surface.material.base_color = vec4(mix(pool, bed, transmission), 1.0);
     // Blend from the bank's matte soil into a glossy wet film, then open water.
-    let film = smoothstep(0.0, 0.035, depth);
+    let film = smoothstep(0.0, 0.09, depth);
+    surface.N = water_normal;
+    if film < 0.999 {
+        // Let the damp sediment and the first centimeters of water follow
+        // the same slope and grain on either side of the shoreline.
+        let bed_normal = normalize(vec3(-lakebed.g, 1.0, -lakebed.b));
+        let tangent = normalize(vec3(1.0, lakebed.g, 0.0));
+        let bitangent = cross(tangent, bed_normal);
+        let grain = textureSampleGrad(sediment_normal, sediment_sampler, gravel_uv, gravel_dx, gravel_dy);
+        let local_normal = gravel_normal(grain.rgb);
+        let gravel_world_normal = normalize(mat3x3(tangent, bitangent, bed_normal) * local_normal);
+        let wet_bed = normalize(mix(bed_normal, gravel_world_normal, gravel_weight));
+        surface.N = normalize(mix(wet_bed, water_normal, film));
+    }
     let water_roughness = 0.105 + 0.028 * gust + 0.065 * near_bank;
     surface.material.perceptual_roughness = mix(0.67, water_roughness, film);
     // The planar mirror below supplies the water's reflection. In the

@@ -202,8 +202,6 @@ pub struct Form {
     pub flag: f32,
     /// Trunk radius multiplier.
     pub girth: f32,
-    /// A dead standing tree with grey wood and no needles.
-    pub snag: bool,
 }
 
 pub const HEALTHY: Form = Form {
@@ -213,7 +211,6 @@ pub const HEALTHY: Form = Form {
     broken_at: 1.0,
     flag: 0.0,
     girth: 1.0,
-    snag: false,
 };
 
 impl Habit {
@@ -229,6 +226,54 @@ impl Habit {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct Stem {
+    pub height: f32,
+    pub top: f32,
+    pub bole: f32,
+    pub radius: f32,
+}
+
+impl Stem {
+    pub fn for_tree(seed: u32, height: f32, form: &Form) -> Self {
+        Self::new(&mut Rng(seed.wrapping_mul(7919)), height, form)
+    }
+
+    fn new(rng: &mut Rng, height: f32, form: &Form) -> Self {
+        let bole = if form.bole > 0.0 {
+            height * form.bole * rng.range(0.85, 1.15)
+        } else {
+            height * rng.range(0.07, 0.12)
+        };
+        Self {
+            height,
+            top: height * form.broken_at.min(1.0),
+            bole,
+            radius: (0.018 * height + 0.03) * form.girth,
+        }
+    }
+
+    pub fn end(self) -> f32 {
+        if self.top < self.height {
+            self.top
+        } else {
+            0.92 * self.height
+        }
+    }
+
+    pub fn radius_at(self, y: f32) -> f32 {
+        let y = y.max(0.0);
+        let flare = 1.0 + 0.7 * (-y / 0.35).exp();
+        self.radius * (1.0 - y / self.height).max(0.06) * flare
+    }
+}
+
+pub struct Fir {
+    pub splats: Vec<GaussianSegment>,
+    /// The stem appears first, so a mesh can supply it in the main view.
+    pub trunk_end: usize,
+}
+
 /// Builds one fir rooted at the origin with its leader at `height`.
 pub fn fir(
     seed: u32,
@@ -237,43 +282,28 @@ pub fn fir(
     height: f32,
     crown_radius: f32,
     level: usize,
-) -> Vec<GaussianSegment> {
+) -> Fir {
     let detail = &LEVELS[level];
     let mut rng = Rng(seed.wrapping_mul(7919));
     let mut out = Vec::new();
-    let base = if form.bole > 0.0 {
-        height * form.bole * rng.range(0.85, 1.15)
-    } else {
-        height * rng.range(0.07, 0.12)
-    };
-    let trunk_radius = (0.018 * height + 0.03) * form.girth;
-    let top = height * form.broken_at.min(1.0);
+    let stem = Stem::new(&mut rng, height, form);
+    let Stem {
+        bole: base,
+        radius: trunk_radius,
+        top,
+        ..
+    } = stem;
     let dead = Habit {
         old: DEAD_OLD,
         young: DEAD_YOUNG,
         ..*habit
     };
 
-    trunk(
-        &mut out,
-        &mut rng.fork(),
-        height,
-        top,
-        base,
-        trunk_radius,
-        form.snag,
-        detail,
-    );
+    trunk(&mut out, &mut rng.fork(), stem, detail);
     if form.broken_at < 1.0 {
-        splinters(
-            &mut out,
-            &mut rng.fork(),
-            height,
-            top,
-            trunk_radius,
-            form.snag,
-        );
+        splinters(&mut out, &mut rng.fork(), height, top, trunk_radius);
     }
+    let trunk_end = out.len();
 
     // Annual whorls get closer together near the leader, where growth is
     // recent and the shoots are short.
@@ -329,23 +359,6 @@ pub fn fir(
                 1.0
             };
             let length = reach * rng.range(0.7, 1.1) * vigor * toward_light * stunted;
-            if form.snag {
-                // Only short, broken stubs of the old limbs remain.
-                if rng.next() < 0.6 {
-                    stub(
-                        &mut out,
-                        &mut rng.fork(),
-                        y,
-                        azimuth,
-                        length,
-                        rel,
-                        height,
-                        trunk_radius,
-                        detail,
-                    );
-                }
-                continue;
-            }
             let length = length * (1.0 + 0.3 * exposure * azimuth.cos());
             limb(
                 &mut out,
@@ -374,11 +387,7 @@ pub fn fir(
             let at = y + step * rng.range(0.25, 0.8);
             let length = reach * rng.range(0.3, 0.62);
             let azimuth = rng.range(0.0, std::f32::consts::TAU);
-            if form.snag
-                || at > top - 0.2
-                || rng.next() < thin
-                || azimuth.cos() < -1.0 + 1.6 * exposure
-            {
+            if at > top - 0.2 || rng.next() < thin || azimuth.cos() < -1.0 + 1.6 * exposure {
                 continue;
             }
             limb(
@@ -401,7 +410,7 @@ pub fn fir(
             let length = (reach * rng.range(0.18, 0.3)).min(0.6) + 0.15;
             let azimuth = rng.range(0.0, std::f32::consts::TAU);
             let mut stream = rng.fork();
-            if form.snag || at > top - 0.3 || rng.next() < thin || !detail.interior {
+            if at > top - 0.3 || rng.next() < thin || !detail.interior {
                 continue;
             }
             limb(
@@ -422,20 +431,21 @@ pub fn fir(
     }
 
     let crest = if form.dead_above < 1.0 { &dead } else { habit };
-    if form.snag {
-        // A snag keeps no leader.
-    } else if form.broken_at < 1.0 {
+    if form.broken_at < 1.0 {
         // A side limb below the break turns up to become a new leader.
         let from = Vec3::Y * (top - 0.35) + toward * trunk_radius;
         let to = from + (toward * 0.35 + Vec3::Y).normalize() * 0.9;
         let color = needle_color(&mut rng, crest, 1.0, 1.0);
-        spray(
-            &mut out,
-            from,
-            to,
-            toward.cross(Vec3::Y),
-            0.05 * detail.grow.min(2.0),
-            color,
+        out.push(
+            spray(
+                from,
+                to,
+                toward.cross(Vec3::Y),
+                0.05 * detail.grow.min(2.0),
+                color,
+            )
+            .with_cutout_taper(0.32)
+            .with_bend_heights(0.0, 0.45),
         );
     } else {
         // The leader is a short upright spray above the last whorl.
@@ -443,18 +453,24 @@ pub fn fir(
         let top = Vec3::Y * height + habit.bend(height, height, toward) * 1.4
             - Vec3::Y * habit.nod(height) * 0.4;
         let color = needle_color(&mut rng, crest, 1.0, 1.0);
-        spray(
-            &mut out,
-            leader_from,
-            top,
-            toward.cross(Vec3::Y),
-            0.05 * detail.grow.min(2.0),
-            color,
+        out.push(
+            spray(
+                leader_from,
+                top,
+                toward.cross(Vec3::Y),
+                0.05 * detail.grow.min(2.0),
+                color,
+            )
+            .with_cutout_taper(0.32)
+            .with_bend_heights(0.0, 0.55),
         );
     }
-    if level >= 2 || form.snag {
+    if level >= 2 {
         // A few dead stubs below the crown would vanish at this size anyway.
-        return out;
+        return Fir {
+            splats: out,
+            trunk_end,
+        };
     }
     // Dead lower branches: bare grey twigs below the living crown.
     let mut y = 0.9;
@@ -465,44 +481,35 @@ pub fn fir(
         let start = Vec3::Y * y + direction.with_y(0.0).normalize() * trunk_radius * 0.8;
         let end = start + direction.normalize() * length;
         let width = 0.012;
-        out.push(GaussianSegment::new(
-            start,
-            end,
-            Vec3::splat(width),
-            Quat::from_rotation_arc(
-                Vec3::Z,
-                Vec3::new(direction.x, 0.6, direction.z).normalize(),
-            ),
-            5.0 * length * width,
-            Vec3::new(0.085, 0.075, 0.065),
-        ));
+        out.push(
+            GaussianSegment::new(
+                start,
+                end,
+                Vec3::splat(width),
+                Quat::from_rotation_arc(
+                    Vec3::Z,
+                    Vec3::new(direction.x, 0.6, direction.z).normalize(),
+                ),
+                5.0 * length * width,
+                Vec3::new(0.085, 0.075, 0.065),
+            )
+            .with_cutout_taper(0.32),
+        );
         y += rng.range(0.12, 0.35);
     }
-    out
+    Fir {
+        splats: out,
+        trunk_end,
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn trunk(
-    out: &mut Vec<GaussianSegment>,
-    rng: &mut Rng,
-    height: f32,
-    top: f32,
-    base: f32,
-    radius: f32,
-    snag: bool,
-    detail: &Level,
-) {
+fn trunk(out: &mut Vec<GaussianSegment>, rng: &mut Rng, stem: Stem, detail: &Level) {
     let mut y = 0.0;
-    let end = if top < height { top } else { height * 0.92 };
+    let end = stem.end();
     while y < end {
-        let step = detail.trunk_step;
-        let taper = |y: f32| {
-            let flare = 1.0 + 0.7 * (-y / 0.35).exp();
-            radius * (1.0 - y / height).max(0.06) * flare
-        };
-        let step = step.min(end - y + 0.05);
-        let r0 = taper(y);
-        let r1 = taper(y + step);
+        let step = detail.trunk_step.min(end - y + 0.05);
+        let r0 = stem.radius_at(y);
+        let r1 = stem.radius_at(y + step);
         for strip in 0..detail.strips {
             let angle = strip as f32 * std::f32::consts::TAU / detail.strips as f32
                 + rng.range(-0.15, 0.15);
@@ -513,17 +520,10 @@ fn trunk(
             // Ridged bark: dark grey with warm fissures.
             let fissure = rng.next();
             // The crown shades the stem above the lowest live limbs.
-            let shade = if y > base && !snag { 0.32 } else { 1.0 };
+            let shade = if y > stem.bole { 0.32 } else { 1.0 };
             let tone = (0.75 + 0.5 * rng.next()) * shade;
-            // Sun and wind bleach the bare wood of a snag silver-grey.
-            let (ridge, groove) = if snag {
-                (Vec3::new(0.30, 0.285, 0.265), Vec3::new(0.15, 0.135, 0.12))
-            } else {
-                (
-                    Vec3::new(0.115, 0.105, 0.095),
-                    Vec3::new(0.060, 0.050, 0.042),
-                )
-            };
+            let ridge = Vec3::new(0.115, 0.105, 0.095);
+            let groove = Vec3::new(0.060, 0.050, 0.042);
             let color = ridge.lerp(groove, fissure) * tone;
             let rotation = Quat::from_mat3(&Mat3::from_cols(
                 Vec3::Y.cross(outward).normalize(),
@@ -544,20 +544,9 @@ fn trunk(
 }
 
 /// Jagged spikes of wood where the stem snapped.
-fn splinters(
-    out: &mut Vec<GaussianSegment>,
-    rng: &mut Rng,
-    height: f32,
-    top: f32,
-    radius: f32,
-    snag: bool,
-) {
+fn splinters(out: &mut Vec<GaussianSegment>, rng: &mut Rng, height: f32, top: f32, radius: f32) {
     let r = radius * (1.0 - top / height).max(0.06);
-    let color = if snag {
-        Vec3::new(0.30, 0.28, 0.25)
-    } else {
-        Vec3::new(0.20, 0.16, 0.11)
-    };
+    let color = Vec3::new(0.20, 0.16, 0.11);
     for _ in 0..3 {
         let angle = rng.range(0.0, std::f32::consts::TAU);
         let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
@@ -572,45 +561,6 @@ fn splinters(
             Quat::from_rotation_arc(Vec3::Z, outward),
             5.0 * width * start.distance(end),
             color * rng.range(0.8, 1.15),
-        ));
-    }
-}
-
-/// A bare, broken limb stub on a snag.
-#[allow(clippy::too_many_arguments)]
-fn stub(
-    out: &mut Vec<GaussianSegment>,
-    rng: &mut Rng,
-    y: f32,
-    azimuth: f32,
-    reach: f32,
-    rel: f32,
-    height: f32,
-    trunk_radius: f32,
-    detail: &Level,
-) {
-    let outward = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
-    let length = reach * rng.range(0.2, 0.7) + 0.2;
-    // Far levels draw one thick link; the fine twigs would vanish anyway.
-    let links = if detail.wood { 3 } else { 1 };
-    let r = trunk_radius * (1.0 - y / height).max(0.06);
-    let droop = rng.range(-0.35, 0.1) - 0.2 * (1.0 - rel);
-    let point = |s: f32| {
-        Vec3::Y * y + outward * (r * 0.6 + length * s) + Vec3::Y * (droop * length * s * s)
-    };
-    let grow = if detail.wood { 1.0 } else { 1.6 };
-    let tone = rng.range(0.8, 1.15);
-    for link in 0..links {
-        let s0 = link as f32 / links as f32;
-        let s1 = (link + 1) as f32 / links as f32;
-        let width = (0.008 + 0.03 * (1.0 - s0) * (length / 1.5).min(1.0)) * grow;
-        out.push(GaussianSegment::new(
-            point(s0),
-            point(s1),
-            Vec3::splat(width),
-            Quat::from_rotation_arc(Vec3::Z, Vec3::Y),
-            5.0 * width * length / links as f32,
-            Vec3::new(0.26, 0.245, 0.225) * tone,
         ));
     }
 }
@@ -653,6 +603,7 @@ fn limb(
     height: f32,
     detail: &Level,
 ) {
+    let first = out.len();
     let outward = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
     let side = Vec3::Y.cross(outward).normalize();
     // The limb leaves the trunk at `start` and bends down along its length
@@ -768,14 +719,17 @@ fn limb(
         for b in &branchlets {
             let light = brightness(b);
             let size = b.base.distance(b.tip);
+            let width = |t: f32| detail.width * (1.0 - 0.58 * t);
             for bend in 0..detail.bends {
                 let t0 = bend as f32 / detail.bends as f32;
                 let t1 = (bend + 1) as f32 / detail.bends as f32;
                 let color = needle_color(rng, habit, light, growth(b)) * 0.8;
-                frond(out, b.at(t0), b.at(t1), b.normal, detail.width, color);
+                out.push(
+                    frond(b.at(t0), b.at(t1), b.normal, width(t0), color)
+                        .with_cutout_taper(width(t1) / width(t0)),
+                );
             }
-            // Short twigs on both sides, each rolled its own way, so the
-            // needles gather in tufts instead of one flat plane.
+            // Stagger the twig roots and roll each spray independently.
             let mut t = 0.08;
             while t < 1.0 {
                 let at = b.at(t);
@@ -784,17 +738,27 @@ fn limb(
                 let across = b.normal.cross(axis).normalize_or(side);
                 let twig_reach = 0.1 * (1.0 - 0.45 * t) * reach.sqrt() * rng.range(0.75, 1.2);
                 for lean in [-1.0f32, 1.0] {
-                    let twig =
-                        (axis * 0.6 + across * lean * 0.75 - Vec3::Y * b.hang * 0.25).normalize();
-                    let normal = Quat::from_axis_angle(twig, rng.range(-0.6, 0.6)) * b.normal;
+                    let roll = rng.range(-0.6, 0.6);
+                    let root = b.at((t + lean * 0.018).clamp(0.0, 1.0));
+                    let twig = (axis * (0.72 + roll * 0.3) + across * lean * 0.72
+                        - Vec3::Y * (b.hang * 0.25 - roll * 0.2))
+                        .normalize();
+                    let normal = Quat::from_axis_angle(twig, roll) * b.normal;
                     let tint = needle_color(rng, habit, light, growth(b) + t * 0.3);
-                    frond(out, at, at + twig * twig_reach, normal, 0.017, tint);
+                    let end = root + twig * twig_reach * (1.0 + roll * 0.32);
+                    out.push(
+                        frond(root, end, normal, 0.019 * (1.0 - 0.20 * t), tint)
+                            .with_cutout_taper(0.28),
+                    );
                 }
                 if rng.next() < 0.22 {
                     // A tuft of needles standing up off the twig.
                     let up = (b.normal * 0.8 + axis * 0.5).normalize();
                     let tint = needle_color(rng, habit, light * 1.05, growth(b) + t * 0.4);
-                    frond(out, at, at + up * twig_reach * 0.6, across, 0.015, tint);
+                    out.push(
+                        frond(at, at + up * twig_reach * 0.6, across, 0.015, tint)
+                            .with_cutout_taper(0.4),
+                    );
                 }
                 t += 0.06 / size.max(0.05) * rng.range(0.85, 1.15);
             }
@@ -807,7 +771,6 @@ fn limb(
             for run in one_side.chunks(detail.group) {
                 let n = run.len() as f32;
                 let base = run[0].base;
-                let mid = run.iter().map(|b| b.mid).sum::<Vec3>() / n;
                 let tip = run.iter().map(|b| b.tip).sum::<Vec3>() / n;
                 let normal = run
                     .iter()
@@ -818,29 +781,30 @@ fn limb(
                 let light = brightness(lead);
                 // Wider runs cover the gaps between the merged branchlets.
                 let width = detail.width * (0.75 + 0.25 * n);
-                let points = [base, mid, tip];
-                for bend in 0..detail.bends {
-                    let (from, to) = if detail.bends == 1 {
-                        (points[0], points[2])
-                    } else {
-                        (points[bend], points[bend + 1])
-                    };
-                    let color = needle_color(rng, habit, light, growth(lead));
-                    frond(out, from, to, normal, width, color);
-                }
+                let color = needle_color(rng, habit, light, growth(lead));
+                let (width, taper) = if detail.group == 1 {
+                    (width * 1.14, 0.52)
+                } else {
+                    (width, 1.0)
+                };
+                out.push(frond(base, tip, normal, width, color).with_cutout_taper(taper));
             }
         }
     }
-    // Needles also clothe the limb itself.
+    // Short sprays alternate off the top of the limb. The wood can show
+    // through between them without drawing a continuous strip of foliage.
     if detail.clothe {
         let links = (length / 0.25).ceil().max(2.0) as u32;
+        let width = |s: f32| 0.028 * detail.grow.sqrt() * (1.0 - 0.65 * s.powf(1.7));
         for link in 0..links {
             let s0 = link as f32 / links as f32;
             let s1 = (link + 1) as f32 / links as f32;
             if s1 < 0.15 {
                 continue;
             }
-            let normal = (point(s0) - point(s1)).cross(side).normalize_or(Vec3::Y) * -1.0;
+            let root = point(s0);
+            let axis = point(s1) - root;
+            let normal = axis.cross(side).normalize_or(Vec3::Y);
             let normal = (normal + outward * 0.25).normalize();
             let color = needle_color(
                 rng,
@@ -848,15 +812,18 @@ fn limb(
                 (0.42 + 0.58 * s1) * shade_scale,
                 (s1 - 0.72).max(0.0) * 2.5,
             );
-            // Needles stand up off the top of the limb and hide the wood.
+            let lean = if link % 2 == 0 { 0.35 } else { -0.35 };
+            let reach = axis.length();
             let lift = normal * 0.02 * detail.grow.sqrt();
-            frond(
-                out,
-                point(s0) + lift,
-                point(s1) + lift,
-                normal,
-                0.045 * detail.grow.sqrt(),
-                color,
+            out.push(
+                frond(
+                    root + lift,
+                    root + axis * 0.81 + side * (reach * lean) + lift * 1.5,
+                    normal,
+                    width(s0),
+                    color,
+                )
+                .with_cutout_taper(0.36),
             );
         }
     }
@@ -865,25 +832,40 @@ fn limb(
     let along = (tangent(1.0) + outward * 0.6).normalize();
     // Keep it narrow and only slightly lighter, or the tips read as dots.
     let color = needle_color(rng, habit, shade_scale, 0.45);
-    spray(
-        out,
-        end,
-        end + along * 0.26 * detail.grow.sqrt(),
-        side,
-        0.028 * detail.grow,
-        color,
-    );
+    let tip = if detail.clothe {
+        spray(
+            end,
+            end + along * 0.19 * detail.grow.sqrt(),
+            side,
+            0.023 * detail.grow,
+            color,
+        )
+        .with_cutout_taper(0.23)
+    } else {
+        spray(
+            end,
+            end + along * 0.26 * detail.grow.sqrt(),
+            side,
+            0.028 * detail.grow,
+            color,
+        )
+    };
+    out.push(tip);
+
+    // Cantilever deflection under a tip load, with the root pinned and
+    // smaller shoots inheriting the motion of their attachment point.
+    let tip_flex = length * (0.52 + 0.36 * rel);
+    let flex = |position: Vec3| {
+        let u = ((position - nodes[0]).dot(outward) / length).clamp(0.0, 1.0);
+        tip_flex * (u * u * (1.5 - 0.5 * u))
+    };
+    for segment in &mut out[first..] {
+        *segment = segment.with_bend_heights(flex(segment.start()), flex(segment.end()));
+    }
 }
 
 /// A flat spray of needles along `start` → `end`, facing `normal`.
-fn frond(
-    out: &mut Vec<GaussianSegment>,
-    start: Vec3,
-    end: Vec3,
-    normal: Vec3,
-    width: f32,
-    color: Vec3,
-) {
+fn frond(start: Vec3, end: Vec3, normal: Vec3, width: f32, color: Vec3) -> GaussianSegment {
     let along = (end - start).normalize_or(Vec3::X);
     let across = normal
         .cross(along)
@@ -892,27 +874,20 @@ fn frond(
     let normal = along.cross(across);
     let rotation = Quat::from_mat3(&Mat3::from_cols(along, across, normal)).normalize();
     let length = start.distance(end);
-    out.push(GaussianSegment::new(
+    GaussianSegment::new(
         start,
         end,
         Vec3::new(width * 0.7, width, width * 0.22),
         rotation,
         3.4 * length * width,
         color,
-    ));
+    )
 }
 
-fn spray(
-    out: &mut Vec<GaussianSegment>,
-    start: Vec3,
-    end: Vec3,
-    side: Vec3,
-    width: f32,
-    color: Vec3,
-) {
+fn spray(start: Vec3, end: Vec3, side: Vec3, width: f32, color: Vec3) -> GaussianSegment {
     let along = (end - start).normalize_or(Vec3::Y);
     let normal = side.cross(along).normalize_or(Vec3::Z);
-    frond(out, start, end, normal, width, color);
+    frond(start, end, normal, width, color)
 }
 
 /// Dark blue-green needles. New growth at the tips is lighter and yellower.

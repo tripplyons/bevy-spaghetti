@@ -1,9 +1,13 @@
-//! Low-poly spire firs that cover the backdrop slopes below the timberline.
+//! Crown meshes for the Cascade slopes and the distant skyline.
+mod atlas;
+
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
+
+pub use atlas::image as crown_atlas;
 
 use super::Relief;
 use crate::landscape::{hash01, smoothstep};
@@ -11,19 +15,8 @@ use crate::landscape::{hash01, smoothstep};
 /// One candidate tree per cell of this size, jittered inside the cell.
 const CELL: f32 = 3.2;
 
-/// Base height, apex height, and radius of each tier, as fractions of the
-/// tree's height and radius. Stacked skirts give the notched fir outline.
-/// Distant firs use fewer tiers, since their notches are under a pixel.
-const TIERS: [&[(f32, f32, f32)]; 3] = [
-    &[
-        (0.03, 0.42, 1.0),
-        (0.24, 0.62, 0.8),
-        (0.45, 0.82, 0.58),
-        (0.66, 1.0, 0.36),
-    ],
-    &[(0.03, 0.5, 1.0), (0.3, 0.76, 0.72), (0.56, 1.0, 0.44)],
-    &[(0.03, 0.62, 1.0), (0.4, 1.0, 0.6)],
-];
+/// Two broad skirts suffice for the few pixels a skyline crown covers.
+const RIDGE_TIERS: &[(f32, f32, f32)] = &[(0.03, 0.62, 1.0), (0.4, 1.0, 0.6)];
 const POINTS: u32 = 6;
 
 /// Where one fir stands, how big it is, and its linear albedo.
@@ -40,6 +33,7 @@ pub struct CanopyMesh {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 4]>,
+    uvs: Vec<[f32; 2]>,
     indices: Vec<u32>,
 }
 
@@ -49,23 +43,70 @@ impl CanopyMesh {
     }
 
     pub fn into_mesh(self) -> Mesh {
-        Mesh::new(
+        let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::RENDER_WORLD,
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
-        .with_inserted_indices(Indices::U32(self.indices))
+        .with_inserted_indices(Indices::U32(self.indices));
+        if !self.uvs.is_empty() {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs);
+        }
+        mesh
     }
 
-    /// Adds a fir. `bake` turns albedo, position, and normal into the vertex color.
-    fn push_tree(
-        &mut self,
-        tiers: &[(f32, f32, f32)],
-        fir: Fir,
-        bake: &dyn Fn(Vec3, Vec3, Vec3) -> Vec3,
-    ) {
+    fn push_crown(&mut self, fir: Fir) {
+        let to_trail = super::WALK_CENTER - fir.base.xz();
+        let inward = to_trail.normalize_or(Vec2::X);
+        // Face the first card toward the walkable valley. A second view of
+        // the same crown fills in when the hiker approaches from the side.
+        let turn = (hash01(fir.seed + 19) - 0.5) * 0.52;
+        let axis = (-inward.perp()).rotate(Vec2::from_angle(turn));
+        let planes = if to_trail.length_squared() > 155.0_f32.powi(2) {
+            1
+        } else {
+            2
+        };
+        let lean = Vec2::new(hash01(fir.seed + 20) - 0.5, hash01(fir.seed + 21) - 0.5);
+        let top = fir.base
+            + Vec3::Y * (1.03 * fir.height)
+            + (lean * (0.11 * fir.height)).extend(0.0).xzy();
+        let variant = (hash01(fir.seed + 23) * atlas::VARIANTS as f32) as u32;
+        for (plane, axis) in [axis, axis.perp()].into_iter().take(planes).enumerate() {
+            let direction = axis.extend(0.0).xzy();
+            let half_width = direction * (1.46 * fir.radius);
+            let facing = 0.66 * inward.extend(0.0).xzy() + 0.46 * Vec3::Y;
+            let left = (facing - 0.75 * direction).normalize();
+            let right = (facing + 0.75 * direction).normalize();
+            let first = self.positions.len() as u32;
+            self.positions.extend([
+                (fir.base - half_width).to_array(),
+                (fir.base + half_width).to_array(),
+                (top - half_width).to_array(),
+                (top + half_width).to_array(),
+            ]);
+            self.normals.extend([
+                left.to_array(),
+                right.to_array(),
+                left.to_array(),
+                right.to_array(),
+            ]);
+            self.colors.extend([fir.color.extend(1.0).to_array(); 4]);
+            self.uvs.extend([
+                atlas::uv(variant, plane, Vec2::Y),
+                atlas::uv(variant, plane, Vec2::ONE),
+                atlas::uv(variant, plane, Vec2::ZERO),
+                atlas::uv(variant, plane, Vec2::X),
+            ]);
+            self.indices
+                .extend([first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+        }
+    }
+
+    /// Bakes lighting and aerial perspective into the skyline fir's vertices.
+    fn push_ridge_fir(&mut self, fir: Fir) {
         let Fir {
             base,
             height,
@@ -75,11 +116,11 @@ impl CanopyMesh {
         } = fir;
         let lean = Vec2::new(hash01(seed + 20) - 0.5, hash01(seed + 21) - 0.5) * 0.07;
         let axis = |fraction: f32| base + Vec3::new(lean.x, 1.0, lean.y) * fraction * height;
-        for (tier, &(bottom, top, width)) in tiers.iter().enumerate() {
+        for (tier, &(bottom, top, width)) in RIDGE_TIERS.iter().enumerate() {
             let seed = seed + 31 * tier as u32;
             let apex = axis(top);
             // Upper tiers catch more sky and sun; lower skirts sit in shade.
-            let shade = 0.55 + 0.6 * tier as f32 / tiers.len() as f32;
+            let shade = 0.55 + 0.6 * tier as f32 / RIDGE_TIERS.len() as f32;
             let turn = hash01(seed) * std::f32::consts::TAU;
             let rim: [Vec3; POINTS as usize] = std::array::from_fn(|point| {
                 let angle = turn + std::f32::consts::TAU * point as f32 / POINTS as f32;
@@ -92,27 +133,43 @@ impl CanopyMesh {
                         .extend(0.0)
                         .xzy()
             });
-            // Flat facets break each skirt into lit and shaded sprays.
+            // Average the neighboring faces at each rim vertex. Keeping
+            // separate vertices per tier preserves the shade under each skirt.
+            let anchor = axis(bottom);
+            let mut rim_normals = [Vec3::ZERO; POINTS as usize];
             for point in 0..POINTS as usize {
+                let next = (point + 1) % POINTS as usize;
                 let a = rim[point];
-                let b = rim[(point + 1) % POINTS as usize];
-                let mut normal = (b - a).cross(apex - a).normalize();
-                if normal.dot(a + b - 2.0 * axis(bottom)) < 0.0 {
-                    normal = -normal;
-                }
+                let b = rim[next];
+                let normal = (apex - a).cross(b - a);
+                rim_normals[point] += normal;
+                rim_normals[next] += normal;
+            }
+            let first = self.positions.len() as u32;
+            for (position, normal) in rim.into_iter().zip(rim_normals) {
+                // The narrow skirt faces nearly sideways. Tilt the foliage
+                // normals toward the sky for the light caught by the sprays.
+                debug_assert!(normal.dot(position - anchor) > 0.0);
+                let normal = normal.normalize();
                 let normal = (normal + Vec3::Y * 0.35).normalize();
-                let first = self.positions.len() as u32;
-                self.positions
-                    .extend([a.to_array(), b.to_array(), apex.to_array()]);
-                self.normals.extend([normal.to_array(); 3]);
-                let low = color * shade;
-                let high = color * (shade + 0.5);
-                self.colors.extend([
-                    bake(low, a, normal).extend(1.0).to_array(),
-                    bake(low, b, normal).extend(1.0).to_array(),
-                    bake(high, apex, normal).extend(1.0).to_array(),
-                ]);
-                self.indices.extend([first, first + 2, first + 1]);
+                self.positions.push(position.to_array());
+                self.normals.push(normal.to_array());
+                self.colors.push(
+                    super::ridge_light(color * shade, position, normal)
+                        .extend(1.0)
+                        .to_array(),
+                );
+            }
+            self.positions.push(apex.to_array());
+            self.normals.push(Vec3::Y.to_array());
+            self.colors.push(
+                super::ridge_light(color * (shade + 0.16), apex, Vec3::Y)
+                    .extend(1.0)
+                    .to_array(),
+            );
+            for point in 0..POINTS {
+                self.indices
+                    .extend([first + point, first + POINTS, first + (point + 1) % POINTS]);
             }
         }
     }
@@ -141,12 +198,12 @@ pub fn plant(relief: &Relief, tiles: UVec2, tile_size: f32) -> Vec<CanopyMesh> {
             }
             // Firs shrink toward the timberline, and slightly with distance so far
             // slopes read as larger mountains.
-            let stunted = 0.5 + 0.5 * (1.0 - cover.alpine);
-            let distance = 1.0 - 0.18 * smoothstep(120.0, 450.0, r);
-            let emergent = if hash01(seed + 7) < 0.06 { 1.45 } else { 1.0 };
+            let stunted = 1.0 - 0.64 * cover.alpine;
+            let distance = 1.0 - 0.24 * smoothstep(120.0, 450.0, r);
+            let emergent = if hash01(seed + 7) < 0.04 { 1.30 } else { 1.0 };
             let height =
                 6.4 * (0.55 + 0.8 * hash01(seed + 3).powf(1.5)) * emergent * stunted * distance;
-            let radius = height * (0.19 + 0.08 * hash01(seed + 4));
+            let radius = height * (0.145 + 0.11 * hash01(seed + 4));
             let tone = 0.65 + 0.7 * hash01(seed + 5);
             let hue = hash01(seed + 6);
             let color = Vec3::new(0.022, 0.039, 0.027)
@@ -159,18 +216,13 @@ pub fn plant(relief: &Relief, tiles: UVec2, tile_size: f32) -> Vec<CanopyMesh> {
                 * (1.0 - 0.18 * site.hollow.max(0.0));
             let base = Vec3::new(at.x, site.height - 0.3, at.y);
             let tile = ((at - min) / tile_size).floor().as_uvec2().min(tiles - 1);
-            let detail = usize::from(r > 210.0) + usize::from(r > 330.0);
-            chunks[(tile.y * tiles.x + tile.x) as usize].push_tree(
-                TIERS[detail],
-                Fir {
-                    base,
-                    height,
-                    radius,
-                    color,
-                    seed,
-                },
-                &|c, _, _| c,
-            );
+            chunks[(tile.y * tiles.x + tile.x) as usize].push_crown(Fir {
+                base,
+                height,
+                radius,
+                color,
+                seed,
+            });
         }
     }
     chunks
@@ -207,17 +259,13 @@ pub fn plant_ring(sectors: u32) -> Vec<CanopyMesh> {
             let base = Vec3::new(at.x, height_at - 1.4, at.y);
             let angle = at.y.atan2(at.x).rem_euclid(std::f32::consts::TAU);
             let sector = ((angle / std::f32::consts::TAU * sectors as f32) as u32).min(sectors - 1);
-            chunks[sector as usize].push_tree(
-                TIERS[2],
-                Fir {
-                    base,
-                    height,
-                    radius,
-                    color,
-                    seed,
-                },
-                &super::ridge_light,
-            );
+            chunks[sector as usize].push_ridge_fir(Fir {
+                base,
+                height,
+                radius,
+                color,
+                seed,
+            });
         }
     }
     chunks

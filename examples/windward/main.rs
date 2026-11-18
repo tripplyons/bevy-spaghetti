@@ -1,6 +1,7 @@
 //! Explore a windswept wetland. Run with `cargo run --example windward`.
 mod atmosphere;
 mod backdrop;
+mod bark;
 mod conifer;
 mod debris;
 mod detail;
@@ -64,6 +65,7 @@ fn add_scene(app: &mut App) {
         SpaghettiPlugin,
         MaterialPlugin::<landscape::GroundMaterial>::default(),
         MaterialPlugin::<lake::LakeMaterial>::default(),
+        MaterialPlugin::<backdrop::HighlandMaterial>::default(),
     ))
     .add_plugins(player::HikerPosePlugin)
     .init_resource::<player::Controls>()
@@ -99,7 +101,10 @@ fn add_scene(app: &mut App) {
             .chain()
             .after(bevy::input::InputSystems),
     )
-    .add_systems(FixedUpdate, (move_hiker, step_reeds).chain())
+    .add_systems(
+        FixedUpdate,
+        ((move_hiker, step_reeds).chain(), forest::bend_crowns),
+    )
     .add_systems(
         Update,
         (
@@ -111,6 +116,7 @@ fn add_scene(app: &mut App) {
             understory::select_understory_detail.after(follow_hiker),
             understory::bend_understory,
             props::select_prop_detail.after(follow_hiker),
+            bark::select_detail.after(follow_hiker),
             meadow::part_meadow,
             stone_grade::grade_stones,
         ),
@@ -122,6 +128,8 @@ fn spawn_camera(
     server: Res<AssetServer>,
     obstacles: Res<landscape::Obstacles>,
 ) {
+    // The cubemap continues the sky haze below the photographed horizon,
+    // where the scene's own terrain and treeline supply the silhouette.
     let sky: Handle<Image> = server
         .load_builder()
         .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| settings.is_srgb = false)

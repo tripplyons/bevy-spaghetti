@@ -14,6 +14,9 @@ const MAX_SEGMENTS: usize = 1_000_000;
 // The renderer sends this small table in the draw uniform.
 pub(crate) const MAX_DETAIL_TRANSITIONS: usize = 3;
 const TRANSITION_BYTES: usize = 12;
+const PROFILE_MARKER: u32 = 0x3f80_0000;
+const PROFILE_TAG_MASK: u32 = 0xff80_0000;
+const PROFILE_WIDTH_MASK: u32 = 1023;
 
 /// A finite segment convolved with a Gaussian of constant covariance.
 ///
@@ -86,6 +89,37 @@ impl GaussianSegment {
         self.end[3].max(self.sigma[3]).max(0.0)
     }
 
+    #[cfg(feature = "render")]
+    pub(crate) fn mean_bend_height(&self) -> f32 {
+        self.end[3] * 0.5 + self.sigma[3] * 0.5
+    }
+
+    /// Sets the end width relative to the start width in the cutout renderer.
+    ///
+    /// One keeps a constant width and zero gives the narrowest tip. Use this
+    /// independently of wind bending and leaf shading.
+    pub fn with_cutout_taper(mut self, end_width: f32) -> Self {
+        let width = (end_width.clamp(0.0, 1.0) * PROFILE_WIDTH_MASK as f32).round() as u32;
+        let bits = self.color[3].to_bits();
+        let profile = if bits & PROFILE_TAG_MASK == PROFILE_MARKER {
+            bits & !PROFILE_WIDTH_MASK
+        } else {
+            PROFILE_MARKER
+        };
+        self.color[3] = f32::from_bits(profile | width);
+        self
+    }
+
+    /// Returns the stored end-to-start width ratio for a cutout.
+    pub fn cutout_end_width(&self) -> f32 {
+        let bits = self.color[3].to_bits();
+        if bits & PROFILE_TAG_MASK == PROFILE_MARKER {
+            (bits & PROFILE_WIDTH_MASK) as f32 / PROFILE_WIDTH_MASK as f32
+        } else {
+            1.0
+        }
+    }
+
     /// Sets the blade height, endpoint fractions along it, and the ratio of
     /// end width to start width for a tapered foliage cutout.
     ///
@@ -98,10 +132,11 @@ impl GaussianSegment {
             height * fractions[0].clamp(0.0, 1.0),
             height * fractions[1].clamp(0.0, 1.0),
         );
-        let width = (end_width.clamp(0.0, 1.0) * 1023.0).round() as u32;
         // Keep the profile in a finite float with a fixed exponent. The
         // mantissa holds 13 height bits followed by 10 taper bits.
-        self.color[3] = f32::from_bits(0x3f80_0000 | (height_mm << 10) | width);
+        self = self.with_cutout_taper(end_width);
+        let bits = self.color[3].to_bits() & (PROFILE_MARKER | PROFILE_WIDTH_MASK);
+        self.color[3] = f32::from_bits(bits | (height_mm << 10));
         self
     }
 
@@ -408,13 +443,24 @@ mod tests {
             0.4,
             Vec3::new(0.1, 0.9, 0.5),
         );
-        let asset = SpaghettiAsset::new(vec![segment]).unwrap();
+        let tapered = segment.with_cutout_taper(0.25);
+        let blade = segment.with_blade_profile(2.0, [0.25, 0.75], 0.5);
+        let blade_with_taper = blade.with_cutout_taper(0.25);
+        assert_eq!(segment.cutout_end_width(), 1.0);
+        assert_eq!(tapered.color[3].to_bits(), 0x3f80_0100);
+        assert_eq!(blade.color[3].to_bits(), 0x3f80_0000 | (2000 << 10) | 512);
+        assert_eq!(
+            blade_with_taper,
+            segment.with_blade_profile(2.0, [0.25, 0.75], 0.25)
+        );
+        let segments = [segment, tapered, blade, blade_with_taper];
+        let asset = SpaghettiAsset::new(segments.to_vec()).unwrap();
         let mut bytes = Vec::new();
         asset.write(&mut bytes).unwrap();
         assert!(bytes.starts_with(MAGIC_V1));
         assert_eq!(
             SpaghettiAsset::from_bytes(&bytes).unwrap().segments(),
-            &[segment]
+            &segments
         );
         assert!(matches!(
             SpaghettiAsset::from_bytes(&bytes[..bytes.len() - 1]),

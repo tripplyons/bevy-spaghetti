@@ -29,6 +29,7 @@ struct View {
     direction_to_light: vec4<f32>,
     ambient: vec4<f32>,
     directional: vec4<f32>,
+    ground_ambient_delta: vec4<f32>,
     eye_relative_from_local: mat4x4<f32>,
     fog: Fog,
     world_from_local: mat4x4<f32>,
@@ -44,7 +45,7 @@ struct View {
 @group(0) @binding(2) var<storage, read> order: array<u32>;
 @group(0) @binding(3) var<storage, read> occlusion: array<u32>;
 
-override SHADOW_QUAD: bool = false;
+override SCENE_SHADOWS: bool = false;
 override BAKED_OCCLUSION: bool = false;
 
 struct SunShadows {
@@ -86,10 +87,12 @@ fn segment_light(index: u32, midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32
     let facing = dot(normal, view.direction_to_light.xyz);
     // Thin foliage passes part of the light through from its back face.
     let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
-    if SHADOW_QUAD && incident > 0.0 {
+    if SCENE_SHADOWS && incident > 0.0 {
         light.y *= scene_shadow(midpoint, select(-normal, normal, facing >= 0.0));
     }
-    return light.x * view.ambient.rgb + (incident * light.y) * view.directional.rgb;
+    let ground_weight = 0.5 - 0.5 * normal.y;
+    let ambient = view.ambient.rgb + ground_weight * view.ground_ambient_delta.rgb;
+    return light.x * ambient + (incident * light.y) * view.directional.rgb;
 }
 
 struct Raster {
@@ -177,6 +180,9 @@ fn blade_profile(packed: f32) -> vec2<f32> {
 fn bend_endpoint(local: vec3<f32>, rise: f32, height: f32) -> vec3<f32> {
     if view.motion.y == 0.0 || !(rise > 0.0) {
         return local;
+    }
+    if view.motion.y == 2.0 {
+        return local + view.pusher.xyz * rise;
     }
     let world = (view.world_from_local * vec4(local, 1.0)).xyz;
     let at = world.xz;
@@ -347,7 +353,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     out.segment = vec2(segment.x / sigma_x, (segment.y - shear * segment.x) / sigma_y_given_x);
     out.depth = vec2(a_ndc.z, b_ndc.z);
     out.color_mass = vec4(0.0);
-    if !SHADOW_QUAD || vertex_index == 1u {
+    if vertex_index == 1u {
         let area_scale = length(cross(j0, j1));
         let peak = (splat.start_mass.w * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
         var color = splat.color.rgb;
@@ -513,7 +519,7 @@ fn cutout_vertex(
     out.profile = vec4(profile, mix(splat.end.w, splat.sigma.w, span.x), mix(splat.end.w, splat.sigma.w, span.y));
 
     out.color = vec3(0.0);
-    if !SHADOW_QUAD || vertex_index == 1u {
+    if vertex_index == 1u {
         var color = splat.color.rgb;
         if view.direction_to_light.w > 0.0 {
             let normal = rotate(q, vec3(0.0, 0.0, 1.0));
@@ -548,7 +554,7 @@ fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
     }
     // Tapered leaf kernels have a pale midrib and thinner, warmer edges.
     var color = in.color;
-    if in.profile.y < 1.0 && in.shape.z >= 1.0 {
+    if in.profile.x > 0.0 && in.profile.y < 1.0 && in.shape.z >= 1.0 {
         let rib = max(1.0 - abs(across) * 3.0, 0.0);
         let edge = across * across;
         // Suppress vein contrast as the blade shrinks below three pixels.

@@ -1,17 +1,21 @@
 use bevy::prelude::*;
 
-use bevy::camera::visibility::RenderLayers;
+use bevy::{
+    camera::visibility::{NoAutoAabb, RenderLayers},
+    light::NotShadowCaster,
+};
 use bevy_spaghetti::{
     DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
-    SpaghettiLighting, SpaghettiNearFade, SpaghettiReceiveShadows,
+    SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting, SpaghettiNearFade,
+    SpaghettiReceiveShadows, SpaghettiSway, SpaghettiTransmission,
 };
 
 use crate::{
-    conifer,
+    bark, conifer,
     lake::REFLECTED_LAYER,
     landscape::{
-        Obstacles, SHADOW_ONLY, SUN, ground, hash01, mark_rock_shadow, noise, shore_distance,
-        smoothstep, trail_x,
+        Obstacles, SHADOW_ONLY, SUN, ground, hash01, mark_rock_shadow, noise, reflected_layers,
+        shore_distance, smoothstep, trail_x,
     },
 };
 
@@ -26,6 +30,8 @@ const LOD_PIXELS: [f32; conifer::LEVEL_COUNT - 1] = [340.0, 95.0, 36.0];
 const CORE_DETAIL: f32 = 1.8;
 /// Crown radius at the lowest whorl, as a fraction of the impostor width.
 const CROWN: f32 = 0.42;
+/// Thin needle sprays let a little of the low sun through from behind.
+const NEEDLE_TRANSMISSION: SpaghettiTransmission = SpaghettiTransmission(0.28);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -86,7 +92,6 @@ const fn snag(broken_at: f32, girth: f32) -> conifer::Form {
     conifer::Form {
         broken_at,
         girth,
-        snag: true,
         ..conifer::HEALTHY
     }
 }
@@ -154,9 +159,9 @@ const VARIANTS: [Variant; 20] = [
         Some((2, 0.9)),
     ),
     // Snags: a tall broken fir, an intact grey spire, and an old stub.
-    Variant::new(Snag, &FIR, snag(0.68, 1.45), 9.6, 1.8, Some((1, 0.32))),
-    Variant::new(Snag, &SUBALPINE, snag(1.0, 1.15), 7.2, 0.9, Some((1, 0.22))),
-    Variant::new(Snag, &HEMLOCK, snag(0.48, 1.7), 8.0, 1.6, Some((2, 0.38))),
+    Variant::new(Snag, &FIR, snag(0.68, 1.45), 9.6, 1.8, None),
+    Variant::new(Snag, &SUBALPINE, snag(1.0, 1.15), 7.2, 0.9, None),
+    Variant::new(Snag, &HEMLOCK, snag(0.48, 1.7), 8.0, 1.6, None),
     // Old trees with tall clear boles and ragged crowns.
     Variant::new(Old, &FIR, old(0.3, 1.6, 0.14), 12.2, 3.3, Some((0, 3.3))),
     Variant::new(
@@ -176,45 +181,84 @@ const VARIANTS: [Variant; 20] = [
 #[derive(Component)]
 pub struct ForestDetail;
 
+#[derive(Component)]
+pub struct CrownWind {
+    reflection: Entity,
+    velocity: Vec2,
+    phase: f32,
+    frequency: f32,
+    exposure: f32,
+}
+
+pub fn bend_crowns(
+    time: Res<Time<Fixed>>,
+    mut crowns: Query<(&mut CrownWind, &mut SpaghettiSway)>,
+    mut reflections: Query<&mut SpaghettiSway, Without<CrownWind>>,
+) {
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+    for (mut crown, mut sway) in &mut crowns {
+        // Share the meadow's traveling wind front. The slower pulse and
+        // each tree's spring keep neighboring crowns from moving in sync.
+        let front = (crown.phase + 1.8 * t).sin();
+        let pulse = (0.62 * crown.phase + 0.79 * t).sin();
+        let crosswind = (1.32 * crown.phase + 2.2 * t).sin();
+        let target = crown.exposure
+            * (Vec2::new(0.82, 0.47) * (0.052 + 0.055 * front + 0.033 * pulse)
+                + Vec2::new(-0.47, 0.82) * (0.031 * crosswind));
+        let slope = sway.0.xz();
+        let frequency = crown.frequency;
+        let acceleration =
+            (target - slope) * (frequency * frequency) - crown.velocity * (1.55 * frequency);
+        crown.velocity += acceleration * dt;
+        let slope = slope + crown.velocity * dt;
+        sway.0 = Vec3::new(slope.x, 0.0, slope.y);
+        if let Ok(mut reflected) = reflections.get_mut(crown.reflection) {
+            *reflected = *sway;
+        }
+    }
+}
+
 struct TreeClouds {
     adaptive: Handle<SpaghettiAsset>,
-    /// The same levels with the coarser schedule of the stand cores.
-    core: Handle<SpaghettiAsset>,
     reflection: Handle<SpaghettiAsset>,
+}
+
+enum TreeModel {
+    Crown(TreeClouds, bark::BarkMeshes),
+    Snag(bark::BarkMeshes),
 }
 
 fn tree_clouds(
     clouds: &mut Assets<SpaghettiAsset>,
     height: f32,
-    levels: [Vec<GaussianSegment>; conifer::LEVEL_COUNT],
+    levels: [conifer::Fir; conifer::LEVEL_COUNT],
 ) -> TreeClouds {
     let reflection = clouds.add(
-        SpaghettiAsset::new(levels[conifer::LEVEL_COUNT - 1].clone())
+        SpaghettiAsset::new(levels[conifer::LEVEL_COUNT - 1].splats.clone())
             .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.30))
             .expect("procedural firs are valid"),
     );
-    let segments: Vec<GaussianSegment> = levels.iter().flatten().copied().collect();
-    let mut adaptive = |detail: f32| {
-        let mut finer_end = 0;
-        let transitions: [_; LOD_PIXELS.len()] = std::array::from_fn(|level| {
-            finer_end += levels[level].len() as u32;
-            let pixels = detail * LOD_PIXELS[level] / height;
-            DetailTransition {
-                finer_end,
-                pixels_per_unit: [0.8 * pixels, 1.2 * pixels],
-            }
-        });
-        clouds.add(
-            SpaghettiAsset::with_detail(segments.clone(), &transitions)
-                .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.30))
-                .expect("procedural firs have valid detail levels"),
-        )
-    };
-    let core = adaptive(CORE_DETAIL);
-    let adaptive = adaptive(1.0);
+    let crowns = levels
+        .each_ref()
+        .map(|level| &level.splats[level.trunk_end..]);
+    let segments: Vec<GaussianSegment> = crowns.into_iter().flatten().copied().collect();
+    let mut finer_end = 0;
+    let transitions: [_; LOD_PIXELS.len()] = std::array::from_fn(|level| {
+        finer_end += crowns[level].len() as u32;
+        let pixels = LOD_PIXELS[level] / height;
+        DetailTransition {
+            finer_end,
+            pixels_per_unit: [0.8 * pixels, 1.2 * pixels],
+        }
+    });
+    let adaptive = clouds.add(
+        SpaghettiAsset::with_detail(segments, &transitions)
+            .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.30))
+            .expect("procedural firs have valid detail levels"),
+    );
     TreeClouds {
         adaptive,
-        core,
         reflection,
     }
 }
@@ -237,21 +281,15 @@ fn choose(kind: Kind, seed: u32) -> usize {
 }
 
 /// Per-tree color: some crowns are yellower from stress, some bluer.
-fn tint(lighting: SpaghettiLighting, seed: u32, kind: Kind) -> SpaghettiLighting {
+fn crown_tint(seed: u32, kind: Kind) -> Vec3 {
     let bright = 0.84 + 0.3 * hash01(seed + 11);
-    let hue = if kind == Snag {
-        Vec3::ONE
-    } else if kind == Sapling {
+    let hue = if kind == Sapling {
         // Open-grown young trees are lighter and yellower.
         Vec3::new(1.3, 1.25, 1.0)
     } else {
         Vec3::new(1.07, 1.03, 0.84).lerp(Vec3::new(0.92, 0.99, 1.12), hash01(seed + 12))
     };
-    SpaghettiLighting {
-        ambient: lighting.ambient * hue * bright,
-        directional: lighting.directional * hue * bright,
-        ..lighting
-    }
+    hue * bright
 }
 
 /// One planted tree, chosen before any entity exists so the ground, grass,
@@ -582,13 +620,30 @@ pub fn spawn_trees(
         cull_mode: None,
         ..default()
     });
-    let splats: Vec<_> = VARIANTS
+    let bark_material = bark::bark_material(&server);
+    let living_bark = materials.add(StandardMaterial {
+        base_color: Color::linear_rgb(0.52, 0.39, 0.29),
+        ..bark_material.clone()
+    });
+    let snag_bark = materials.add(bark_material);
+    let models: Vec<_> = VARIANTS
         .iter()
         .enumerate()
         .map(|(index, variant)| {
+            let seed = index as u32 * 101 + 17;
+            if variant.kind == Snag {
+                return TreeModel::Snag(bark::BarkMeshes::snag(
+                    &mut meshes,
+                    seed,
+                    variant.height,
+                    variant.top(),
+                    variant.radius,
+                    variant.form.girth,
+                ));
+            }
             let levels = std::array::from_fn(|level| {
                 conifer::fir(
-                    index as u32 * 101 + 17,
+                    seed,
                     variant.habit,
                     &variant.form,
                     variant.height,
@@ -596,14 +651,13 @@ pub fn spawn_trees(
                     level,
                 )
             });
-            tree_clouds(&mut clouds, variant.top(), levels)
+            let stem = conifer::Stem::for_tree(seed, variant.height, &variant.form);
+            TreeModel::Crown(
+                tree_clouds(&mut clouds, variant.top(), levels),
+                bark::BarkMeshes::living(&mut meshes, seed, stem),
+            )
         })
         .collect();
-    let lighting = SpaghettiLighting {
-        direction_to_light: SUN,
-        ambient: Vec3::new(0.24, 0.27, 0.29),
-        directional: Vec3::new(0.62, 0.52, 0.40),
-    };
     let firs: [Handle<WorldAsset>; 3] =
         [0, 1, 2].map(|i| server.load(GltfAssetLabel::Scene(i).from_asset("windward/fir.glb")));
     for tree in &forest().trees {
@@ -617,75 +671,126 @@ pub fn spawn_trees(
             core,
         } = tree;
         let variant = &VARIANTS[pick];
-        let detail = &splats[pick];
-        let lighting = tint(lighting, seed, variant.kind);
         let mut transform = placement(at, scale, seed);
+        if obstacle {
+            add_obstacle(&mut obstacles, at, scale, variant.height);
+        }
+        let (detail, stem) = match &models[pick] {
+            TreeModel::Crown(detail, stem) => (detail, stem),
+            TreeModel::Snag(model) => {
+                let mut tree = commands.spawn((
+                    Name::new("Standing deadwood"),
+                    transform,
+                    model.coarse_mesh(),
+                    model.clone(),
+                    model.bounds,
+                    NoAutoAabb,
+                    MeshMaterial3d(snag_bark.clone()),
+                    reflected_layers(),
+                    ForestDetail,
+                ));
+                if distant {
+                    tree.insert(NotShadowCaster);
+                }
+                continue;
+            }
+        };
+        let tint = crown_tint(seed, variant.kind);
+        let lighting = SpaghettiLighting {
+            direction_to_light: SUN,
+            ambient: Vec3::new(0.64, 0.73, 0.75) * tint,
+            directional: Vec3::new(0.62, 0.52, 0.40) * tint,
+        };
+        // The ground reflects warmer light into the undersides of sprays.
+        let ground_ambient = SpaghettiGroundAmbient(Vec3::new(0.42, 0.39, 0.32) * tint);
         if variant.form.flag > 0.0 {
             // Flagged crowns all point downwind, toward +X.
             transform.rotation = Quat::from_rotation_y((hash01(seed + 3) - 0.5) * 0.6);
         }
-        commands
-            .spawn((
-                Name::new(if distant {
-                    "Distant conifer"
-                } else {
-                    "Conifer"
-                }),
-                transform,
-                Spaghetti3d(if core {
-                    detail.core.clone()
-                } else {
-                    detail.adaptive.clone()
-                }),
-                ForestDetail,
-                lighting,
-                SpaghettiReceiveShadows,
-                // Limbs between the follow camera and the hiker dissolve
-                // instead of smearing across the frame.
-                SpaghettiNearFade {
-                    start: 1.0,
-                    end: 3.4,
-                },
-                // Depth-writing cutouts skip the per-view sort and let the
-                // depth test reject hidden needles.
-                SpaghettiCutout,
-            ))
-            .with_children(|children| {
-                if core && let Some((_, radius)) = variant.shadow {
-                    // Core trees stand behind the stand edges, where a few
-                    // stacked cones cast a close enough shadow for a
-                    // fraction of the glTF crown's cost.
-                    children.spawn((
-                        Mesh3d(whorls.clone()),
-                        MeshMaterial3d(shadow_material.clone()),
-                        Transform::from_scale(Vec3::new(radius, variant.top(), radius)),
-                        RenderLayers::layer(SHADOW_ONLY),
-                    ));
-                } else if !distant && let Some((scene, radius)) = variant.shadow {
-                    // The glTF crown only casts the shadow. Snags use a
-                    // squeezed crown, which reads as a thin stem.
-                    let across = radius / (ATLAS_WIDTHS[scene] * CROWN);
-                    children
-                        .spawn((
-                            WorldAssetRoot(firs[scene].clone()),
-                            Transform::from_scale(Vec3::new(
-                                across,
-                                variant.top() / HEIGHTS[scene],
-                                across,
-                            )),
-                        ))
-                        .observe(mark_rock_shadow);
-                }
+        let mut reflected = commands.spawn((
+            Name::new("Reflected conifer"),
+            Spaghetti3d(detail.reflection.clone()),
+            lighting,
+            ground_ambient,
+            NEEDLE_TRANSMISSION,
+            SpaghettiReceiveShadows,
+            RenderLayers::layer(REFLECTED_LAYER),
+        ));
+        if !distant {
+            reflected.insert(SpaghettiSway::default());
+        }
+        let reflection = reflected.id();
+        let mut tree = commands.spawn((
+            Name::new(if distant {
+                "Distant conifer"
+            } else {
+                "Conifer"
+            }),
+            transform,
+            Spaghetti3d(detail.adaptive.clone()),
+            SpaghettiDetailScale(if core { CORE_DETAIL } else { 1.0 }),
+            ForestDetail,
+            lighting,
+            ground_ambient,
+            NEEDLE_TRANSMISSION,
+            SpaghettiReceiveShadows,
+            // Limbs between the follow camera and the hiker dissolve
+            // instead of smearing across the frame.
+            SpaghettiNearFade {
+                start: 1.0,
+                end: 3.4,
+            },
+            // Depth-writing cutouts skip the per-view sort and let the
+            // depth test reject hidden needles.
+            SpaghettiCutout,
+        ));
+        tree.add_child(reflection).with_children(|children| {
+            children.spawn((
+                Name::new("Living bark"),
+                stem.coarse_mesh(),
+                stem.clone(),
+                stem.bounds,
+                NoAutoAabb,
+                MeshMaterial3d(living_bark.clone()),
+                // The crown's proxy already supplies its shadow.
+                NotShadowCaster,
+            ));
+            if core && let Some((_, radius)) = variant.shadow {
+                // Core trees stand behind the stand edges, where a few
+                // stacked cones cast a close enough shadow for a
+                // fraction of the glTF crown's cost.
                 children.spawn((
-                    Name::new("Reflected conifer"),
-                    Spaghetti3d(detail.reflection.clone()),
-                    lighting,
-                    SpaghettiReceiveShadows,
-                    RenderLayers::layer(REFLECTED_LAYER),
+                    Mesh3d(whorls.clone()),
+                    MeshMaterial3d(shadow_material.clone()),
+                    Transform::from_scale(Vec3::new(radius, variant.top(), radius)),
+                    RenderLayers::layer(SHADOW_ONLY),
                 ));
-            });
-        if obstacle {
-            add_obstacle(&mut obstacles, at, scale, variant.height);
+            } else if !distant && let Some((scene, radius)) = variant.shadow {
+                // The glTF crown only casts the shadow.
+                let across = radius / (ATLAS_WIDTHS[scene] * CROWN);
+                children
+                    .spawn((
+                        WorldAssetRoot(firs[scene].clone()),
+                        Transform::from_scale(Vec3::new(
+                            across,
+                            variant.top() / HEIGHTS[scene],
+                            across,
+                        )),
+                    ))
+                    .observe(mark_rock_shadow);
+            }
+        });
+        if !distant {
+            tree.insert((
+                SpaghettiSway::default(),
+                CrownWind {
+                    reflection,
+                    velocity: Vec2::ZERO,
+                    phase: at.dot(Vec2::new(-0.29, 0.19)),
+                    frequency: 4.2 + 1.6 * hash01(seed + 13),
+                    exposure: scale * if core { 0.68 } else { 1.0 },
+                },
+            ));
         }
     }
 }

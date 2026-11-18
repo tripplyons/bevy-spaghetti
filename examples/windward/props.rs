@@ -19,20 +19,16 @@ use crate::{
     forest::ForestDetail,
     lake::REFLECTED_LAYER,
     landscape::{
-        LAKE, LAKE_RADII, Obstacles, ROCKS, RockDetail, SUN, WATER_LEVEL, ground, hash01,
-        mark_rock_shadow, noise, shore_distance, trail_x,
+        LAKE, LAKE_RADII, Obstacles, ROCKS, SUN, WATER_LEVEL, ground, hash01, mark_rock_shadow,
+        noise, shore_distance, trail_x,
     },
     player::HikerCamera,
 };
 
-/// Poly Haven "Tree Stump 01" (CC0), kept as the shadow caster.
+/// Poly Haven "Tree Stump 01" (CC0).
 const STUMP: &str = "windward/stump/tree_stump_01_1k.gltf";
-/// The same scan converted with spaghetti-convert at 30k, 9k, and 2.5k samples.
-const STUMP_CLOUDS: [&str; 3] = [
-    "windward/stump.spag",
-    "windward/stump-mid.spag",
-    "windward/stump-far.spag",
-];
+/// The same scan converted with spaghetti-convert at 2.5k samples.
+const STUMP_REFLECTION: &str = "windward/stump-far.spag";
 /// The scan's litter mound reaches 0.19 m below its origin about 0.6 to 0.9 m
 /// from the trunk axis.
 const STUMP_SKIRT: f32 = 0.17;
@@ -161,8 +157,6 @@ pub fn spawn_props(
     mut obstacles: ResMut<Obstacles>,
     trees: Query<&Transform, With<ForestDetail>>,
     logs: Query<&Transform, With<LogDetail>>,
-    rocks: Query<(Entity, &Transform, &Children), With<RockDetail>>,
-    scans: Query<&WorldAssetRoot>,
 ) {
     let mut clearance = Clearance {
         trees: trees.iter().map(|t| t.translation.xz()).collect(),
@@ -183,22 +177,10 @@ pub fn spawn_props(
         logs: clearance.logs.clone(),
     });
 
-    // The ledges come from the landscape with only a shadow caster, so give
-    // them the same opaque core as the props.
     let mut contacts = Vec::new();
-    for (entity, transform, children) in &rocks {
-        let Some(scan) = children.iter().find_map(|child| scans.get(child).ok()) else {
-            continue;
-        };
-        let core = spawn_core(&mut commands, scan.0.clone(), Vec3::splat(CORE_SCALE));
-        commands.entity(entity).add_child(core);
-        // The ROCKS scale is the ledge's footprint radius over 0.89.
-        let at = transform.translation.xz();
-        let radius = ROCKS
-            .iter()
-            .map(|&(x, z, scale)| (Vec2::new(x, z).distance_squared(at), 0.89 * scale))
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map_or(1.0, |(_, radius)| radius);
+    for (x, z, scale) in ROCKS {
+        let at = Vec2::new(x, z);
+        let radius = 0.89 * scale;
         if ground(at) > WATER_LEVEL + 0.02 {
             contacts.push((at, 0.55 * radius, 1.3 * radius, 0.72));
         }
@@ -313,8 +295,8 @@ fn spawn_stumps(
     clearance: &mut Clearance,
 ) -> Vec<(Vec2, f32)> {
     let mut placed = Vec::new();
-    let shadow = server.load(GltfAssetLabel::Scene(0).from_asset(STUMP));
-    let clouds = STUMP_CLOUDS.map(|path| load_lit_cloud(server, path));
+    let scan = server.load(GltfAssetLabel::Scene(0).from_asset(STUMP));
+    let reflection = load_lit_cloud(server, STUMP_REFLECTION);
     for (index, anchor) in STUMP_ANCHORS.into_iter().enumerate() {
         let seed = 4100 + index as u32 * 37;
         let scale = 1.1 + 0.5 * hash01(seed);
@@ -339,14 +321,20 @@ fn spawn_stumps(
         let transform = Transform::from_xyz(at.x, floor + STUMP_SKIRT * height, at.y)
             .with_rotation(Quat::from_rotation_y(hash01(seed + 2) * TAU))
             .with_scale(Vec3::new(scale, height, scale));
-        spawn_prop(
-            commands,
-            "Old-growth stump",
-            transform,
-            &clouds,
-            &shadow,
-            (178.0, 54.0),
-        );
+        // The opaque scan uses the bark's normal map and supplies the shadow.
+        commands
+            .spawn((
+                Name::new("Old-growth stump"),
+                WorldAssetRoot(scan.clone()),
+                transform,
+            ))
+            .with_child((
+                Name::new("Reflected stump"),
+                Spaghetti3d(reflection.clone()),
+                LIGHTING,
+                SpaghettiReceiveShadows,
+                RenderLayers::layer(REFLECTED_LAYER),
+            ));
         clearance.props.push((at, reach));
         placed.push((at, scale));
         // The unstretched scan is about 0.32 m in radius and 0.55 m tall.

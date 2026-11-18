@@ -1,9 +1,12 @@
 use bevy::{
     asset::RenderAssetUsages,
-    camera::{CameraProjection, Exposure, Hdr, RenderTarget, visibility::RenderLayers},
+    camera::{
+        CameraProjection, Exposure, Hdr, RenderTarget, primitives::Aabb, visibility::RenderLayers,
+    },
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
     image::ImageSampler,
     light::{GeneratedEnvironmentMapLight, NotShadowCaster, Skybox},
+    math::Vec3A,
     pbr::{DistanceFog, ExtendedMaterial, MaterialExtension},
     prelude::*,
     render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat},
@@ -13,6 +16,7 @@ use bevy::{
 use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset};
 
 use crate::{
+    detail::CameraView,
     landscape::{LAKE, SUN, SUN_COLOR, SUN_LUX, WATER_LEVEL, ground, load_tile, shore_distance},
     meadow::Meadow,
     player::HikerCamera,
@@ -21,10 +25,14 @@ use crate::{
 
 pub const LAKE_SURFACE_LAYER: usize = 2;
 pub const REFLECTED_LAYER: usize = 3;
-/// Half the 1280 x 800 main view in each axis.
-const REFLECTION_SIZE: UVec2 = UVec2::new(640, 400);
-const REFLECTION_PERIOD: f32 = 1.0 / 36.0;
+const REFLECTION_LIMIT: UVec2 = UVec2::new(640, 400);
+const REFLECTION_MIN_LONG_EDGE: f32 = 320.0;
+const MAX_REFLECTION_HZ: f32 = 36.0;
 const PLANE_SIZE: Vec2 = Vec2::new(28.0, 42.0);
+const LAKE_BOUNDS: Aabb = Aabb {
+    center: Vec3A::new(LAKE.x, WATER_LEVEL, LAKE.y),
+    half_extents: Vec3A::new(PLANE_SIZE.x * 0.5, 0.02, PLANE_SIZE.y * 0.5),
+};
 
 #[derive(Resource)]
 pub struct Lake(Handle<LakeMaterial>);
@@ -32,6 +40,7 @@ pub struct Lake(Handle<LakeMaterial>);
 #[derive(Component, Default)]
 pub struct ReflectedView {
     last_update: Option<f32>,
+    size: UVec2,
 }
 
 pub type LakeMaterial = ExtendedMaterial<StandardMaterial, LakeSurface>;
@@ -51,7 +60,7 @@ pub struct LakeSurface {
     reflection: Handle<Image>,
     #[texture(103)]
     #[sampler(104)]
-    lakebed_depth: Handle<Image>,
+    lakebed: Handle<Image>,
     #[texture(105)]
     #[sampler(106)]
     sediment: Handle<Image>,
@@ -59,6 +68,8 @@ pub struct LakeSurface {
     #[texture(107)]
     #[sampler(108)]
     bank: Handle<Image>,
+    #[texture(109)]
+    sediment_normal: Handle<Image>,
 }
 
 impl MaterialExtension for LakeSurface {
@@ -86,13 +97,11 @@ pub fn spawn_lake(
     >,
 ) {
     let (transform, projection, exposure, sky, environment, fog) = *main;
-    let (mirror, perspective) = reflect_view(transform, projection);
-    let mut target = Image::new_target_texture(
-        REFLECTION_SIZE.x,
-        REFLECTION_SIZE.y,
-        TextureFormat::Rgba16Float,
-        None,
-    );
+    let (mirror, perspective) = reflect_view(transform, projection, UVec2::ONE);
+    // Allocate the full target when the main camera has a viewport and sees water.
+    let mut target = Image::new_target_texture(1, 1, TextureFormat::Rgba16Float, None);
+    target.data = None;
+    target.copy_on_resize = false;
     target.sampler = ImageSampler::linear();
     let reflection = images.add(target);
     commands.spawn((
@@ -100,6 +109,7 @@ pub fn spawn_lake(
         ReflectedView::default(),
         Camera3d::default(),
         Camera {
+            is_active: false,
             order: -1,
             invert_culling: true,
             ..default()
@@ -140,9 +150,10 @@ pub fn spawn_lake(
                 elapsed: 0.0,
             },
             reflection,
-            lakebed_depth: images.add(depth_texture()),
+            lakebed: images.add(lakebed_texture()),
             sediment: load_tile(&server, "windward/trail-color.dds", true),
             bank: load_tile(&server, "windward/ground-color.dds", true),
+            sediment_normal: load_tile(&server, "windward/trail-normal.dds", false),
         },
     });
     commands.spawn((
@@ -156,18 +167,36 @@ pub fn spawn_lake(
     commands.insert_resource(Lake(water));
 }
 
-/// Water depth in meters, negative under the bank. The signed values keep
-/// the interpolated zero crossing on the real waterline, so the shore fade
-/// is smooth at any texel size.
-fn depth_texture() -> Image {
+/// Signed water depth and the slope of the bed along world X and Z.
+/// Depth crosses zero at the visible terrain so the shoreline stays in place.
+fn lakebed_texture() -> Image {
     const SIZE: UVec2 = UVec2::new(224, 336);
-    let mut depths = Vec::with_capacity((SIZE.x * SIZE.y * 2) as usize);
+    let spacing = PLANE_SIZE / SIZE.as_vec2();
+    let origin = LAKE - 0.5 * PLANE_SIZE;
+    let mut heights = Vec::with_capacity((SIZE.x * SIZE.y) as usize);
     for row in 0..SIZE.y {
         for column in 0..SIZE.x {
-            let uv = (Vec2::new(column as f32, row as f32) + 0.5) / SIZE.as_vec2();
-            let at = LAKE + (uv - 0.5) * PLANE_SIZE;
-            let depth = (WATER_LEVEL - ground(at)).clamp(-0.5, 2.5);
-            depths.extend(f16_bits(depth).to_le_bytes());
+            let at = origin + (Vec2::new(column as f32, row as f32) + 0.5) * spacing;
+            heights.push(ground(at));
+        }
+    }
+    let height = |x, z| heights[(z * SIZE.x + x) as usize];
+    let mut samples = Vec::with_capacity(heights.len() * 8);
+    for row in 0..SIZE.y {
+        for column in 0..SIZE.x {
+            // Average over half a meter to avoid a normal seam on each
+            // triangle edge. The plane boundaries use one-sided differences.
+            let left = column.saturating_sub(2);
+            let right = (column + 2).min(SIZE.x - 1);
+            let front = row.saturating_sub(2);
+            let back = (row + 2).min(SIZE.y - 1);
+            let dx = (height(right, row) - height(left, row)) / (spacing.x * (right - left) as f32);
+            let dz = (height(column, back) - height(column, front))
+                / (spacing.y * (back - front) as f32);
+            let depth = (WATER_LEVEL - height(column, row)).clamp(-0.5, 2.5);
+            for channel in [depth, dx, dz, 0.0] {
+                samples.extend(f16_bits(channel).to_le_bytes());
+            }
         }
     }
     let mut image = Image::new(
@@ -177,8 +206,8 @@ fn depth_texture() -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        depths,
-        TextureFormat::R16Float,
+        samples,
+        TextureFormat::Rgba16Float,
         RenderAssetUsages::default(),
     );
     image.sampler = ImageSampler::linear();
@@ -250,7 +279,7 @@ pub fn reflect_lake(
     clouds: Res<Assets<SpaghettiAsset>>,
     time: Res<Time>,
     lake: Res<Lake>,
-    main: Single<(&Transform, &Projection), (With<HikerCamera>, Without<ReflectedView>)>,
+    main: Single<CameraView, (With<HikerCamera>, Without<ReflectedView>)>,
     mut reflected: Single<(
         &mut Transform,
         &mut Projection,
@@ -258,32 +287,83 @@ pub fn reflect_lake(
         &mut ReflectedView,
     )>,
     mut materials: ResMut<Assets<LakeMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     add_shore_plants_to_reflection(&mut commands, &plants, &clouds);
-    let (transform, projection) = *main;
+    let (main_camera, transform, projection, resolution) = *main;
     let (mirror, mirror_projection, camera, state) = &mut *reflected;
+    camera.is_active = false;
+    let Some(view_size) = resolution
+        .map(|resolution| resolution.0)
+        .or_else(|| main_camera.physical_viewport_size())
+        .filter(|size| size.min_element() > 0)
+        .filter(|_| lake_in_view(transform, projection))
+    else {
+        state.last_update = None;
+        return;
+    };
     let elapsed = time.elapsed_secs();
     let Some(mut water) = materials.get_mut(&lake.0) else {
         return;
     };
     water.extension.uniform.elapsed = elapsed;
-    let delta_to_lake = Vec3::new(LAKE.x, WATER_LEVEL, LAKE.y) - transform.translation;
-    let in_front = delta_to_lake.dot(transform.forward().as_vec3()) > -20.5;
-    let refresh = state
+    let size = reflection_size(view_size);
+    if size != state.size {
+        let Some(mut image) = images.get_mut(&water.extension.reflection) else {
+            return;
+        };
+        image.resize(Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        });
+        state.size = size;
+    } else if state
         .last_update
-        .is_none_or(|last_update| elapsed - last_update >= REFLECTION_PERIOD);
-    camera.is_active = in_front && refresh;
-    if camera.is_active {
-        let (reflection, perspective) = reflect_view(transform, projection);
-        water.extension.uniform.reflected_clip_from_world =
-            perspective.get_clip_from_view() * reflection.compute_affine().inverse();
-        **mirror = reflection;
-        **mirror_projection = Projection::Perspective(perspective);
-        state.last_update = Some(elapsed);
+        .is_some_and(|last_update| elapsed - last_update < reflection_period(view_size))
+    {
+        return;
     }
+    let (reflection, perspective) = reflect_view(transform, projection, size);
+    water.extension.uniform.reflected_clip_from_world =
+        perspective.get_clip_from_view() * reflection.compute_affine().inverse();
+    **mirror = reflection;
+    **mirror_projection = Projection::Perspective(perspective);
+    state.last_update = Some(elapsed);
+    camera.is_active = true;
 }
 
-fn reflect_view(camera: &Transform, projection: &Projection) -> (Transform, PerspectiveProjection) {
+fn reflection_size(view_size: UVec2) -> UVec2 {
+    let view_size = view_size.as_vec2();
+    // At small window sizes, keep enough pixels for the reflected scene's
+    // detail levels. A smaller target was slower on the Metal test device.
+    let half_scale = (REFLECTION_MIN_LONG_EDGE / view_size.max_element()).clamp(0.5, 1.0);
+    let scale = (REFLECTION_LIMIT.as_vec2() / view_size)
+        .min_element()
+        .min(half_scale);
+    (view_size * scale).round().as_uvec2().max(UVec2::ONE)
+}
+
+fn reflection_period(view_size: UVec2) -> f32 {
+    // The reflected mesh can update less often in a small viewport while
+    // the ripple shading and the world-space reprojection run every frame.
+    let scale = (view_size.max_element() as f32 / (REFLECTION_LIMIT.x * 2) as f32).sqrt();
+    (MAX_REFLECTION_HZ * scale)
+        .clamp(16.0, MAX_REFLECTION_HZ)
+        .recip()
+}
+
+fn lake_in_view(camera: &Transform, projection: &Projection) -> bool {
+    projection
+        .compute_frustum(&GlobalTransform::from(*camera))
+        .intersects_obb_identity(&LAKE_BOUNDS)
+}
+
+fn reflect_view(
+    camera: &Transform,
+    projection: &Projection,
+    size: UVec2,
+) -> (Transform, PerspectiveProjection) {
     let mirror = Mat4::from_scale_rotation_translation(
         Vec3::new(1.0, -1.0, 1.0),
         Quat::IDENTITY,
@@ -299,7 +379,7 @@ fn reflect_view(camera: &Transform, projection: &Projection) -> (Transform, Pers
     let clip = normal.extend(camera.translation.y - WATER_LEVEL - 0.015);
     let projection = PerspectiveProjection {
         near_clip_plane: clip,
-        aspect_ratio: REFLECTION_SIZE.x as f32 / REFLECTION_SIZE.y as f32,
+        aspect_ratio: size.x as f32 / size.y as f32,
         ..*main
     };
     (camera, projection)

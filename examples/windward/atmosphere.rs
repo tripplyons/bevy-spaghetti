@@ -30,42 +30,53 @@ pub fn camera_haze() -> impl Bundle {
     (
         VolumetricFog {
             ambient_color: Color::linear_rgb(0.72, 0.82, 0.96),
-            // Sky light keeps haze in terrain shadow blue-gray. Without it,
-            // shaded fog only absorbs and the low-sun valley turns brown-black.
-            ambient_intensity: 0.04,
+            // A little sky light keeps the bank mist readable in shade.
+            ambient_intensity: 0.025,
             step_count: 14,
             jitter: 0.035,
         },
         DistanceFog {
             color: Color::srgba(0.46, 0.53, 0.61, 0.59),
             // A broad warm glow toward the low sun, as in backlit haze.
-            directional_light_color: Color::srgba(0.98, 0.79, 0.63, 0.13),
+            directional_light_color: Color::srgba(0.98, 0.79, 0.63, 0.09),
             directional_light_exponent: 18.0,
-            falloff: FogFalloff::ExponentialSquared { density: 0.0072 },
+            falloff: FogFalloff::ExponentialSquared { density: 0.0051 },
         },
     )
 }
 
 /// Exposure, tone mapping, and a restrained photographic grade.
+///
+/// Brighten the sunlit meadow and sky while keeping contrast in the
+/// shaded forest. The section ranges use scene-linear levels after
+/// camera exposure. Applying the lift in the grade preserves the
+/// scene's balance with distance fog.
 pub fn camera_grade() -> impl Bundle {
     (
         Exposure { ev100: 11.5 },
         Tonemapping::AgX,
         ColorGrading {
             global: ColorGradingGlobal {
-                temperature: 0.015,
-                post_saturation: 1.04,
+                exposure: 0.22,
+                temperature: 0.022,
+                post_saturation: 1.05,
+                midtones_range: 0.12..0.35,
                 ..default()
             },
             shadows: ColorGradingSection {
-                gamma: 0.96,
+                gamma: 0.94,
+                saturation: 0.94,
                 ..default()
             },
             midtones: ColorGradingSection {
-                contrast: 1.07,
+                gain: 1.16,
+                saturation: 1.04,
                 ..default()
             },
-            ..default()
+            highlights: ColorGradingSection {
+                gain: 1.33,
+                ..default()
+            },
         },
         Bloom {
             intensity: 0.045,
@@ -126,10 +137,10 @@ pub fn spawn_atmosphere(mut commands: Commands, mut images: ResMut<Assets<Image>
             density_factor: 0.095,
             absorption: 0.11,
             scattering: 0.31,
-            scattering_asymmetry: 0.59,
+            scattering_asymmetry: 0.45,
             fog_color: Color::linear_rgb(0.75, 0.84, 0.95),
             // Tuned with the sun visible to the fog; see `unblock_sun_shafts`.
-            light_intensity: 0.3,
+            light_intensity: 0.14,
             ..default()
         },
         Transform::from_translation(CENTER).with_scale(SIZE),
@@ -151,11 +162,13 @@ fn density_map() -> Image {
                 let p = CENTER + (uvw - 0.5) * SIZE;
                 let at = p.xz();
                 let height = (p.y - ground(at).max(WATER_LEVEL)).max(0.0);
-                let low_air = (-0.26 * height).exp();
+                let low_air = (-0.43 * height).exp();
                 let lake = 1.0 - smoothstep(0.72, 1.34, shore_distance(at));
                 let wisp = noise(at * 0.087 + Vec2::new(p.y * 0.75, -p.y * 0.22));
                 let bank = lake * (-1.42 * height).exp() * (0.28 + 0.70 * wisp);
-                let density = edge * (0.14 * low_air + 0.61 * bank);
+                // Most suspended mist belongs to the lake. Keep the air
+                // along the trail clear beyond a thin surface layer.
+                let density = edge * (0.07 * low_air + 0.61 * bank);
                 samples.push((density * 255.0).round() as u8);
             }
         }

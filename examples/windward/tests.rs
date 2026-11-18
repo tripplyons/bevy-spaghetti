@@ -48,6 +48,9 @@ struct ReviewFrames {
     pixels: Vec<u8>,
 }
 
+#[derive(Resource)]
+struct BenchmarkSize(UVec2);
+
 #[test]
 #[ignore = "requires a native GPU; runs without a window or any image files"]
 fn full_scene_renders_in_background() {
@@ -55,10 +58,13 @@ fn full_scene_renders_in_background() {
     if let Some(destination) = std::env::var_os("WINDWARD_REVIEW_DIR") {
         let destination = PathBuf::from(destination);
         std::fs::create_dir_all(&destination).unwrap();
-        app.insert_resource(ReviewFrames {
-            destination,
-            pixels: Vec::new(),
-        });
+        // Asset load time varies between runs. Start wind, animation, and
+        // reflection updates from the same simulation time in every review.
+        app.insert_resource(TimeUpdateStrategy::FixedTimesteps(0))
+            .insert_resource(ReviewFrames {
+                destination,
+                pixels: Vec::new(),
+            });
     }
     app.insert_resource(FrameCapture(None))
         .add_systems(Startup, capture_offscreen.after(spawn_camera));
@@ -67,6 +73,8 @@ fn full_scene_renders_in_background() {
     });
 
     let samples = if app.world().contains_resource::<ReviewFrames>() {
+        app.insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
+        step_scene(&mut app, 8);
         1280 * 800
     } else {
         WIDTH * HEIGHT
@@ -74,27 +82,21 @@ fn full_scene_renders_in_background() {
     save_review_frame(app.world(), "trailhead.png");
     let before = app.world().resource::<FrameCapture>().0.unwrap();
     let start = hiker_position(app.world_mut());
-    let beginning = reed_end(app.world_mut());
+    let reeds_before = reed_ends(app.world_mut());
     let start_camera = camera_position(app.world_mut());
 
     app.world_mut()
         .resource_mut::<ButtonInput<KeyCode>>()
         .press(KeyCode::KeyW);
-    for _ in 0..34 {
-        app.update();
-    }
+    step_scene(&mut app, 34);
     let walked = hiker_position(app.world_mut());
     app.world_mut()
         .resource_mut::<ButtonInput<KeyCode>>()
         .press(KeyCode::ShiftLeft);
-    for _ in 0..34 {
-        app.update();
-    }
+    step_scene(&mut app, 34);
     let ran = hiker_position(app.world_mut());
     app.world_mut().resource_mut::<player::Controls>().jump = true;
-    for _ in 0..12 {
-        app.update();
-    }
+    step_scene(&mut app, 12);
     let jumped = hiker_position(app.world_mut());
 
     let after = app.world().resource::<FrameCapture>().0.unwrap();
@@ -125,17 +127,19 @@ fn full_scene_renders_in_background() {
         camera_position(app.world_mut()).distance(start_camera) > 1.2,
         "camera did not follow"
     );
+    let assets = app.world().resource::<Assets<SpaghettiAsset>>();
     assert!(
-        reed_end(app.world_mut()).distance(beginning) > 0.002,
-        "wind did not deform the reed asset"
+        reeds_before.iter().any(|(id, count, end)| {
+            let segments = assets.get(*id).unwrap().segments();
+            segments.len() == *count && end.distance(segments[0].end()) > 0.002
+        }),
+        "wind did not deform any reed patch that kept the same level of detail"
     );
 
     app.world_mut()
         .resource_mut::<ButtonInput<KeyCode>>()
         .reset_all();
-    for _ in 0..45 {
-        app.update();
-    }
+    step_scene(&mut app, 45);
     let landed = hiker_position(app.world_mut());
     assert!(
         (landed.y - ground(landed.xz())).abs() < 1e-5,
@@ -162,11 +166,64 @@ fn full_scene_renders_in_background() {
         // From a hillside across the hazy valley toward the sun.
         pose_review_camera(&mut app, Vec2::new(28.0, -38.0), -0.15, 0.02);
         save_review_frame(app.world(), "valley-sun.png");
-        // Low by the lake, looking up toward the sun through the haze.
-        pose_review_camera(&mut app, Vec2::new(5.0, -3.0), -0.2, 0.22);
+        // Look toward the sun from the dry bank. Find the bank here so
+        // changes to the basin cannot silently put the hiker underwater.
+        let bank = (0..60)
+            .map(|step| Vec2::new(5.0 - 0.1 * step as f32, -3.0))
+            .find(|&at| ground(at) > landscape::WATER_LEVEL + 0.06)
+            .expect("dry bank near the haze review camera");
+        pose_review_camera(&mut app, bank, -0.36, 0.22);
         save_review_frame(app.world(), "haze-low.png");
+        // Backlit stand from the side of the trail, with nearby bark and grass.
+        pose_review_camera(&mut app, Vec2::new(-8.7, -16.1), 0.46, -0.05);
+        save_review_frame(app.world(), "backlit-trail.png");
+        // Look down at the dry litter where a stand meets the meadow.
+        pose_review_camera(&mut app, Vec2::new(-10.3, -21.0), 0.90, 0.60);
+        save_review_frame(app.world(), "forest-floor.png");
+        if std::env::var_os("WINDWARD_WIND_REVIEW").is_some() {
+            pose_review_camera(&mut app, Vec2::new(-9.5, -22.0), 0.9, 0.16);
+            // Compare branches against the same stationary trunk over time.
+            for frame in 0..24 {
+                step_scene(&mut app, 6);
+                save_review_frame(app.world(), &format!("crown-wind-{frame:02}.png"));
+            }
+        }
+    } else {
+        check_reflection_resize(&mut app);
     }
     assert_shaders_loaded(&app);
+}
+
+fn check_reflection_resize(app: &mut App) {
+    pose_review_camera(app, Vec2::new(-0.6, -7.0), -0.78, 0.10);
+    let world = app.world_mut();
+    let mut main_view = world.query_filtered::<&RenderTarget, With<HikerCamera>>();
+    let RenderTarget::Image(target) = main_view.single(world).unwrap() else {
+        panic!("expected an offscreen image target");
+    };
+    let handle = target.handle.clone();
+    let mut mirror = world.query_filtered::<&Camera, With<lake::ReflectedView>>();
+    assert_eq!(
+        mirror.single(world).unwrap().physical_target_size(),
+        Some(UVec2::new(WIDTH as u32, HEIGHT as u32))
+    );
+
+    // Match a window resize by changing the actual render target, including
+    // its aspect ratio. Both widths are aligned for texture readback.
+    world
+        .resource_mut::<Assets<Image>>()
+        .get_mut(&handle)
+        .unwrap()
+        .resize(Extent3d {
+            width: 256,
+            height: 384,
+            depth_or_array_layers: 1,
+        });
+    step_scene(app, 8);
+    assert_eq!(
+        mirror.single(app.world()).unwrap().physical_target_size(),
+        Some(UVec2::new(213, 320))
+    );
 }
 
 fn pose_review_camera(app: &mut App, at: Vec2, yaw: f32, pitch: f32) {
@@ -180,9 +237,7 @@ fn pose_review_camera(app: &mut App, at: Vec2, yaw: f32, pitch: f32) {
     let mut rig = rig.single_mut(world).unwrap();
     rig.yaw = yaw;
     rig.pitch = pitch;
-    for _ in 0..48 {
-        app.update();
-    }
+    step_scene(app, 48);
 }
 
 fn turn_hiker_to_camera(app: &mut App) {
@@ -190,9 +245,20 @@ fn turn_hiker_to_camera(app: &mut App) {
     let mut hiker = world.query_filtered::<&mut Transform, With<Hiker>>();
     let mut hiker = hiker.single_mut(world).unwrap();
     hiker.rotate_y(std::f32::consts::PI);
-    // Frame readback can lag by more than 24 updates.
-    for _ in 0..48 {
+    step_scene(app, 48);
+}
+
+fn step_scene(app: &mut App, steps: usize) {
+    let device = app
+        .world()
+        .contains_resource::<ReviewFrames>()
+        .then(|| app.world().resource::<RenderDevice>().clone());
+    for _ in 0..steps {
         app.update();
+        if let Some(device) = &device {
+            // Keep texture readbacks on the same animation frame across runs.
+            device.poll(PollType::wait_indefinitely()).unwrap();
+        }
     }
 }
 
@@ -225,8 +291,23 @@ fn save_review_frame(world: &World, name: &str) {
 #[ignore = "release-mode throughput benchmark on a native GPU"]
 fn benchmark_scene_offscreen() {
     let mut app = headless_app();
-    app.add_systems(Startup, benchmark_target.after(spawn_camera));
+    let size = if std::env::var_os("WINDWARD_BENCH_SMALL").is_some() {
+        UVec2::new(320, 192)
+    } else {
+        UVec2::new(1280, 800)
+    };
+    let away = std::env::var_os("WINDWARD_BENCH_AWAY").is_some();
+    app.insert_resource(BenchmarkSize(size))
+        .add_systems(Startup, benchmark_target.after(spawn_camera));
     warm_up(&mut app, |_| true);
+    if away {
+        pose_review_camera(
+            &mut app,
+            Vec2::new(-10.0, -6.0),
+            std::f32::consts::FRAC_PI_2,
+            0.08,
+        );
+    }
     let device = app.world().resource::<RenderDevice>().clone();
     device.poll(PollType::wait_indefinitely()).unwrap();
     app.world_mut()
@@ -236,10 +317,15 @@ fn benchmark_scene_offscreen() {
     const SAMPLES: usize = 10;
     const FRAMES_PER_SAMPLE: usize = 10;
     let mut frame_times = [0.0; SAMPLES];
+    let mut reflected = app
+        .world_mut()
+        .query_filtered::<&Camera, With<lake::ReflectedView>>();
+    let mut reflected_frames = 0;
     for sample in &mut frame_times {
         let start = Instant::now();
         for _ in 0..FRAMES_PER_SAMPLE {
             app.update();
+            reflected_frames += usize::from(reflected.single(app.world()).unwrap().is_active);
         }
         device.poll(PollType::wait_indefinitely()).unwrap();
         *sample = start.elapsed().as_secs_f64() * 1000.0 / FRAMES_PER_SAMPLE as f64;
@@ -248,7 +334,10 @@ fn benchmark_scene_offscreen() {
     frame_times.sort_by(f64::total_cmp);
     let mean = frame_times.iter().sum::<f64>() / SAMPLES as f64;
     println!(
-        "1280 × 800 offscreen walk, {} frames: {:.2} ms/frame mean ({:.1} FPS), {:.2} ms median block, {:.2} ms slowest block",
+        "{} × {} offscreen walk ({}), {} frames: {:.2} ms/frame mean ({:.1} FPS), {:.2} ms median block, {:.2} ms slowest block, {reflected_frames} reflection frames",
+        size.x,
+        size.y,
+        if away { "away from lake" } else { "trailhead" },
         SAMPLES * FRAMES_PER_SAMPLE,
         mean,
         1000.0 / mean,
@@ -304,10 +393,11 @@ fn benchmark_target(
     mut commands: Commands,
     camera: Single<Entity, With<HikerCamera>>,
     mut images: ResMut<Assets<Image>>,
+    size: Res<BenchmarkSize>,
 ) {
     let image = images.add(Image::new_target_texture(
-        1280,
-        800,
+        size.0.x,
+        size.0.y,
         TextureFormat::Rgba8UnormSrgb,
         None,
     ));
@@ -377,14 +467,20 @@ fn camera_position(world: &mut World) -> Vec3 {
         .translation
 }
 
-fn reed_end(world: &mut World) -> Vec3 {
+fn reed_ends(world: &mut World) -> Vec<(AssetId<SpaghettiAsset>, usize, Vec3)> {
     let handles: Vec<_> = world
         .query_filtered::<&Spaghetti3d, With<ReedPatch>>()
         .iter(world)
         .map(|cloud| cloud.0.id())
         .collect();
     let assets = world.resource::<Assets<SpaghettiAsset>>();
-    assets.get(handles[handles.len() / 2]).unwrap().segments()[2].end()
+    handles
+        .into_iter()
+        .map(|id| {
+            let segments = assets.get(id).unwrap().segments();
+            (id, segments.len(), segments[0].end())
+        })
+        .collect()
 }
 
 fn capture_offscreen(

@@ -16,6 +16,18 @@ cargo run --example viewer -- my_model.spag
 
 The bundled `assets/marble_bust_01.spag` contains 240,000 Gaussian segments converted from the 2K glTF of Marble Bust 01 by Rico Cilliers. The conversion samples the model's color texture and bakes lighting using its normals and normal map. [Source model and CC0 license](https://polyhaven.com/a/marble_bust_01)
 
+## Play Windward
+
+Windward uses splats for wind-driven vegetation, conifer crowns, and scanned props in a third-person wetland scene.
+
+```sh
+cargo run --release --example windward
+```
+
+Use **WASD** to move, **Shift** to run, and **Space** to jump. Click the window to look with the mouse. Press **Esc** to release the cursor or **R** to reset.
+
+The forest-floor material uses a CC0 scan by Rob Tuytel. [Forest Ground 03](https://polyhaven.com/a/forrest_ground_03)
+
 ## Add splats to a game
 
 Add this crate as a path dependency to a Bevy 0.20 game.
@@ -49,7 +61,13 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
 
 The entity supports transforms, inherited visibility, render layers, frustum culling and per-camera `VisibilityRange`. Each 3D camera gets a separate segment depth order. Splats test against opaque Bevy depth and blend in the transparent pass. To create an asset in Rust, build a `Vec<GaussianSegment>`, pass it to `SpaghettiAsset::new`, and add it to `Assets<SpaghettiAsset>`. Equal endpoints produce a point splat. When splitting a straight segment with the same color and kernel, divide its optical mass in proportion to the child lengths to preserve opacity at the join.
 
-Add `SpaghettiCutout` for dense surface splats that should write depth. The cutout pipeline tests a projected Gaussian cross section and draws directly from the segment buffer. Add `SpaghettiWind` and update its time and pusher to deform an existing buffer on the GPU. Set bend heights with `GaussianSegment::with_bend_heights`. For tapered grass, use `with_blade_profile` to set the blade height, endpoint fractions and end width together.
+Add `SpaghettiCutout` for dense surface splats that should write depth. The cutout pipeline tests a projected Gaussian cross section and draws directly from the segment buffer. Use `GaussianSegment::with_cutout_taper` to set the end width as a fraction of the start width.
+
+Use `SpaghettiWind` for procedural gusts and contact, or update `SpaghettiSway` with a precomputed world-space displacement per unit of bend height. Both deform endpoints on the GPU with no asset upload. Set endpoint bend heights with `GaussianSegment::with_bend_heights`. For tapered grass, use `with_blade_profile` to set the blade height, endpoint fractions and end width together.
+
+Add `SpaghettiDetailScale` to let entities share one multilevel asset while using different detail thresholds. For example, `SpaghettiDetailScale(1.8)` switches to coarser levels at 1.8 times the asset's default projected size.
+
+With `SpaghettiLighting`, add `SpaghettiGroundAmbient` to set a separate linear RGB multiplier for ground bounce. Upward-facing splats receive the sky color from `SpaghettiLighting::ambient`, and side-facing splats receive a blend of sky and ground light.
 
 ## Convert a model
 
@@ -82,7 +100,7 @@ Version 1 uses the eight bytes `SPAG\x01\x00\x00\x00`, followed by a little-endi
 | End | XYZ endpoint and start bend height in world units, or zero |
 | Kernel | XYZ principal-axis standard deviations and end bend height in world units, or zero |
 | Rotation | Unit quaternion XYZW |
-| Color | Linear RGB and optional packed blade profile, or zero |
+| Color | Linear RGB and optional packed cutout taper or blade profile, or zero |
 
 Version 2 uses `SPAG\x02\x00\x00\x00` and the same segment records, grouped from finest to coarsest. The segment records are followed by a little-endian `u32` transition count (1 to 3). Each transition stores the exclusive end index of the finer level as a `u32` and the lower and upper cross-fade thresholds in projected pixels per asset unit as two `f32` values. The writer uses version 1 for clouds with a single level.
 

@@ -7,8 +7,10 @@ use bevy::{
     asset::RenderAssetUsages,
     light::NotShadowCaster,
     mesh::{Indices, PrimitiveTopology, UvChannel},
+    pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
-    render::render_resource::Face,
+    render::render_resource::{AsBindGroup, Face},
+    shader::ShaderRef,
 };
 
 use crate::landscape::{SUN, ground, noise, reflected_layers, smoothstep};
@@ -22,29 +24,46 @@ const ORIGIN: Vec2 = Vec2::new(-480.0, -528.0);
 const HEIGHTMAP_RADIUS: f32 = 474.0;
 const RING_INNER: f32 = 440.0;
 const RING_OUTER: f32 = 650.0;
-const RING_SEGMENTS: u32 = 448;
+const RING_SEGMENTS: u32 = 640;
 const RING_SECTORS: u32 = 8;
 const RING_RADII: u32 = 30;
 /// World size of one repeat of the albedo and normal detail maps.
 const ALBEDO_TILE: f32 = 37.0;
 const NORMAL_TILE: f32 = 14.0;
+const WALK_CENTER: Vec2 = Vec2::new(1.0, -19.0);
 const ELEVATION: &[u8; ((COLUMNS + 1) * (ROWS + 1) * 2) as usize] =
     include_bytes!("../../assets/windward/cascades-height.u16le");
+
+pub type HighlandMaterial = ExtendedMaterial<StandardMaterial, HighlandAir>;
+
+#[derive(Asset, AsBindGroup, TypePath, Clone, Debug, Default)]
+pub struct HighlandAir {}
+
+impl MaterialExtension for HighlandAir {
+    fn fragment_shader() -> ShaderRef {
+        "windward/highland.wesl".into()
+    }
+}
 
 pub fn spawn_backdrop(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut highlands: ResMut<Assets<HighlandMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let (albedo, albedo_mean) = detail_texture::albedo_detail();
-    let mountain = materials.add(StandardMaterial {
-        base_color_texture: Some(images.add(albedo)),
-        normal_map_texture: Some(images.add(detail_texture::normal_detail())),
-        normal_map_channel: UvChannel::Uv1,
-        reflectance: 0.12,
-        perceptual_roughness: 0.95,
-        ..default()
+    let mountain = highlands.add(ExtendedMaterial {
+        base: StandardMaterial {
+            base_color_texture: Some(images.add(albedo)),
+            normal_map_texture: Some(images.add(detail_texture::normal_detail())),
+            normal_map_channel: UvChannel::Uv1,
+            reflectance: 0.12,
+            perceptual_roughness: 0.95,
+            fog_enabled: false,
+            ..default()
+        },
+        extension: HighlandAir {},
     });
     let relief = Relief::new();
     for north in (0..ROWS).step_by(TILE as usize) {
@@ -59,12 +78,17 @@ pub fn spawn_backdrop(
         }
     }
 
-    let firs = materials.add(StandardMaterial {
-        reflectance: 0.2,
-        perceptual_roughness: 0.9,
-        double_sided: true,
-        cull_mode: None::<Face>,
-        ..default()
+    let firs = highlands.add(ExtendedMaterial {
+        base: StandardMaterial {
+            base_color_texture: Some(images.add(canopy::crown_atlas())),
+            alpha_mode: AlphaMode::Mask(0.36),
+            reflectance: 0.2,
+            perceptual_roughness: 0.9,
+            cull_mode: None::<Face>,
+            fog_enabled: false,
+            ..default()
+        },
+        extension: HighlandAir {},
     });
     let tiles = UVec2::new(COLUMNS.div_ceil(TILE), ROWS.div_ceil(TILE));
     for chunk in canopy::plant(&relief, tiles, TILE as f32 * SPACING) {
@@ -249,9 +273,8 @@ pub struct Cover {
 
 /// Distance from the area the hiker can walk, which `player` clamps to.
 fn walk_distance(p: Vec2) -> f32 {
-    let center = Vec2::new(1.0, -19.0);
     let half = Vec2::new(38.0, 43.0);
-    ((p - center).abs() - half).max(Vec2::ZERO).length()
+    ((p - WALK_CENTER).abs() - half).max(Vec2::ZERO).length()
 }
 
 fn canopy_cover(p: Vec2, normal: Vec3, elevation: f32, hollow: f32) -> Cover {
@@ -269,8 +292,7 @@ fn canopy_cover(p: Vec2, normal: Vec3, elevation: f32, hollow: f32) -> Cover {
     let stands = smoothstep(0.28, 0.5, clump);
     // Avalanche chutes keep steep gullies open.
     let chute = gully * (1.0 - smoothstep(0.8, 0.92, normal.y));
-    // Near the trail the forest module plants real firs; the low-poly ones
-    // stay far enough out that their facets never show.
+    // Let the full splat trees cover the ground nearest the trail.
     let clear = smoothstep(32.0, 44.0, walk_distance(p)) * smoothstep(2.0, 10.0, near_edge(p));
     let trees =
         (1.25 * (1.0 - alpine) * (1.0 - rock) * stands * (1.0 - 0.85 * chute)).min(1.0) * clear;
@@ -354,7 +376,7 @@ fn mountain_color(site: &Site) -> Vec3 {
     let mut albedo = glade.lerp(duff, smoothstep(0.05, 0.5, cover.trees));
     let tundra = Vec3::new(0.105, 0.098, 0.076) * (0.7 + 0.5 * patches + 0.2 * strata);
     albedo = albedo.lerp(tundra, cover.alpine);
-    let stone = Vec3::new(0.15, 0.143, 0.135) * (0.5 + 0.7 * strata + 0.3 * broad);
+    let stone = bedrock(p, site.elevation) * (0.68 + 0.48 * strata + 0.16 * broad);
     albedo = albedo.lerp(
         stone,
         (0.85 * cover.rock + cover.alpine * (1.0 - normal.y) * 1.8).min(1.0),
@@ -363,6 +385,14 @@ fn mountain_color(site: &Site) -> Vec3 {
     albedo *= 1.0 - 0.38 * site.hollow.max(0.0) + 0.22 * (-site.hollow).max(0.0);
     let snow = Vec3::new(0.63, 0.72, 0.82) * (0.76 + 0.24 * strata);
     albedo.lerp(snow, cover.snow)
+}
+
+/// Weathered rock bands follow tilted bedding rather than the mesh grid.
+fn bedrock(p: Vec2, elevation: f32) -> Vec3 {
+    let strata = (elevation + 0.72 * p.x - 0.4 * p.y) / 55.0;
+    let seam = noise(Vec2::new(strata, 0.028 * (p.x + 0.41 * p.y)));
+    let weathering = smoothstep(0.26, 0.72, seam);
+    Vec3::new(0.100, 0.098, 0.095).lerp(Vec3::new(0.206, 0.174, 0.143), weathering)
 }
 
 /// Ridged noise in 0..1, sharp along crests, for the far peaks.
@@ -470,7 +500,7 @@ fn ridge_color(point: Vec3, normal: Vec3) -> Vec3 {
     let across = p.y.atan2(p.x) * p.length();
     let ribs = noise(Vec2::new(across * 0.055, p.length() * 0.012));
     let forest = Vec3::new(0.030, 0.046, 0.038) * (0.6 + 0.6 * grain + 0.3 * detail);
-    let rock = Vec3::new(0.12, 0.115, 0.11) * (0.55 + 0.5 * grain + 0.45 * ribs);
+    let rock = bedrock(p, 1325.0 + height / 0.030) * (0.48 + 0.5 * grain + 0.5 * ribs);
     let bare = smoothstep(treeline - 10.0, treeline + 22.0, height) + 0.8 * steep;
     let mut albedo = forest.lerp(rock, bare.min(1.0));
     let snowline = 96.0 + 20.0 * detail - 14.0 * normal.z.max(0.0) - 22.0 * (0.5 - ribs);
@@ -488,17 +518,17 @@ fn ridge_light(albedo: Vec3, point: Vec3, normal: Vec3) -> Vec3 {
     let sky = 0.55 + 0.45 * normal.y;
     let lit = albedo * (Vec3::new(0.30, 0.36, 0.46) * sky + Vec3::new(1.0, 0.80, 0.62) * 1.6 * sun);
 
-    // Aerial perspective: farther and higher ridges fade to a lighter blue, as the
-    // camera's DistanceFog would at this range, with its glow toward the sun.
+    // The far rings inherit the valley haze, with warmer air toward the sun.
     let r = p.length();
     let view = (point - Vec3::Y * 10.0).normalize();
     let glow = view.dot(SUN).max(0.0).powi(12);
     let haze = Vec3::new(0.115, 0.158, 0.232).lerp(Vec3::new(0.30, 0.25, 0.22), 0.6 * glow);
     // Valley mist pools low, so ridge bases match the fogged heightmap in front.
     let mist = 1.0 - smoothstep(-10.0, 55.0, height);
-    let aerial = 0.5 + 0.33 * smoothstep(470.0, 640.0, r) + 0.08 * smoothstep(40.0, 150.0, height);
+    let aerial = 0.57 + 0.29 * smoothstep(470.0, 640.0, r);
     let low_haze = Vec3::new(0.21, 0.25, 0.31);
     let haze = haze.lerp(low_haze, 0.7 * mist);
-    let aerial = aerial + 0.3 * mist;
+    let clear_air = smoothstep(22.0, 103.0, height);
+    let aerial = aerial + 0.28 * mist - 0.17 * clear_air;
     lit.lerp(haze, aerial.min(0.92))
 }

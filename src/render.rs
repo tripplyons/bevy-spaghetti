@@ -66,6 +66,12 @@ pub struct SpaghettiLighting {
     pub directional: Vec3,
 }
 
+/// Adds separate ground bounce to a cloud with [`SpaghettiLighting`].
+/// The segment's world-space normal blends this linear RGB multiplier on
+/// downward faces with [`SpaghettiLighting::ambient`] on upward faces.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SpaghettiGroundAmbient(pub Vec3);
+
 /// Receives Bevy directional shadow maps on a cloud with [`SpaghettiLighting`].
 ///
 /// Uses the shadow-casting light whose direction matches the cloud's light.
@@ -99,6 +105,13 @@ pub struct SpaghettiNearFade {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct SpaghettiCutout;
 
+/// Multiplies an asset's projected detail thresholds for this entity.
+///
+/// Values above one switch to coarser levels sooner. One keeps the asset's
+/// schedule. Missing, non-positive, and non-finite values behave as one.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SpaghettiDetailScale(pub f32);
+
 /// Applies gusts and an optional pusher in world space.
 ///
 /// Set endpoint bend heights with [`crate::GaussianSegment::with_bend_heights`].
@@ -112,6 +125,13 @@ pub struct SpaghettiWind {
     /// Horizontal radius in world units. Zero disables contact.
     pub push_radius: f32,
 }
+
+/// Bends a cloud using a precomputed world-space displacement per meter of
+/// bend height. Set heights with [`crate::GaussianSegment::with_bend_heights`].
+/// Endpoints with zero height stay fixed. This component takes precedence
+/// over [`SpaghettiWind`] when both are present.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct SpaghettiSway(pub Vec3);
 
 /// Registers the `.spag` asset loader and the Bevy 3D render pipeline.
 ///
@@ -181,12 +201,15 @@ pub struct ExtractedCloud {
     layers: RenderLayers,
     disable_culling: bool,
     lighting: Option<SpaghettiLighting>,
+    ground_ambient: Option<SpaghettiGroundAmbient>,
     receive_shadows: bool,
     transmission: f32,
     cutout: bool,
     wind: Option<SpaghettiWind>,
+    sway: Option<Vec3>,
     range: Option<VisibilityRange>,
     near_fade: Option<SpaghettiNearFade>,
+    detail_scale: f32,
 }
 
 impl SyncComponent<RenderApp> for Spaghetti3d {
@@ -201,19 +224,37 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
         Option<&'static RenderLayers>,
         Has<NoFrustumCulling>,
         Option<&'static SpaghettiLighting>,
+        Option<&'static SpaghettiGroundAmbient>,
         Has<SpaghettiReceiveShadows>,
         Option<&'static SpaghettiTransmission>,
         Has<SpaghettiCutout>,
         Option<&'static SpaghettiWind>,
+        Option<&'static SpaghettiSway>,
         Option<&'static VisibilityRange>,
         Option<&'static SpaghettiNearFade>,
+        Option<&'static SpaghettiDetailScale>,
     );
     type QueryFilter = ();
     type Out = ExtractedCloud;
 
     fn extract_component(
-        (cloud, transform, visibility, layers, disable_culling, lighting, receive_shadows, transmission, cutout, wind, range, near_fade):
-            QueryItem<'_, '_, Self::QueryData>,
+        (
+            cloud,
+            transform,
+            visibility,
+            layers,
+            disable_culling,
+            lighting,
+            ground_ambient,
+            receive_shadows,
+            transmission,
+            cutout,
+            wind,
+            sway,
+            range,
+            near_fade,
+            detail_scale,
+        ): QueryItem<'_, '_, Self::QueryData>,
     ) -> Option<Self::Out> {
         visibility.get().then(|| ExtractedCloud {
             asset: cloud.0.id(),
@@ -221,12 +262,18 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             layers: layers.cloned().unwrap_or_default(),
             disable_culling,
             lighting: lighting.copied(),
+            ground_ambient: ground_ambient.copied(),
             receive_shadows,
             transmission: transmission.map_or(0.0, |t| t.0.max(0.0)),
             cutout,
             wind: wind.copied(),
+            sway: sway.map(|sway| sway.0).filter(|sway| sway.is_finite()),
             range: range.cloned(),
             near_fade: near_fade.copied(),
+            detail_scale: detail_scale
+                .map(|scale| scale.0)
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .unwrap_or(1.0),
         })
     }
 }
@@ -234,7 +281,8 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
 struct GpuCloud {
     segments: Option<Buffer>,
     occlusion: Option<Buffer>,
-    centers: Box<[Vec3]>,
+    // XYZ is the segment midpoint. W is its average endpoint bend height.
+    centers: Box<[Vec4]>,
     bounds: Aabb,
     max_bend_height: f32,
     detail: Box<[DetailTransition]>,
@@ -276,7 +324,9 @@ impl RenderAsset for GpuCloud {
         let centers = asset
             .segments()
             .iter()
-            .map(|segment| segment.start() * 0.5 + segment.end() * 0.5)
+            .map(|segment| {
+                (segment.start() * 0.5 + segment.end() * 0.5).extend(segment.mean_bend_height())
+            })
             .collect();
         let existing = previous
             .and_then(|cloud| cloud.segments.as_ref())
@@ -325,6 +375,7 @@ impl GpuCloud {
         &self,
         clip_from_local: Mat4,
         viewport_height: f32,
+        detail_scale: f32,
         bounds: Aabb,
         uniform: &mut DrawUniform,
     ) -> Range<u32> {
@@ -336,7 +387,8 @@ impl GpuCloud {
         // A local reference length projects to scale / clip.w pixels. The Y row
         // accounts for viewport focal length and asset scale without depending
         // on segment orientation or its distance from the center of the screen.
-        let scale = clip_from_local.row(1).truncate().length() * viewport_height * 0.5;
+        let scale =
+            clip_from_local.row(1).truncate().length() * viewport_height * 0.5 / detail_scale;
         let depth = clip_from_local.row(3);
         let center = depth.dot(Vec3::from(bounds.center).extend(1.0));
         let radius = depth.truncate().abs().dot(bounds.half_extents.into());
@@ -369,7 +421,7 @@ struct SplatPipeline {
     shader: Handle<Shader>,
     bindings: BindGroupLayoutDescriptor,
     shadows: ShadowBindings,
-    shadow_quad: Buffer,
+    quad_indices: Buffer,
 }
 
 fn init_pipeline(
@@ -395,8 +447,8 @@ fn init_pipeline(
         shadows: ShadowBindings::new(&device, &cache),
         // Both triangles use corner 1 as the provoking vertex for flat
         // attributes, so only that corner shades the segment.
-        shadow_quad: device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("spaghetti shadow quad"),
+        quad_indices: device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("spaghetti quad indices"),
             contents: bytemuck::cast_slice(&[1_u16, 2, 0, 1, 3, 2]),
             usage: BufferUsages::INDEX,
         }),
@@ -423,7 +475,7 @@ impl SpecializedRenderPipeline for SplatPipeline {
                 shader: self.shader.clone(),
                 entry_point: Some(if key.cutout { "cutout_vertex" } else { "vertex" }.into()),
                 constants: vec![
-                    ("SHADOW_QUAD".into(), u32::from(key.shadowed) as f64),
+                    ("SCENE_SHADOWS".into(), u32::from(key.shadowed) as f64),
                     ("BAKED_OCCLUSION".into(), u32::from(key.baked_occlusion) as f64),
                 ],
                 ..default()
@@ -439,11 +491,7 @@ impl SpecializedRenderPipeline for SplatPipeline {
                 ..default()
             }),
             primitive: PrimitiveState {
-                topology: if key.shadowed {
-                    PrimitiveTopology::TriangleList
-                } else {
-                    PrimitiveTopology::TriangleStrip
-                },
+                topology: PrimitiveTopology::TriangleList,
                 ..default()
             },
             depth_stencil: Some(DepthStencilState {
@@ -572,12 +620,14 @@ struct DrawUniform {
     direction_to_light: [f32; 4],
     ambient: [f32; 4],
     directional: [f32; 4],
+    ground_ambient_delta: [f32; 4],
     eye_relative_from_local: [[f32; 4]; 4],
     fog: FogUniform,
     world_from_local: [[f32; 4]; 4],
     local_from_world: [[f32; 4]; 3],
+    // Pusher position and radius for procedural wind, or local sway vector.
     pusher: [f32; 4],
-    // Time, wind enabled, range coverage, reverse range dither.
+    // Time, wind mode, range coverage, reverse range dither.
     motion: [f32; 4],
     // Near and far clip.w for each active transition.
     detail_depths: [[f32; 4]; MAX_DETAIL_TRANSITIONS],
@@ -611,8 +661,7 @@ struct CloudDraw {
     order: Option<Buffer>,
     bindings: BindGroup,
     shadows: BindGroup,
-    shadowed: bool,
-    direction: Vec3,
+    direction: Vec4,
     revision: u64,
     segments: Range<u32>,
     idle_frames: u8,
@@ -712,12 +761,18 @@ fn queue_clouds(
             if coverage <= 0.0 || (cloud.cutout && cutout_phase.is_none()) {
                 continue;
             }
-            let inverse_basis = cloud.wind.and_then(|_| {
-                let inverse = Mat3::from_mat4(cloud.world_from_local).inverse();
-                inverse.is_finite().then_some(inverse)
-            });
+            let inverse_basis = (cloud.sway.is_some() || cloud.wind.is_some())
+                .then(|| Mat3::from_mat4(cloud.world_from_local).inverse())
+                .filter(|inverse| inverse.is_finite());
+            let sway = cloud
+                .sway
+                .zip(inverse_basis)
+                .map(|(slope, inverse)| inverse * slope)
+                .filter(|sway| sway.is_finite());
             let mut bounds = gpu.bounds;
-            if let Some(inverse) = inverse_basis {
+            if let Some(sway) = sway {
+                bounds.half_extents += Vec3A::from(sway.abs() * gpu.max_bend_height);
+            } else if let (Some(_), Some(inverse)) = (cloud.wind, inverse_basis) {
                 let rows = inverse.transpose();
                 let stretch = Vec3::new(rows.x_axis.length(), rows.y_axis.length(), rows.z_axis.length());
                 // Maximum displacement combines horizontal reach and vertical shortening.
@@ -746,7 +801,10 @@ fn queue_clouds(
                 uniform.viewport[2] = fade.start;
                 uniform.viewport[3] = fade.end;
             }
-            if let (Some(wind), Some(inverse)) = (cloud.wind, inverse_basis) {
+            if let Some(sway) = sway {
+                uniform.motion[1] = 2.0;
+                uniform.pusher = sway.extend(0.0).to_array();
+            } else if let (Some(wind), Some(inverse)) = (cloud.wind, inverse_basis) {
                 uniform.world_from_local = cloud.world_from_local.to_cols_array_2d();
                 uniform.local_from_world = [inverse.x_axis, inverse.y_axis, inverse.z_axis]
                     .map(|axis| axis.extend(0.0).to_array());
@@ -770,6 +828,10 @@ fn queue_clouds(
             if let Some(lighting) = cloud.lighting {
                 uniform.set_lighting(lighting, cloud.world_from_local);
                 uniform.ambient[3] = cloud.transmission;
+                if let Some(ground) = cloud.ground_ambient {
+                    uniform.ground_ambient_delta =
+                        (ground.0 - lighting.ambient).extend(0.0).to_array();
+                }
                 if cloud.receive_shadows && let Some(data) = shadow_data {
                     let view_shadows = view_shadows.get_or_insert_with(|| {
                         pipeline.shadows.for_view(
@@ -800,7 +862,13 @@ fn queue_clouds(
                 uniform.fog = *fog;
             }
             let key = (view.retained_view_entity, entity);
-            let segments = gpu.select_segments(clip_from_local, size.y as f32, bounds, &mut uniform);
+            let segments = gpu.select_segments(
+                clip_from_local,
+                size.y as f32,
+                cloud.detail_scale,
+                bounds,
+                &mut uniform,
+            );
             let new_draw = || {
                 make_draw(&device, &bind_group_layout, source, gpu, *main_entity, cloud.cutout, shadows)
             };
@@ -815,18 +883,18 @@ fn queue_clouds(
                 *draw = new_draw();
             }
             draw.shadows = shadows.clone();
-            draw.shadowed = shadowed;
             if let Some(order_buffer) = &draw.order {
                 let direction = (view_from_world * cloud.world_from_local)
                     .row(2)
                     .truncate()
                     .normalize_or_zero();
+                let direction = direction.extend(sway.map_or(0.0, |sway| sway.dot(direction)));
                 if draw.direction != direction
                     || draw.revision != gpu.revision
                     || draw.segments != segments
                 {
                     // Translation preserves relative depths. Re-sort only if the
-                    // view direction, asset data, or submitted levels changed.
+                    // view direction, sway depth, asset data, or submitted levels changed.
                     depths.clear();
                     depths.extend(
                         gpu.centers[segments.start as usize..segments.end as usize]
@@ -897,7 +965,7 @@ fn queue_clouds(
                 draw_function,
                 batch_range: 0..1,
                 extra_index: PhaseItemExtraIndex::None,
-                indexed: shadowed,
+                indexed: true,
             });
         }
     }
@@ -961,8 +1029,7 @@ fn make_draw(
         order,
         bindings,
         shadows: shadows.clone(),
-        shadowed: false,
-        direction: Vec3::NAN,
+        direction: Vec4::NAN,
         revision: 0,
         segments: 0..count as u32,
         idle_frames: 0,
@@ -994,12 +1061,11 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
         } else {
             draw.segments.clone()
         };
-        if draw.shadowed {
-            pass.set_index_buffer(pipeline.into_inner().shadow_quad.slice(..), IndexFormat::Uint16);
-            pass.draw_indexed(0..6, 0, instances);
-        } else {
-            pass.draw(0..4, instances);
-        }
+        pass.set_index_buffer(
+            pipeline.into_inner().quad_indices.slice(..),
+            IndexFormat::Uint16,
+        );
+        pass.draw_indexed(0..6, 0, instances);
         RenderCommandResult::Success
     }
 }

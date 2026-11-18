@@ -3,9 +3,13 @@ use std::{
     f32::consts::{FRAC_PI_2, TAU},
 };
 
-use bevy::{camera::visibility::RenderLayers, prelude::*};
+use bevy::{
+    camera::visibility::{RenderLayers, VisibilityRange},
+    prelude::*,
+};
 use bevy_spaghetti::{
-    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows,
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting,
+    SpaghettiReceiveShadows,
 };
 
 use crate::{
@@ -24,11 +28,11 @@ const TRUNK_CLOUDS: [&str; 3] = [
     "windward/deadfall-far.spag",
 ];
 
-/// The logs share the conifer gains, so the bark doesn't glow beside the
-/// trunks of the standing trees.
+/// Near the ground, bounced light from the grass and soil is less blue
+/// than the open sky. Keep shaded bark visible between direct sun patches.
 const LOG_LIGHTING: SpaghettiLighting = SpaghettiLighting {
     direction_to_light: SUN,
-    ambient: Vec3::new(0.24, 0.27, 0.29),
+    ambient: Vec3::new(0.43, 0.44, 0.42),
     directional: Vec3::new(0.62, 0.52, 0.40),
 };
 
@@ -133,6 +137,89 @@ pub fn spawn_debris(
             SpaghettiReceiveShadows,
             Transform::IDENTITY,
         ));
+    }
+    spawn_twigs(&mut commands, &mut splats);
+}
+
+fn spawn_twigs(commands: &mut Commands, splats: &mut Assets<SpaghettiAsset>) {
+    const CELL: f32 = 8.0;
+    let forest = crate::forest::forest();
+    let mut patches: BTreeMap<(i32, i32), Vec<GaussianSegment>> = BTreeMap::new();
+    for (index, tree) in forest
+        .trees
+        .iter()
+        .enumerate()
+        .filter(|(_, tree)| tree.is_stand())
+    {
+        for twig in 0..9 {
+            let seed = 48_913 + 173 * index as u32 + 13 * twig;
+            let across = Vec2::from_angle(TAU * hash01(seed));
+            let at = tree.at + across * tree.crown().max(0.9) * (0.42 + 0.80 * hash01(seed + 1));
+            if (at.x - trail_x(at.y)).abs() < 1.8 || ground(at) < WATER_LEVEL + 0.27 {
+                continue;
+            }
+            let cell = (at / CELL).floor().as_ivec2();
+            let origin = cell.as_vec2() * CELL;
+            fallen_twig(
+                patches.entry((cell.x, cell.y)).or_default(),
+                at,
+                origin,
+                seed,
+            );
+        }
+    }
+    for ((x, z), segments) in patches {
+        commands.spawn((
+            Name::new("Fallen twigs"),
+            Spaghetti3d(splats.add(SpaghettiAsset::new(segments).expect("valid twigs"))),
+            SpaghettiCutout,
+            LIGHTING,
+            SpaghettiReceiveShadows,
+            Transform::from_xyz(x as f32 * CELL, 0.0, z as f32 * CELL),
+            VisibilityRange {
+                start_margin: 0.0..0.0,
+                end_margin: 13.0..18.0,
+                use_aabb: true,
+            },
+        ));
+    }
+}
+
+fn fallen_twig(patch: &mut Vec<GaussianSegment>, at: Vec2, origin: Vec2, seed: u32) {
+    let along = Vec2::from_angle(TAU * hash01(seed + 2));
+    let side = along.perp() * (2.0 * hash01(seed + 3) - 1.0).signum();
+    let length = 0.13 + 0.52 * hash01(seed + 4).powi(2);
+    let width = 0.0055 + 0.012 * length;
+    let color = Vec3::new(0.16, 0.095, 0.054).lerp(Vec3::new(0.30, 0.22, 0.14), hash01(seed + 5));
+    let point = |point: Vec2, relief: f32| {
+        let local = point - origin;
+        Vec3::new(local.x, ground(point) + relief * width, local.y)
+    };
+    let root = point(at - along * (0.46 * length), 0.59);
+    let bend = point(at + side * (0.09 * length), 1.5);
+    let tip = point(at + along * (0.54 * length) + side * (0.14 * length), 0.75);
+    let mut stick = |a: Vec3, b: Vec3, sigma: f32, taper: f32, tint| {
+        let along = (b - a).normalize();
+        let side = Vec3::Y.cross(along).normalize();
+        let rotation =
+            Quat::from_mat3(&Mat3::from_cols(along, side, along.cross(side))).normalize();
+        patch.push(
+            GaussianSegment::new(
+                a,
+                b,
+                Vec3::splat(sigma),
+                rotation,
+                5.4 * a.distance(b) * sigma,
+                color * tint,
+            )
+            .with_cutout_taper(taper),
+        );
+    };
+    stick(root, bend, width, 0.67, 0.88);
+    stick(bend, tip, 0.67 * width, 0.24, 1.03);
+    if length > 0.25 {
+        let fork = point(at + (0.28 * along + 0.37 * side) * length, 0.60);
+        stick(bend, fork, 0.53 * width, 0.19, 0.85);
     }
 }
 

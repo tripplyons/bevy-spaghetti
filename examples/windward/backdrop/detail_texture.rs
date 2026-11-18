@@ -108,7 +108,7 @@ pub fn albedo_detail() -> (Image, f32) {
         })
         .collect();
     (
-        generate_mips(image(pixels, TextureFormat::Rgba8Unorm)),
+        generate_mips(image(pixels, TextureFormat::Rgba8Unorm), 1),
         mean,
     )
 }
@@ -139,24 +139,23 @@ pub fn normal_detail() -> Image {
             ]);
         }
     }
-    generate_mips(image(pixels, TextureFormat::Rgba8Unorm))
+    generate_mips(image(pixels, TextureFormat::Rgba8Unorm), 1)
 }
 
-/// Box-filters a full mip chain so distant slopes average the detail instead
-/// of shimmering.
-fn generate_mips(mut image: Image) -> Image {
+/// Box-filters an RGBA texture until its shorter side reaches `min_size`.
+pub(super) fn generate_mips(mut image: Image, min_size: u32) -> Image {
     let mut levels = vec![image.data.clone().unwrap()];
-    let mut size = SIZE;
-    while size > 1 {
+    let (mut width, mut height) = (image.width(), image.height());
+    while width.min(height) > min_size {
         let previous = levels.last().unwrap();
-        let half = size / 2;
-        let mut next = Vec::with_capacity((half * half * 4) as usize);
-        for y in 0..half {
-            for x in 0..half {
+        let (next_width, next_height) = (width / 2, height / 2);
+        let mut next = Vec::with_capacity((next_width * next_height * 4) as usize);
+        for y in 0..next_height {
+            for x in 0..next_width {
                 for channel in 0..4 {
                     let at = |dx: u32, dy: u32| {
                         u32::from(
-                            previous[(((2 * y + dy) * size + 2 * x + dx) * 4 + channel) as usize],
+                            previous[(((2 * y + dy) * width + 2 * x + dx) * 4 + channel) as usize],
                         )
                     };
                     next.push(((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8);
@@ -164,7 +163,7 @@ fn generate_mips(mut image: Image) -> Image {
             }
         }
         levels.push(next);
-        size = half;
+        (width, height) = (next_width, next_height);
     }
     image.texture_descriptor.mip_level_count = levels.len() as u32;
     image.data = Some(levels.concat());

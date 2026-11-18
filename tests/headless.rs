@@ -17,14 +17,16 @@ use bevy::{
     winit::WinitPlugin,
 };
 use bevy_spaghetti::{
-    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiPlugin,
+    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
+    SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting, SpaghettiPlugin,
+    SpaghettiSway,
 };
 
 const SIZE: usize = 128;
 
 #[derive(Resource, Default)]
 struct Samples {
-    strand: Option<[[u8; 4]; 9]>,
+    strand: Option<[[u8; 4]; 16]>,
     bust: Option<usize>,
 }
 
@@ -75,6 +77,13 @@ fn renders_strands_and_bundled_asset_offscreen() {
                 tapered,
                 lit,
                 unlit,
+                cutout_root_edge,
+                cutout_tip,
+                cutout_tip_edge,
+                shared_fine,
+                shared_coarse,
+                sky_light,
+                ground_light,
             ] = pixels;
             println!(
                 "strand: {pixels:?}, bust coverage: {bust} / {}",
@@ -110,6 +119,24 @@ fn renders_strands_and_bundled_asset_offscreen() {
                 lit[0] > 200 && unlit[0] > 35 && lit[0] > unlit[0] + 100,
                 "oriented splats did not receive distinct lighting"
             );
+            assert!(
+                cutout_root_edge[1] > 200 && cutout_tip[1] > 200 && cutout_tip_edge[1] < 5,
+                "cutout did not narrow toward its tip"
+            );
+            assert!(
+                shared_fine[0] > 240
+                    && shared_fine[1] < 5
+                    && shared_coarse[0] < 5
+                    && shared_coarse[1] > 240,
+                "instances of the same cloud did not choose distinct detail levels"
+            );
+            assert!(
+                sky_light[2] > 220
+                    && sky_light[0] < 5
+                    && ground_light[0] > 220
+                    && ground_light[2] < 5,
+                "ambient hemisphere did not follow the world-space normals"
+            );
             return check_same_size_update(&mut app);
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -119,12 +146,11 @@ fn renders_strands_and_bundled_asset_offscreen() {
 
 fn check_same_size_update(app: &mut App) {
     let world = app.world_mut();
-    let cloud = world
-        .query_filtered::<&Spaghetti3d, With<EditableCloud>>()
+    let (entity, cloud) = world
+        .query_filtered::<(Entity, &Spaghetti3d), With<EditableCloud>>()
         .single(world)
-        .unwrap()
-        .0
-        .clone();
+        .unwrap();
+    let cloud = cloud.0.clone();
     let mut assets = world.resource_mut::<Assets<SpaghettiAsset>>();
     let mut segments = assets.get(&cloud).unwrap().segments().to_vec();
     // Flip the points' depths while preserving the source buffer size and
@@ -140,6 +166,7 @@ fn check_same_size_update(app: &mut App) {
             segment.color(),
         );
     }
+    segments[2] = segments[2].with_bend_heights(1.0, 1.0);
     assets
         .insert(cloud.id(), SpaghettiAsset::new(segments).unwrap())
         .unwrap();
@@ -149,11 +176,27 @@ fn check_same_size_update(app: &mut App) {
         let samples = app.world().resource::<Samples>().strand.unwrap();
         if samples[5][2] > samples[5][0] {
             println!("same-size edit reversed depth order: {:?}", samples[5]);
-            return;
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(SpaghettiSway(Vec3::Z * 0.55));
+            return check_sway_order(app);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
     panic!("same-size edit did not update overlapping point depth order");
+}
+
+fn check_sway_order(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        app.update();
+        let samples = app.world().resource::<Samples>().strand.unwrap();
+        if samples[5][0] > samples[5][2] && samples[5][2] > 40 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("sway did not move the red point ahead of the pinned blue point");
 }
 
 fn setup(
@@ -182,6 +225,42 @@ fn setup(
         EditableCloud,
         Spaghetti3d(splats.add(SpaghettiAsset::new(segments).unwrap())),
     ));
+    let cutout = GaussianSegment::new(
+        Vec3::new(-1.4, 1.45, 0.0),
+        Vec3::new(1.4, 1.45, 0.0),
+        Vec3::splat(0.16),
+        Quat::IDENTITY,
+        2.2,
+        Vec3::Y,
+    )
+    .with_cutout_taper(0.20);
+    commands.spawn((
+        Spaghetti3d(splats.add(SpaghettiAsset::new(vec![cutout]).unwrap())),
+        SpaghettiCutout,
+    ));
+    let levels =
+        [Vec3::X, Vec3::Y].map(|color| make_splat(-0.3 * Vec3::X, 0.3 * Vec3::X, 0.35, color));
+    let shared = splats.add(
+        SpaghettiAsset::with_detail(
+            levels.to_vec(),
+            &[DetailTransition {
+                finer_end: 1,
+                pixels_per_unit: [14.0, 24.0],
+            }],
+        )
+        .unwrap(),
+    );
+    commands.spawn((
+        Spaghetti3d(shared.clone()),
+        SpaghettiCutout,
+        Transform::from_xyz(-1.0, -1.48, 0.0),
+    ));
+    commands.spawn((
+        Spaghetti3d(shared),
+        SpaghettiCutout,
+        SpaghettiDetailScale(4.0),
+        Transform::from_xyz(1.0, -1.48, 0.0),
+    ));
     let lit_points = [
         (
             Vec3::new(-1.14, 0.9, 0.0),
@@ -201,6 +280,28 @@ fn setup(
             ambient: Vec3::splat(0.045),
             directional: Vec3::splat(0.85),
         },
+    ));
+    let hemisphere_points = [
+        (-0.9, Quat::IDENTITY),
+        (0.85, Quat::from_rotation_y(std::f32::consts::PI)),
+    ]
+    .into_iter()
+    .map(|(x, rotation)| {
+        let pos = Vec3::X * x;
+        GaussianSegment::new(pos, pos, Vec3::splat(0.08), rotation, 0.12, Vec3::ONE)
+    })
+    .collect();
+    commands.spawn((
+        Spaghetti3d(splats.add(SpaghettiAsset::new(hemisphere_points).unwrap())),
+        // Turn the two local normals into world-space up and down.
+        Transform::from_xyz(0.0, 0.43, 0.0)
+            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        SpaghettiLighting {
+            direction_to_light: Vec3::X,
+            ambient: Vec3::Z,
+            directional: Vec3::ZERO,
+        },
+        SpaghettiGroundAmbient(Vec3::X),
     ));
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(0.35, 0.55, 0.1))),
@@ -241,8 +342,23 @@ fn setup(
                 pixel(99, 64),
                 pixel(27, 35),
                 pixel(45, 35),
+                pixel(29, 22),
+                pixel(101, 17),
+                pixel(101, 22),
+                pixel(32, 111),
+                pixel(96, 111),
+                pixel(35, 50),
+                pixel(91, 50),
             ];
-            if pixels[2][1] > 240 && pixels[0][0] > 200 && pixels[7][0] > 5 {
+            if pixels[2][1] > 240
+                && pixels[0][0] > 200
+                && pixels[7][0] > 5
+                && pixels[10][1] > 5
+                && pixels[12][0].max(pixels[12][1]) > 5
+                && pixels[13][0].max(pixels[13][1]) > 5
+                && pixels[14][0].max(pixels[14][2]) > 5
+                && pixels[15][0].max(pixels[15][2]) > 5
+            {
                 samples.strand = Some(pixels);
             }
         },
