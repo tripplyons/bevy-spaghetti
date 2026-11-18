@@ -22,6 +22,17 @@ impl Rng {
     fn range(&mut self, low: f32, high: f32) -> f32 {
         low + (high - low) * self.next()
     }
+
+    /// A child stream that advances this one by exactly one step.
+    ///
+    /// Detail levels draw different numbers of samples for bark, shoots and
+    /// twigs. Giving each of those calls its own stream keeps the whorls and
+    /// limbs in the same places at every level, so trees keep their shape
+    /// when they switch level.
+    fn fork(&mut self) -> Rng {
+        self.next();
+        Rng(self.0.wrapping_mul(0x2c1b_3c6d) ^ 0x297a_2d39)
+    }
 }
 
 /// Sampling parameters for one level of detail.
@@ -88,6 +99,8 @@ pub struct Habit {
     young: Vec3,
     /// Sideways bend of the leader in meters.
     nod: f32,
+    /// Exponent of the crown profile. Lower values give a columnar spire.
+    profile: f32,
 }
 
 /// Grand fir: stiff upturned limbs and dark blue-green needles.
@@ -99,6 +112,7 @@ pub const FIR: Habit = Habit {
     old: Vec3::new(0.050, 0.082, 0.056),
     young: Vec3::new(0.105, 0.145, 0.068),
     nod: 0.0,
+    profile: 0.92,
 };
 
 /// Western hemlock: soft pendulous limbs, a nodding leader, and yellower
@@ -111,13 +125,67 @@ pub const HEMLOCK: Habit = Habit {
     old: Vec3::new(0.056, 0.090, 0.046),
     young: Vec3::new(0.125, 0.165, 0.062),
     nod: 0.55,
+    profile: 0.92,
+};
+
+/// Subalpine fir: a very narrow spire with short, stiff limbs and grey
+/// blue-green needles. Build it with a crown radius about half that of a
+/// grand fir of the same height.
+pub const SUBALPINE: Habit = Habit {
+    climb_top: 0.62,
+    climb_drop: 0.95,
+    sag: 0.20,
+    tip: 0.16,
+    old: Vec3::new(0.046, 0.074, 0.068),
+    young: Vec3::new(0.088, 0.132, 0.110),
+    nod: 0.0,
+    profile: 0.72,
+};
+
+/// Needles that died this season: rusty above, grey-brown when old.
+const DEAD_OLD: Vec3 = Vec3::new(0.200, 0.105, 0.052);
+const DEAD_YOUNG: Vec3 = Vec3::new(0.330, 0.150, 0.055);
+
+/// Age and damage of one tree. [`HEALTHY`] is a vigorous tree.
+#[derive(Clone, Copy)]
+pub struct Form {
+    /// Clear lower trunk as a fraction of height; zero picks a young bole.
+    pub bole: f32,
+    /// Extra fraction of limbs that are missing.
+    pub thin: f32,
+    /// Fraction of height above which the needles are dead.
+    pub dead_above: f32,
+    /// Fraction of height where the stem has snapped off.
+    pub broken_at: f32,
+    /// Strength of wind flagging: the upper crown keeps limbs only on its
+    /// leeward side, local +X.
+    pub flag: f32,
+    /// Trunk radius multiplier.
+    pub girth: f32,
+    /// A dead standing tree with grey wood and no needles.
+    pub snag: bool,
+}
+
+pub const HEALTHY: Form = Form {
+    bole: 0.0,
+    thin: 0.0,
+    dead_above: 2.0,
+    broken_at: 1.0,
+    flag: 0.0,
+    girth: 1.0,
+    snag: false,
 };
 
 impl Habit {
     /// Offset of the stem axis at height `y`; only the top bends.
     fn bend(&self, y: f32, height: f32, toward: Vec3) -> Vec3 {
         let t = ((y / height - 0.82) / 0.18).max(0.0);
-        toward * (self.nod * t * t)
+        toward * (self.nod(height) * t * t)
+    }
+
+    /// Small trees nod less, in proportion to their height.
+    fn nod(&self, height: f32) -> f32 {
+        self.nod * (height / 8.0).min(1.0)
     }
 }
 
@@ -125,6 +193,7 @@ impl Habit {
 pub fn fir(
     seed: u32,
     habit: &Habit,
+    form: &Form,
     height: f32,
     crown_radius: f32,
     level: usize,
@@ -132,10 +201,32 @@ pub fn fir(
     let detail = &LEVELS[level];
     let mut rng = Rng(seed.wrapping_mul(7919));
     let mut out = Vec::new();
-    let base = height * rng.range(0.07, 0.12);
-    let trunk_radius = 0.018 * height + 0.03;
+    let base = if form.bole > 0.0 {
+        height * form.bole * rng.range(0.85, 1.15)
+    } else {
+        height * rng.range(0.07, 0.12)
+    };
+    let trunk_radius = (0.018 * height + 0.03) * form.girth;
+    let top = height * form.broken_at.min(1.0);
+    let dead = Habit {
+        old: DEAD_OLD,
+        young: DEAD_YOUNG,
+        ..*habit
+    };
 
-    trunk(&mut out, &mut rng, height, base, trunk_radius, detail);
+    trunk(
+        &mut out,
+        &mut rng.fork(),
+        height,
+        top,
+        base,
+        trunk_radius,
+        form.snag,
+        detail,
+    );
+    if form.broken_at < 1.0 {
+        splinters(&mut out, &mut rng.fork(), height, top, trunk_radius, form.snag);
+    }
 
     // Annual whorls get closer together near the leader, where growth is
     // recent and the shoots are short.
@@ -143,28 +234,62 @@ pub fn fir(
     let toward = Vec3::new(lean.cos(), 0.0, lean.sin());
     let mut y = base;
     let mut whorl = 0u32;
-    while y < height - 0.25 {
+    while y < top - 0.25 {
         let rel = ((y - base) / (height - base)).clamp(0.0, 1.0);
-        let reach = crown_radius * (1.0 - rel).powf(0.92) * rng.range(0.86, 1.08) + 0.12;
+        let reach = crown_radius * (1.0 - rel).powf(habit.profile) * rng.range(0.86, 1.08) + 0.12;
+        let foliage = if y / height > form.dead_above {
+            &dead
+        } else {
+            habit
+        };
+        let thin = form.thin
+            + if y / height > form.dead_above {
+                0.3
+            } else {
+                0.0
+            };
+        // Wind and rime kill the exposed upper limbs on the windward side.
+        let exposure = ((rel - 0.25) / 0.75).clamp(0.0, 1.0) * form.flag;
         let count = 5 + (rng.next() * 4.0) as u32;
         let turn = whorl as f32 * 2.399 + rng.range(0.0, 0.6);
         // Crowding and old storm damage leave short or missing limbs, and
         // one side of the crown usually reaches further toward the light.
         let vigor = rng.range(0.85, 1.12);
         for branch in 0..count {
-            if rng.next() < 0.1 {
+            if rng.next() < 0.1 + thin {
                 continue;
             }
             let azimuth = turn
                 + branch as f32 * std::f32::consts::TAU / count as f32
                 + rng.range(-0.35, 0.35);
+            if azimuth.cos() < -1.0 + 1.6 * exposure {
+                continue;
+            }
             let toward_light = 1.0 + 0.12 * (azimuth - lean).cos();
             let stunted = if rng.next() < 0.12 { 0.55 } else { 1.0 };
             let length = reach * rng.range(0.72, 1.08) * vigor * toward_light * stunted;
+            if form.snag {
+                // Only short, broken stubs of the old limbs remain.
+                if rng.next() < 0.6 {
+                    stub(
+                        &mut out,
+                        &mut rng.fork(),
+                        y,
+                        azimuth,
+                        length,
+                        rel,
+                        height,
+                        trunk_radius,
+                        detail,
+                    );
+                }
+                continue;
+            }
+            let length = length * (1.0 + 0.3 * exposure * azimuth.cos());
             limb(
                 &mut out,
-                &mut rng,
-                habit,
+                &mut rng.fork(),
+                foliage,
                 habit.bend(y, height, toward),
                 y,
                 azimuth,
@@ -180,10 +305,17 @@ pub fn fir(
             let at = y + step * rng.range(0.3, 0.75);
             let length = reach * rng.range(0.38, 0.62);
             let azimuth = rng.range(0.0, std::f32::consts::TAU);
+            if form.snag
+                || at > top - 0.2
+                || rng.next() < thin
+                || azimuth.cos() < -1.0 + 1.6 * exposure
+            {
+                continue;
+            }
             limb(
                 &mut out,
-                &mut rng,
-                habit,
+                &mut rng.fork(),
+                foliage,
                 habit.bend(at, height, toward),
                 at,
                 azimuth,
@@ -197,20 +329,38 @@ pub fn fir(
         whorl += 1;
     }
 
-    // The leader is a short upright spray above the last whorl.
-    let leader_from = Vec3::Y * (height - 0.55) + habit.bend(height - 0.55, height, toward);
-    let top =
-        Vec3::Y * height + habit.bend(height, height, toward) * 1.4 - Vec3::Y * habit.nod * 0.4;
-    let color = needle_color(&mut rng, habit, 1.0, 1.0);
-    spray(
-        &mut out,
-        leader_from,
-        top,
-        toward.cross(Vec3::Y),
-        0.05 * detail.grow.min(2.0),
-        color,
-    );
-    if level >= 2 {
+    let crest = if form.dead_above < 1.0 { &dead } else { habit };
+    if form.snag {
+        // A snag keeps no leader.
+    } else if form.broken_at < 1.0 {
+        // A side limb below the break turns up to become a new leader.
+        let from = Vec3::Y * (top - 0.35) + toward * trunk_radius;
+        let to = from + (toward * 0.35 + Vec3::Y).normalize() * 0.9;
+        let color = needle_color(&mut rng, crest, 1.0, 1.0);
+        spray(
+            &mut out,
+            from,
+            to,
+            toward.cross(Vec3::Y),
+            0.05 * detail.grow.min(2.0),
+            color,
+        );
+    } else {
+        // The leader is a short upright spray above the last whorl.
+        let leader_from = Vec3::Y * (height - 0.55) + habit.bend(height - 0.55, height, toward);
+        let top = Vec3::Y * height + habit.bend(height, height, toward) * 1.4
+            - Vec3::Y * habit.nod(height) * 0.4;
+        let color = needle_color(&mut rng, crest, 1.0, 1.0);
+        spray(
+            &mut out,
+            leader_from,
+            top,
+            toward.cross(Vec3::Y),
+            0.05 * detail.grow.min(2.0),
+            color,
+        );
+    }
+    if level >= 2 || form.snag {
         // A few dead stubs below the crown would vanish at this size anyway.
         return out;
     }
@@ -239,21 +389,26 @@ pub fn fir(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn trunk(
     out: &mut Vec<GaussianSegment>,
     rng: &mut Rng,
     height: f32,
+    top: f32,
     base: f32,
     radius: f32,
+    snag: bool,
     detail: &Level,
 ) {
     let mut y = 0.0;
-    while y < height * 0.92 {
+    let end = if top < height { top } else { height * 0.92 };
+    while y < end {
         let step = detail.trunk_step;
         let taper = |y: f32| {
             let flare = 1.0 + 0.7 * (-y / 0.35).exp();
             radius * (1.0 - y / height).max(0.06) * flare
         };
+        let step = step.min(end - y + 0.05);
         let r0 = taper(y);
         let r1 = taper(y + step);
         for strip in 0..detail.strips {
@@ -266,10 +421,18 @@ fn trunk(
             // Ridged bark: dark grey with warm fissures.
             let fissure = rng.next();
             // The crown shades the stem above the lowest live limbs.
-            let shade = if y > base { 0.42 } else { 1.0 };
+            let shade = if y > base && !snag { 0.42 } else { 1.0 };
             let tone = (0.75 + 0.5 * rng.next()) * shade;
-            let color =
-                Vec3::new(0.115, 0.105, 0.095).lerp(Vec3::new(0.060, 0.050, 0.042), fissure) * tone;
+            // Sun and wind bleach the bare wood of a snag silver-grey.
+            let (ridge, groove) = if snag {
+                (Vec3::new(0.30, 0.285, 0.265), Vec3::new(0.15, 0.135, 0.12))
+            } else {
+                (
+                    Vec3::new(0.115, 0.105, 0.095),
+                    Vec3::new(0.060, 0.050, 0.042),
+                )
+            };
+            let color = ridge.lerp(groove, fissure) * tone;
             let rotation = Quat::from_mat3(&Mat3::from_cols(
                 Vec3::Y.cross(outward).normalize(),
                 Vec3::Y,
@@ -285,6 +448,78 @@ fn trunk(
             ));
         }
         y += step;
+    }
+}
+
+/// Jagged spikes of wood where the stem snapped.
+fn splinters(
+    out: &mut Vec<GaussianSegment>,
+    rng: &mut Rng,
+    height: f32,
+    top: f32,
+    radius: f32,
+    snag: bool,
+) {
+    let r = radius * (1.0 - top / height).max(0.06);
+    let color = if snag {
+        Vec3::new(0.30, 0.28, 0.25)
+    } else {
+        Vec3::new(0.20, 0.16, 0.11)
+    };
+    for _ in 0..3 {
+        let angle = rng.range(0.0, std::f32::consts::TAU);
+        let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
+        let start = Vec3::Y * (top - 0.1) + outward * r * 0.4;
+        let end =
+            start + (Vec3::Y + outward * rng.range(0.05, 0.3)).normalize() * rng.range(0.25, 0.9);
+        let width = r * rng.range(0.35, 0.6);
+        out.push(GaussianSegment::new(
+            start,
+            end,
+            Vec3::new(width, width, width * 0.7),
+            Quat::from_rotation_arc(Vec3::Z, outward),
+            5.0 * width * start.distance(end),
+            color * rng.range(0.8, 1.15),
+        ));
+    }
+}
+
+/// A bare, broken limb stub on a snag.
+#[allow(clippy::too_many_arguments)]
+fn stub(
+    out: &mut Vec<GaussianSegment>,
+    rng: &mut Rng,
+    y: f32,
+    azimuth: f32,
+    reach: f32,
+    rel: f32,
+    height: f32,
+    trunk_radius: f32,
+    detail: &Level,
+) {
+    let outward = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+    let length = reach * rng.range(0.2, 0.7) + 0.2;
+    // Far levels draw one thick link; the fine twigs would vanish anyway.
+    let links = if detail.wood { 3 } else { 1 };
+    let r = trunk_radius * (1.0 - y / height).max(0.06);
+    let droop = rng.range(-0.35, 0.1) - 0.2 * (1.0 - rel);
+    let point = |s: f32| {
+        Vec3::Y * y + outward * (r * 0.6 + length * s) + Vec3::Y * (droop * length * s * s)
+    };
+    let grow = if detail.wood { 1.0 } else { 1.6 };
+    let tone = rng.range(0.8, 1.15);
+    for link in 0..links {
+        let s0 = link as f32 / links as f32;
+        let s1 = (link + 1) as f32 / links as f32;
+        let width = (0.008 + 0.03 * (1.0 - s0) * (length / 1.5).min(1.0)) * grow;
+        out.push(GaussianSegment::new(
+            point(s0),
+            point(s1),
+            Vec3::splat(width),
+            Quat::from_rotation_arc(Vec3::Z, Vec3::Y),
+            5.0 * width * length / links as f32,
+            Vec3::new(0.26, 0.245, 0.225) * tone,
+        ));
     }
 }
 

@@ -156,6 +156,15 @@ fn full_scene_renders_in_background() {
         pose_review_camera(&mut app, Vec2::new(3.2, 1.5), 2.6, -0.12);
         turn_hiker_to_camera(&mut app);
         save_review_frame(app.world(), "hiker-front.png");
+        // Into the low sun beside a stand, where limbs pass the camera.
+        pose_review_camera(&mut app, Vec2::new(-9.5, -22.0), -0.15, 0.12);
+        save_review_frame(app.world(), "into-sun.png");
+        // From a hillside across the hazy valley toward the sun.
+        pose_review_camera(&mut app, Vec2::new(28.0, -38.0), -0.15, 0.02);
+        save_review_frame(app.world(), "valley-sun.png");
+        // Low by the lake, looking up toward the sun through the haze.
+        pose_review_camera(&mut app, Vec2::new(5.0, -3.0), -0.2, 0.22);
+        save_review_frame(app.world(), "haze-low.png");
     }
     assert_shaders_loaded(&app);
 }
