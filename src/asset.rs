@@ -6,6 +6,7 @@ use thiserror::Error;
 
 const MAGIC_V1: &[u8; 8] = b"SPAG\x01\0\0\0";
 const MAGIC_V2: &[u8; 8] = b"SPAG\x02\0\0\0";
+const MAGIC_V3: &[u8; 8] = b"SPAG\x03\0\0\0";
 const HEADER_BYTES: usize = 12;
 const SEGMENT_BYTES: usize = size_of::<GaussianSegment>();
 /// Caps GPU storage at 80 MB per cloud.
@@ -119,7 +120,7 @@ impl GaussianSegment {
 
 #[derive(Debug, Error)]
 pub enum AssetError {
-    #[error("expected a version 1 or 2 SPAG file")]
+    #[error("expected a version 1, 2, or 3 SPAG file")]
     Header,
     #[error("expected between 1 and {MAX_SEGMENTS} segments, found {0}")]
     Count(usize),
@@ -131,6 +132,12 @@ pub enum AssetError {
         "invalid detail transitions: expected up to {MAX_DETAIL_TRANSITIONS} ordered transitions between nonempty levels"
     )]
     InvalidDetail,
+    #[error("occlusion direction must be finite and nonzero")]
+    InvalidOcclusionDirection,
+    #[error("occlusion density must be finite and nonnegative")]
+    InvalidOcclusionDensity,
+    #[error("occlusion factors must be between 0 and 1")]
+    InvalidOcclusion,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -145,6 +152,7 @@ pub struct SpaghettiAsset {
     segments: Arc<Vec<GaussianSegment>>,
     bounds: (Vec3, Vec3),
     detail: Arc<[DetailTransition]>,
+    occlusion: Arc<[[f32; 2]]>,
 }
 
 /// One transition in a cloud whose segments are grouped from finest to coarsest.
@@ -208,6 +216,7 @@ impl SpaghettiAsset {
             segments: Arc::new(segments),
             bounds: (min, max),
             detail: Arc::from(detail),
+            occlusion: Arc::from([]),
         })
     }
 
@@ -219,6 +228,53 @@ impl SpaghettiAsset {
         &self.detail
     }
 
+    /// Bakes ambient and directional transmittance at the segment midpoints.
+    ///
+    /// The sun direction and upper hemisphere (+Y) are in asset space. Each
+    /// detail level is baked independently. Rebake if the direction changes.
+    /// The segment at the ray's origin does not occlude itself.
+    pub fn bake_occlusion(self, direction_to_light: Vec3) -> Result<Self, AssetError> {
+        self.bake_occlusion_with_density(direction_to_light, 1.0)
+    }
+
+    /// Bakes transmittance with optical masses scaled for lighting.
+    ///
+    /// Use a lower density when kernels with substantial overlap represent
+    /// a single opaque surface. This scale does not affect raster opacity.
+    pub fn bake_occlusion_with_density(
+        mut self,
+        direction_to_light: Vec3,
+        density: f32,
+    ) -> Result<Self, AssetError> {
+        if !density.is_finite() || density < 0.0 {
+            return Err(AssetError::InvalidOcclusionDensity);
+        }
+        let direction = direction_to_light
+            .as_dvec3()
+            .try_normalize()
+            .ok_or(AssetError::InvalidOcclusionDirection)?;
+        let mut factors = vec![[0.0; 2]; self.segments.len()];
+        let mut start = 0;
+        let ends = self.detail.iter().map(|level| level.finer_end as usize);
+        for end in ends.chain([self.segments.len()]) {
+            crate::occlusion::bake(
+                &self.segments[start..end],
+                direction,
+                density.into(),
+                &mut factors[start..end],
+            );
+            start = end;
+        }
+        self.occlusion = factors.into();
+        Ok(self)
+    }
+
+    /// One pair of ambient and directional transmittance factors per segment.
+    /// Empty for clouds without baked occlusion.
+    pub fn occlusion(&self) -> &[[f32; 2]] {
+        &self.occlusion
+    }
+
     /// Local-space minimum and maximum, including four standard deviations
     /// of kernel support.
     pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -226,7 +282,8 @@ impl SpaghettiAsset {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AssetError> {
-        let has_detail = bytes.starts_with(MAGIC_V2);
+        let has_occlusion = bytes.starts_with(MAGIC_V3);
+        let has_detail = has_occlusion || bytes.starts_with(MAGIC_V2);
         if !(has_detail || bytes.starts_with(MAGIC_V1)) || bytes.len() < HEADER_BYTES {
             return Err(AssetError::Header);
         }
@@ -236,23 +293,27 @@ impl SpaghettiAsset {
         let Some(trailer) = bytes.get(segment_end..) else {
             return Err(AssetError::Length);
         };
-        let records = if has_detail {
-            let Some((count, data)) = trailer.split_first_chunk::<4>() else {
+        let (records, occlusion_bytes) = if has_detail {
+            let Some((detail_count, data)) = trailer.split_first_chunk::<4>() else {
                 return Err(AssetError::Length);
             };
-            let count = u32::from_le_bytes(*count) as usize;
-            if !(1..=MAX_DETAIL_TRANSITIONS).contains(&count) {
+            let detail_count = u32::from_le_bytes(*detail_count) as usize;
+            if detail_count > MAX_DETAIL_TRANSITIONS || (!has_occlusion && detail_count == 0) {
                 return Err(AssetError::InvalidDetail);
             }
-            if data.len() != count * TRANSITION_BYTES {
+            let Some((detail, occlusion)) = data.split_at_checked(detail_count * TRANSITION_BYTES)
+            else {
+                return Err(AssetError::Length);
+            };
+            if occlusion.len() != if has_occlusion { count * 8 } else { 0 } {
                 return Err(AssetError::Length);
             }
-            data.as_chunks::<TRANSITION_BYTES>().0
+            (detail.as_chunks::<TRANSITION_BYTES>().0, occlusion)
         } else {
             if !trailer.is_empty() {
                 return Err(AssetError::Length);
             }
-            &[]
+            (&[][..], &[][..])
         };
 
         let segments = bytes[HEADER_BYTES..segment_end]
@@ -277,11 +338,28 @@ impl SpaghettiAsset {
                 }
             })
             .collect();
-        Self::with_detail(segments, &detail)
+        let mut asset = Self::with_detail(segments, &detail)?;
+        let occlusion = occlusion_bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|record| {
+                let factors = bytemuck::cast::<_, [[u8; 4]; 2]>(*record).map(f32::from_le_bytes);
+                if factors.iter().all(|value| (0.0..=1.0).contains(value)) {
+                    Ok(factors)
+                } else {
+                    Err(AssetError::InvalidOcclusion)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        asset.occlusion = occlusion.into();
+        Ok(asset)
     }
 
     pub fn write(&self, mut writer: impl Write) -> Result<(), AssetError> {
-        writer.write_all(if self.detail.is_empty() {
+        writer.write_all(if !self.occlusion.is_empty() {
+            MAGIC_V3
+        } else if self.detail.is_empty() {
             MAGIC_V1
         } else {
             MAGIC_V2
@@ -292,7 +370,7 @@ impl SpaghettiAsset {
             let bytes: [[u8; 4]; SEGMENT_BYTES / 4] = fields.map(f32::to_le_bytes);
             writer.write_all(bytemuck::cast_slice(&bytes))?;
         }
-        if !self.detail.is_empty() {
+        if !self.detail.is_empty() || !self.occlusion.is_empty() {
             writer.write_all(&(self.detail.len() as u32).to_le_bytes())?;
             for transition in &*self.detail {
                 writer.write_all(&transition.finer_end.to_le_bytes())?;
@@ -300,6 +378,9 @@ impl SpaghettiAsset {
                     writer.write_all(&edge.to_le_bytes())?;
                 }
             }
+        }
+        for factors in &*self.occlusion {
+            writer.write_all(bytemuck::cast_slice(&factors.map(f32::to_le_bytes)))?;
         }
         Ok(())
     }
@@ -339,6 +420,72 @@ mod tests {
             SpaghettiAsset::from_bytes(&bytes[..bytes.len() - 1]),
             Err(AssetError::Length)
         ));
+    }
+
+    #[test]
+    fn buried_midpoint_has_less_light_and_factors_survive_round_trip() {
+        let point = |center, mass| {
+            GaussianSegment::new(
+                center,
+                center,
+                Vec3::splat(0.1),
+                Quat::IDENTITY,
+                mass,
+                Vec3::ONE,
+            )
+        };
+        let mut segments = vec![point(Vec3::ZERO, 0.0), point(Vec3::splat(2.0), 0.0)];
+        for axis in [
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::NEG_X,
+            Vec3::NEG_Y,
+            Vec3::NEG_Z,
+        ] {
+            segments.push(point(axis * 0.1, 0.15));
+        }
+        // A second level can occupy exactly the same space.
+        let finer_end = segments.len() as u32;
+        segments.push(point(Vec3::ZERO, 1.0));
+        let asset = SpaghettiAsset::with_detail(
+            segments,
+            &[DetailTransition {
+                finer_end,
+                pixels_per_unit: [40.0, 60.0],
+            }],
+        )
+        .unwrap()
+        .bake_occlusion(Vec3::Y)
+        .unwrap();
+        let factors = asset.occlusion();
+        assert!(
+            factors[0].iter().all(|value| *value < 0.3),
+            "{:?}",
+            factors[0]
+        );
+        assert_eq!(factors[1], [1.0; 2]);
+        assert_eq!(factors[finer_end as usize], [1.0; 2]);
+        let mut bytes = Vec::new();
+        asset.write(&mut bytes).unwrap();
+        assert!(bytes.starts_with(MAGIC_V3));
+        let read = SpaghettiAsset::from_bytes(&bytes).unwrap();
+        assert_eq!(read.occlusion(), factors);
+        assert_eq!(read.detail_transitions(), asset.detail_transitions());
+    }
+
+    #[test]
+    fn directional_point_integrates_the_forward_half_ray() {
+        let point = |center, mass| {
+            GaussianSegment::new(center, center, Vec3::ONE, Quat::IDENTITY, mass, Vec3::ONE)
+        };
+        let mass = std::f32::consts::TAU;
+        let asset =
+            SpaghettiAsset::new(vec![point(Vec3::ZERO, 0.0), point(Vec3::Y, mass)]).unwrap();
+        let forward = asset.clone().bake_occlusion(Vec3::Y).unwrap().occlusion()[0][1];
+        let backward = asset.bake_occlusion(Vec3::NEG_Y).unwrap().occlusion()[0][1];
+        assert!((forward - (-0.8413447_f32).exp()).abs() < 1e-6);
+        assert!((backward - (-0.1586553_f32).exp()).abs() < 1e-6);
     }
 
     #[test]

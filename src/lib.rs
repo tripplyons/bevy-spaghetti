@@ -6,6 +6,7 @@
 )]
 
 mod asset;
+mod occlusion;
 pub use asset::{AssetError, DetailTransition, GaussianSegment, SpaghettiAsset};
 
 #[cfg(feature = "render")]
@@ -13,5 +14,5 @@ mod render;
 #[cfg(feature = "render")]
 pub use render::{
     Spaghetti3d, SpaghettiCutout, SpaghettiLighting, SpaghettiNearFade, SpaghettiPlugin, SpaghettiTransmission,
-    SpaghettiWind,
+    SpaghettiReceiveShadows, SpaghettiWind,
 };

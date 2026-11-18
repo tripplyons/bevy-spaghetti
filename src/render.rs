@@ -38,10 +38,15 @@ use bevy::{
 };
 use bevy_light::{DirectionalLight, VolumetricLight};
 use bevy_math::{Affine3A, Vec3A};
-use bevy_pbr::{DistanceFog, FogFalloff, MAX_DIRECTIONAL_LIGHTS};
+use bevy_pbr::{
+    DistanceFog, ExtractedDirectionalLight, FogFalloff, LightEntity, MAX_DIRECTIONAL_LIGHTS,
+};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{AssetError, DetailTransition, SpaghettiAsset, asset::MAX_DETAIL_TRANSITIONS};
+
+mod shadow;
+use shadow::{ShadowBindings, ShadowViewData};
 
 /// Renders a cloud using the entity's transform, visibility and render layers.
 #[derive(Component, Clone, Debug)]
@@ -60,6 +65,13 @@ pub struct SpaghettiLighting {
     pub ambient: Vec3,
     pub directional: Vec3,
 }
+
+/// Receives Bevy directional shadow maps on a cloud with [`SpaghettiLighting`].
+///
+/// Uses the shadow-casting light whose direction matches the cloud's light.
+/// Outside its cascades or in a view without that light, the cloud stays lit.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct SpaghettiReceiveShadows;
 
 /// Optional light transmission for thin splats such as leaves and blades.
 ///
@@ -104,6 +116,8 @@ pub struct SpaghettiWind {
 /// Registers the `.spag` asset loader and the Bevy 3D render pipeline.
 ///
 /// Add this after the plugins that provide Bevy's asset server and 3D renderer.
+/// The loader accepts `Option<([f32; 3], f32)>` settings for baking at load
+/// time. Supply the asset-space sun direction and optical density scale.
 pub struct SpaghettiPlugin;
 
 impl Plugin for SpaghettiPlugin {
@@ -135,18 +149,24 @@ struct SpaghettiLoader;
 
 impl AssetLoader for SpaghettiLoader {
     type Asset = SpaghettiAsset;
-    type Settings = ();
+    type Settings = Option<([f32; 3], f32)>;
     type Error = AssetError;
 
     async fn load(
         &self,
         reader: &mut dyn Reader,
-        _: &(),
+        bake: &Self::Settings,
         _: &mut LoadContext<'_>,
     ) -> Result<Self::Asset, Self::Error> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        SpaghettiAsset::from_bytes(&bytes)
+        let asset = SpaghettiAsset::from_bytes(&bytes)?;
+        match *bake {
+            Some((direction, density)) => {
+                asset.bake_occlusion_with_density(Vec3::from_array(direction), density)
+            }
+            None => Ok(asset),
+        }
     }
 
     fn extensions(&self) -> &[&str] {
@@ -161,6 +181,7 @@ pub struct ExtractedCloud {
     layers: RenderLayers,
     disable_culling: bool,
     lighting: Option<SpaghettiLighting>,
+    receive_shadows: bool,
     transmission: f32,
     cutout: bool,
     wind: Option<SpaghettiWind>,
@@ -180,6 +201,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
         Option<&'static RenderLayers>,
         Has<NoFrustumCulling>,
         Option<&'static SpaghettiLighting>,
+        Has<SpaghettiReceiveShadows>,
         Option<&'static SpaghettiTransmission>,
         Has<SpaghettiCutout>,
         Option<&'static SpaghettiWind>,
@@ -190,7 +212,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
     type Out = ExtractedCloud;
 
     fn extract_component(
-        (cloud, transform, visibility, layers, disable_culling, lighting, transmission, cutout, wind, range, near_fade):
+        (cloud, transform, visibility, layers, disable_culling, lighting, receive_shadows, transmission, cutout, wind, range, near_fade):
             QueryItem<'_, '_, Self::QueryData>,
     ) -> Option<Self::Out> {
         visibility.get().then(|| ExtractedCloud {
@@ -199,6 +221,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             layers: layers.cloned().unwrap_or_default(),
             disable_culling,
             lighting: lighting.copied(),
+            receive_shadows,
             transmission: transmission.map_or(0.0, |t| t.0.max(0.0)),
             cutout,
             wind: wind.copied(),
@@ -210,6 +233,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
 
 struct GpuCloud {
     segments: Option<Buffer>,
+    occlusion: Option<Buffer>,
     centers: Box<[Vec3]>,
     bounds: Aabb,
     max_bend_height: f32,
@@ -222,7 +246,7 @@ impl RenderAsset for GpuCloud {
     type Param = (SRes<RenderDevice>, SRes<RenderQueue>);
 
     fn byte_len(asset: &Self::SourceAsset) -> Option<usize> {
-        Some(std::mem::size_of_val(asset.segments()))
+        Some(std::mem::size_of_val(asset.segments()) + asset.occlusion().len() * size_of::<u32>())
     }
 
     fn prepare_asset(
@@ -240,6 +264,7 @@ impl RenderAsset for GpuCloud {
             );
             return Ok(Self {
                 segments: None,
+                occlusion: None,
                 centers: Box::new([]),
                 bounds: Aabb::from_min_max(Vec3::ZERO, Vec3::ZERO),
                 max_bend_height: 0.0,
@@ -266,8 +291,24 @@ impl RenderAsset for GpuCloud {
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             })
         };
+        let occlusion = (!asset.occlusion().is_empty()).then(|| {
+            let packed: Vec<_> = asset
+                .occlusion()
+                .iter()
+                .map(|[ambient, directional]| {
+                    let pack = |factor: f32| (factor * 65535.0).round() as u32;
+                    pack(*ambient) | (pack(*directional) << 16)
+                })
+                .collect();
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("spaghetti occlusion attributes"),
+                contents: bytemuck::cast_slice(&packed),
+                usage: BufferUsages::STORAGE,
+            })
+        });
         Ok(Self {
             segments: Some(segments),
+            occlusion,
             centers,
             bounds: Aabb::from_min_max(min, max),
             max_bend_height: asset.segments().iter().map(|segment| segment.max_bend_height()).fold(0.0, f32::max),
@@ -327,9 +368,16 @@ impl GpuCloud {
 struct SplatPipeline {
     shader: Handle<Shader>,
     bindings: BindGroupLayoutDescriptor,
+    shadows: ShadowBindings,
+    shadow_quad: Buffer,
 }
 
-fn init_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
+fn init_pipeline(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    device: Res<RenderDevice>,
+    cache: Res<PipelineCache>,
+) {
     commands.insert_resource(SplatPipeline {
         shader: load_embedded_asset!(asset_server.as_ref(), "spaghetti.wgsl"),
         bindings: BindGroupLayoutDescriptor::new(
@@ -340,9 +388,18 @@ fn init_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
                     uniform_buffer_sized(false, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
                 ),
             ),
         ),
+        shadows: ShadowBindings::new(&device, &cache),
+        // Both triangles use corner 1 as the provoking vertex for flat
+        // attributes, so only that corner shades the segment.
+        shadow_quad: device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("spaghetti shadow quad"),
+            contents: bytemuck::cast_slice(&[1_u16, 2, 0, 1, 3, 2]),
+            usage: BufferUsages::INDEX,
+        }),
     });
 }
 
@@ -351,6 +408,8 @@ struct PipelineKey {
     target: TextureFormat,
     samples: u32,
     cutout: bool,
+    shadowed: bool,
+    baked_occlusion: bool,
 }
 
 impl SpecializedRenderPipeline for SplatPipeline {
@@ -359,10 +418,14 @@ impl SpecializedRenderPipeline for SplatPipeline {
     fn specialize(&self, key: PipelineKey) -> RenderPipelineDescriptor {
         RenderPipelineDescriptor {
             label: Some("spaghetti volume compositing".into()),
-            layout: vec![self.bindings.clone()],
+            layout: vec![self.bindings.clone(), self.shadows.layout.clone()],
             vertex: VertexState {
                 shader: self.shader.clone(),
                 entry_point: Some(if key.cutout { "cutout_vertex" } else { "vertex" }.into()),
+                constants: vec![
+                    ("SHADOW_QUAD".into(), u32::from(key.shadowed) as f64),
+                    ("BAKED_OCCLUSION".into(), u32::from(key.baked_occlusion) as f64),
+                ],
                 ..default()
             },
             fragment: Some(FragmentState {
@@ -376,7 +439,11 @@ impl SpecializedRenderPipeline for SplatPipeline {
                 ..default()
             }),
             primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleStrip,
+                topology: if key.shadowed {
+                    PrimitiveTopology::TriangleList
+                } else {
+                    PrimitiveTopology::TriangleStrip
+                },
                 ..default()
             },
             depth_stencil: Some(DepthStencilState {
@@ -539,9 +606,12 @@ struct CloudDraw {
     main_entity: MainEntity,
     cutout_pipeline: Option<CachedRenderPipelineId>,
     source: Buffer,
+    occlusion: Option<BufferId>,
     uniform: Buffer,
     order: Option<Buffer>,
     bindings: BindGroup,
+    shadows: BindGroup,
+    shadowed: bool,
     direction: Vec3,
     revision: u64,
     segments: Range<u32>,
@@ -552,12 +622,14 @@ struct CloudDraw {
 struct ViewDraws(HashMap<(RetainedViewEntity, Entity), CloudDraw>);
 
 type SplatView = (
+    Entity,
     &'static ExtractedView,
     &'static Msaa,
     Option<&'static Frustum>,
     Option<&'static RenderLayers>,
     Option<&'static TemporalJitter>,
     Option<&'static MainPassResolutionOverride>,
+    Option<ShadowViewData>,
 );
 
 #[expect(clippy::too_many_arguments, reason = "Bevy system parameters")]
@@ -576,8 +648,8 @@ fn queue_clouds(
     mut pipelines: ResMut<SpecializedRenderPipelines<SplatPipeline>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    mut depths: Local<Vec<(f32, u32)>>,
-    mut order: Local<Vec<u32>>,
+    (mut depths, mut order): (Local<Vec<(f32, u32)>>, Local<Vec<u32>>),
+    (cascade_views, sun_lights): (Query<&LightEntity>, Query<&ExtractedDirectionalLight>),
 ) {
     for draw in draws.0.values_mut() {
         draw.idle_frames += 1;
@@ -587,7 +659,7 @@ fn queue_clouds(
     let cutout_draw_function = cutout_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let bind_group_layout = cache.get_bind_group_layout(&pipeline.bindings);
     let default_layers = RenderLayers::default();
-    for (view, msaa, frustum, layers, jitter, resolution) in &views {
+    for (view_entity, view, msaa, frustum, layers, jitter, resolution, shadow_data) in &views {
         let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
@@ -607,7 +679,8 @@ fn queue_clouds(
         } else {
             view.clip_from_world.unwrap_or(projection * view_from_world)
         };
-        let mut pipeline_ids = [None; 2];
+        let mut pipeline_ids = [None; 8];
+        let mut view_shadows = None;
 
         for (entity, main_entity, cloud) in &clouds {
             if !layers.intersects(&cloud.layers) {
@@ -692,9 +765,33 @@ fn queue_clouds(
                 uniform.motion[0] = wind.time;
                 uniform.motion[1] = 1.0;
             }
+            let mut shadows = &pipeline.shadows.fallback;
+            let mut shadowed = false;
             if let Some(lighting) = cloud.lighting {
                 uniform.set_lighting(lighting, cloud.world_from_local);
                 uniform.ambient[3] = cloud.transmission;
+                if cloud.receive_shadows && let Some(data) = shadow_data {
+                    let view_shadows = view_shadows.get_or_insert_with(|| {
+                        pipeline.shadows.for_view(
+                            &device,
+                            &cache,
+                            view_entity,
+                            data,
+                            -view_from_world.row(2),
+                            &cascade_views,
+                            &sun_lights,
+                        )
+                    });
+                    let direction = lighting.direction_to_light.normalize_or_zero();
+                    if let Some((_, binding)) = view_shadows.iter()
+                        .filter(|(sun, _)| sun.dot(direction) > 0.999)
+                        .max_by(|(a, _), (b, _)| a.dot(direction).total_cmp(&b.dot(direction)))
+                    {
+                        shadows = binding;
+                        shadowed = true;
+                        uniform.world_from_local = cloud.world_from_local.to_cols_array_2d();
+                    }
+                }
             }
             if let Some(fog) = fog {
                 let mut eye_relative = cloud.world_from_local;
@@ -704,14 +801,21 @@ fn queue_clouds(
             }
             let key = (view.retained_view_entity, entity);
             let segments = gpu.select_segments(clip_from_local, size.y as f32, bounds, &mut uniform);
-            let new_draw = || make_draw(&device, &bind_group_layout, source, gpu.centers.len(), *main_entity, cloud.cutout);
+            let new_draw = || {
+                make_draw(&device, &bind_group_layout, source, gpu, *main_entity, cloud.cutout, shadows)
+            };
             let draw = draws.0.entry(key).or_insert_with(new_draw);
-            if draw.source.id() != source.id() || draw.order.is_none() != cloud.cutout {
+            if draw.source.id() != source.id()
+                || draw.order.is_none() != cloud.cutout
+                || draw.occlusion != gpu.occlusion.as_ref().map(Buffer::id)
+            {
                 if draw.cutout_pipeline.is_some() && let Some(phase) = cutout_phase.as_deref_mut() {
                     phase.remove(draw.main_entity);
                 }
                 *draw = new_draw();
             }
+            draw.shadows = shadows.clone();
+            draw.shadowed = shadowed;
             if let Some(order_buffer) = &draw.order {
                 let direction = (view_from_world * cloud.world_from_local)
                     .row(2)
@@ -743,11 +847,21 @@ fn queue_clouds(
             draw.segments = segments;
             queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&uniform));
             draw.idle_frames = 0;
-            let pipeline_id = *pipeline_ids[usize::from(cloud.cutout)].get_or_insert_with(|| {
+            let baked_occlusion = gpu.occlusion.is_some() && cloud.lighting.is_some();
+            let variant = usize::from(cloud.cutout)
+                + 2 * usize::from(shadowed)
+                + 4 * usize::from(baked_occlusion);
+            let pipeline_id = *pipeline_ids[variant].get_or_insert_with(|| {
                 pipelines.specialize(
                     &cache,
                     &pipeline,
-                    PipelineKey { target: view.target_format, samples: msaa.samples(), cutout: cloud.cutout },
+                    PipelineKey {
+                        target: view.target_format,
+                        samples: msaa.samples(),
+                        cutout: cloud.cutout,
+                        shadowed,
+                        baked_occlusion,
+                    },
                 )
             });
             if let Some(phase) = cutout_phase.as_deref_mut().filter(|_| cloud.cutout) {
@@ -783,7 +897,7 @@ fn queue_clouds(
                 draw_function,
                 batch_range: 0..1,
                 extra_index: PhaseItemExtraIndex::None,
-                indexed: false,
+                indexed: shadowed,
             });
         }
     }
@@ -804,10 +918,12 @@ fn make_draw(
     device: &RenderDevice,
     layout: &BindGroupLayout,
     source: &Buffer,
-    count: usize,
+    cloud: &GpuCloud,
     main_entity: MainEntity,
     cutout: bool,
+    shadows: &BindGroup,
 ) -> CloudDraw {
+    let count = cloud.centers.len();
     let make_buffer = |label, size: usize, usage| {
         device.create_buffer(&BufferDescriptor {
             label: Some(label),
@@ -833,15 +949,19 @@ fn make_draw(
             uniform.as_entire_binding(),
             source.as_entire_binding(),
             order.as_ref().unwrap_or(source).as_entire_binding(),
+            cloud.occlusion.as_ref().unwrap_or(source).as_entire_binding(),
         )),
     );
     CloudDraw {
         main_entity,
         cutout_pipeline: None,
         source: source.clone(),
+        occlusion: cloud.occlusion.as_ref().map(Buffer::id),
         uniform,
         order,
         bindings,
+        shadows: shadows.clone(),
+        shadowed: false,
         direction: Vec3::NAN,
         revision: 0,
         segments: 0..count as u32,
@@ -852,7 +972,7 @@ fn make_draw(
 struct DrawCloud;
 
 impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
-    type Param = SRes<ViewDraws>;
+    type Param = (SRes<ViewDraws>, SRes<SplatPipeline>);
     type ViewQuery = Read<ExtractedView>;
     type ItemQuery = ();
 
@@ -860,7 +980,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
         item: &P,
         view: &'w ExtractedView,
         _: Option<()>,
-        draws: SystemParamItem<'w, '_, Self::Param>,
+        (draws, pipeline): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         let key = (view.retained_view_entity, item.entity());
@@ -868,12 +988,18 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
             return RenderCommandResult::Skip;
         };
         pass.set_bind_group(0, &draw.bindings, &[]);
+        pass.set_bind_group(1, &draw.shadows, &[]);
         let instances = if draw.order.is_some() {
             0..draw.segments.len() as u32
         } else {
             draw.segments.clone()
         };
-        pass.draw(0..4, instances);
+        if draw.shadowed {
+            pass.set_index_buffer(pipeline.into_inner().shadow_quad.slice(..), IndexFormat::Uint16);
+            pass.draw_indexed(0..6, 0, instances);
+        } else {
+            pass.draw(0..4, instances);
+        }
         RenderCommandResult::Success
     }
 }

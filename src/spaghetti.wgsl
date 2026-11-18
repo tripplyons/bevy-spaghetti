@@ -42,13 +42,62 @@ struct View {
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(1) var<storage, read> splats: array<Splat>;
 @group(0) @binding(2) var<storage, read> order: array<u32>;
+@group(0) @binding(3) var<storage, read> occlusion: array<u32>;
+
+override SHADOW_QUAD: bool = false;
+override BAKED_OCCLUSION: bool = false;
+
+struct SunShadows {
+    matrices: array<mat4x4<f32>, 4>,
+    far_bounds: vec4<f32>,
+    normal_bias: vec4<f32>,
+    view_depth: vec4<f32>,
+    depth_bias: vec4<f32>,
+    layers: vec4<u32>,
+}
+
+@group(1) @binding(0) var<uniform> sun_shadow: SunShadows;
+@group(1) @binding(1) var sun_depth: texture_depth_2d_array;
+@group(1) @binding(2) var sun_compare: sampler_comparison;
+
+fn scene_shadow(midpoint: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let world = view.world_from_local * vec4(midpoint, 1.0);
+    let depth = dot(sun_shadow.view_depth, world);
+    let beyond = select(vec4<u32>(0u), vec4<u32>(1u), vec4(depth) >= sun_shadow.far_bounds);
+    let cascade = beyond.x + beyond.y + beyond.z + beyond.w;
+    if cascade >= sun_shadow.layers.y {
+        return 1.0;
+    }
+    let offset = normal * sun_shadow.normal_bias[cascade] + sun_shadow.depth_bias.xyz;
+    // Directional cascades use an orthographic transform and reverse Z.
+    let ndc = (sun_shadow.matrices[cascade] * vec4(world.xyz + offset, 1.0)).xyz;
+    if any(abs(ndc.xy) >= vec2(1.0)) || ndc.z < 0.0 || ndc.z > 1.0 {
+        return 1.0;
+    }
+    let uv = ndc.xy * vec2(0.5, -0.5) + 0.5;
+    return textureSampleCompareLevel(sun_depth, sun_compare, uv, sun_shadow.layers.x + cascade, ndc.z);
+}
+
+fn segment_light(index: u32, midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var light = vec2(1.0);
+    if BAKED_OCCLUSION {
+        light = unpack2x16unorm(occlusion[index]);
+    }
+    let facing = dot(normal, view.direction_to_light.xyz);
+    // Thin foliage passes part of the light through from its back face.
+    let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
+    if SHADOW_QUAD && incident > 0.0 {
+        light.y *= scene_shadow(midpoint, select(-normal, normal, facing >= 0.0));
+    }
+    return light.x * view.ambient.rgb + (incident * light.y) * view.directional.rgb;
+}
 
 struct Raster {
     @builtin(position) position: vec4<f32>,
     @location(0) offset: vec2<f32>,
     @location(1) @interpolate(flat) segment: vec2<f32>,
     @location(2) @interpolate(flat) depth: vec2<f32>,
-    @location(3) @interpolate(flat) color_mass: vec4<f32>,
+    @location(3) @interpolate(flat, first) color_mass: vec4<f32>,
     @location(4) @interpolate(flat) coverage: f32,
     @location(5) @interpolate(flat) detail: vec2<f32>,
 }
@@ -297,23 +346,23 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     out.offset = vec2(v.x / sigma_x, (v.y - shear * v.x) / sigma_y_given_x);
     out.segment = vec2(segment.x / sigma_x, (segment.y - shear * segment.x) / sigma_y_given_x);
     out.depth = vec2(a_ndc.z, b_ndc.z);
-    let area_scale = length(cross(j0, j1));
-    let peak = (splat.start_mass.w * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
-    var color = splat.color.rgb;
-    if view.direction_to_light.w > 0.0 {
-        let normal = view.normal_from_local * rotate(q, vec3(0.0, 0.0, 1.0));
-        let unit = normal * inverseSqrt(max(1e-10, dot(normal, normal)));
-        let facing = dot(unit, view.direction_to_light.xyz);
-        // Thin foliage passes part of the light through from its back face.
-        let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
-        color *= view.ambient.rgb + incident * view.directional.rgb;
+    out.color_mass = vec4(0.0);
+    if !SHADOW_QUAD || vertex_index == 1u {
+        let area_scale = length(cross(j0, j1));
+        let peak = (splat.start_mass.w * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
+        var color = splat.color.rgb;
+        if view.direction_to_light.w > 0.0 {
+            let normal = view.normal_from_local * rotate(q, vec3(0.0, 0.0, 1.0));
+            let unit = normal * inverseSqrt(max(1e-10, dot(normal, normal)));
+            color *= segment_light(index, (local_start + local_end) * 0.5, unit);
+        }
+        if view.fog.mode != 0u {
+            let local_midpoint = mix(local_start, local_end, (span.x + span.y) * 0.5);
+            color = apply_distance_fog(color, local_midpoint);
+        }
+        // The fragment stage premultiplies the fogged color by optical alpha.
+        out.color_mass = vec4(color, peak * near_fade(midpoint.w));
     }
-    if view.fog.mode != 0u {
-        let local_midpoint = mix(local_start, local_end, (span.x + span.y) * 0.5);
-        color = apply_distance_fog(color, local_midpoint);
-    }
-    // The fragment stage premultiplies the fogged color by optical alpha.
-    out.color_mass = vec4(color, peak * near_fade(midpoint.w));
     out.coverage = view.motion.z;
     out.position = vec4((a_px + v) / half_viewport, 0.5, 1.0);
     return out;
@@ -376,7 +425,7 @@ struct CutoutRaster {
     @builtin(position) position: vec4<f32>,
     @location(0) coordinate: vec2<f32>,
     @location(1) @interpolate(flat) shape: vec4<f32>,
-    @location(2) @interpolate(flat) color: vec3<f32>,
+    @location(2) @interpolate(flat, first) color: vec3<f32>,
     @location(3) @interpolate(flat) profile: vec4<f32>,
     @location(4) @interpolate(flat) detail: vec2<f32>,
 }
@@ -463,18 +512,19 @@ fn cutout_vertex(
     );
     out.profile = vec4(profile, mix(splat.end.w, splat.sigma.w, span.x), mix(splat.end.w, splat.sigma.w, span.y));
 
-    var color = splat.color.rgb;
-    if view.direction_to_light.w > 0.0 {
-        let normal = rotate(q, vec3(0.0, 0.0, 1.0));
-        let unit = normalize(view.normal_from_local * normal);
-        let facing = dot(unit, view.direction_to_light.xyz);
-        let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
-        color *= view.ambient.rgb + incident * view.directional.rgb;
+    out.color = vec3(0.0);
+    if !SHADOW_QUAD || vertex_index == 1u {
+        var color = splat.color.rgb;
+        if view.direction_to_light.w > 0.0 {
+            let normal = rotate(q, vec3(0.0, 0.0, 1.0));
+            let unit = normalize(view.normal_from_local * normal);
+            color *= segment_light(instance, (local_a + local_b) * 0.5, unit);
+        }
+        if view.fog.mode != 0u {
+            color = apply_distance_fog(color, (local_a + local_b) * 0.5);
+        }
+        out.color = color;
     }
-    if view.fog.mode != 0u {
-        color = apply_distance_fog(color, (local_a + local_b) * 0.5);
-    }
-    out.color = color;
     return out;
 }
 
