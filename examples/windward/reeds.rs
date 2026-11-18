@@ -5,7 +5,7 @@ use bevy_spaghetti::{GaussianSegment, Spaghetti3d, SpaghettiAsset};
 
 use crate::{
     detail::{CameraView, ScreenDetail},
-    landscape::{LAKE, LAKE_RADII, WATER_LEVEL, ground, hash01, noise, trail_x},
+    landscape::{LAKE, LAKE_RADII, WATER_LEVEL, ground, hash01, noise, shore_distance, trail_x},
     player::{Hiker, HikerCamera},
 };
 
@@ -121,7 +121,14 @@ pub fn spawn_reeds(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiAs
             let (sin, cos) = turn.sin_cos();
             let reeds = 0.072 * (turn * 5.0 + 0.6).sin() + 0.041 * (turn * 9.0).sin();
             let radius = 0.98 + 0.34 * hash01(id + 1).powi(2) + reeds;
-            let at = LAKE + Vec2::new(cos, sin) * LAKE_RADII * radius;
+            // Walk along the ray until the noisy shoreline reaches this
+            // distance, so reeds follow its coves and points.
+            let toward = Vec2::new(cos, sin) * LAKE_RADII;
+            let mut along = radius;
+            for _ in 0..5 {
+                along += radius - shore_distance(LAKE + toward * along);
+            }
+            let at = LAKE + toward * along.max(0.3);
             (at, radius < 1.113 && noise(at * 0.29) > 0.28)
         } else {
             let z = -52.0 + 71.0 * hash01(id);
