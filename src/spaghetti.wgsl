@@ -50,6 +50,15 @@ struct Raster {
     @location(4) @interpolate(flat) coverage: f32,
 }
 
+// Opacity factor for segments close to the camera; viewport.zw hold the fade
+// start and end view depths, and equal values turn it off.
+fn near_fade(depth: f32) -> f32 {
+    if view.viewport.w <= view.viewport.z {
+        return 1.0;
+    }
+    return smoothstep(view.viewport.z, view.viewport.w, depth);
+}
+
 fn rotate(q: vec4<f32>, p: vec3<f32>) -> vec3<f32> {
     let t = 2.0 * cross(q.xyz, p);
     return p + q.w * t + cross(q.xyz, t);
@@ -262,7 +271,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
         color = apply_distance_fog(color, local_midpoint);
     }
     // The fragment stage premultiplies the fogged color by optical alpha.
-    out.color_mass = vec4(color, peak);
+    out.color_mass = vec4(color, peak * near_fade(midpoint.w));
     out.coverage = view.motion.z;
     out.position = vec4((a_px + v) / half_viewport, 0.5, 1.0);
     return out;
@@ -391,9 +400,15 @@ fn cutout_vertex(
         1.0,
     );
     out.coordinate = vec2(select(0.0, length_px, tip) + along, edge);
+    // Close segments dissolve through the same dither as the LOD fades.
+    let coverage = view.motion.z * near_fade(midpoint.w);
+    if coverage <= 0.0 {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
     out.shape = vec4(
         length_px, cap, cross_sigma * radius,
-        select(view.motion.z, -view.motion.z, view.motion.w > 0.0),
+        select(coverage, -coverage, view.motion.w > 0.0),
     );
     out.profile = vec4(profile, mix(splat.end.w, splat.sigma.w, span.x), mix(splat.end.w, splat.sigma.w, span.y));
 

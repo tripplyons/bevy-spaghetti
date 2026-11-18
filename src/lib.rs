@@ -12,6 +12,6 @@ pub use asset::{AssetError, GaussianSegment, SpaghettiAsset};
 mod render;
 #[cfg(feature = "render")]
 pub use render::{
-    Spaghetti3d, SpaghettiCutout, SpaghettiLighting, SpaghettiPlugin, SpaghettiTransmission,
+    Spaghetti3d, SpaghettiCutout, SpaghettiLighting, SpaghettiNearFade, SpaghettiPlugin, SpaghettiTransmission,
     SpaghettiWind,
 };

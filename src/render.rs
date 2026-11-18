@@ -69,6 +69,17 @@ pub struct SpaghettiLighting {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct SpaghettiTransmission(pub f32);
 
+/// Fades segments out as they come close to the camera.
+///
+/// Segments whose view depth is below `start` metres are hidden, and segments
+/// beyond `end` draw at full opacity. Use it on foliage that can pass between a
+/// follow camera and its subject, where close splats spread into soft blurs.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SpaghettiNearFade {
+    pub start: f32,
+    pub end: f32,
+}
+
 /// Draws dense surface splats as depth-writing Gaussian cutouts.
 ///
 /// Cutouts use a projected cross section and an optical-depth threshold. They
@@ -154,6 +165,7 @@ pub struct ExtractedCloud {
     cutout: bool,
     wind: Option<SpaghettiWind>,
     range: Option<VisibilityRange>,
+    near_fade: Option<SpaghettiNearFade>,
 }
 
 impl SyncComponent<RenderApp> for Spaghetti3d {
@@ -172,12 +184,13 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
         Has<SpaghettiCutout>,
         Option<&'static SpaghettiWind>,
         Option<&'static VisibilityRange>,
+        Option<&'static SpaghettiNearFade>,
     );
     type QueryFilter = ();
     type Out = ExtractedCloud;
 
     fn extract_component(
-        (cloud, transform, visibility, layers, disable_culling, lighting, transmission, cutout, wind, range):
+        (cloud, transform, visibility, layers, disable_culling, lighting, transmission, cutout, wind, range, near_fade):
             QueryItem<'_, '_, Self::QueryData>,
     ) -> Option<Self::Out> {
         visibility.get().then(|| ExtractedCloud {
@@ -190,6 +203,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             cutout,
             wind: wind.copied(),
             range: range.cloned(),
+            near_fade: near_fade.copied(),
         })
     }
 }
@@ -601,6 +615,10 @@ fn queue_clouds(
                 motion: [0.0, 0.0, coverage, reverse_dither],
                 ..DrawUniform::zeroed()
             };
+            if let Some(fade) = cloud.near_fade.filter(|fade| fade.end > fade.start) {
+                uniform.viewport[2] = fade.start;
+                uniform.viewport[3] = fade.end;
+            }
             if let (Some(wind), Some(inverse)) = (cloud.wind, inverse_basis) {
                 uniform.world_from_local = cloud.world_from_local.to_cols_array_2d();
                 uniform.local_from_world = [inverse.x_axis, inverse.y_axis, inverse.z_axis]
