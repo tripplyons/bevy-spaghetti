@@ -127,11 +127,36 @@ pub fn trail_x(z: f32) -> f32 {
     2.7 * (0.073 * z + 0.04).sin() + 1.05 * (0.22 * z + 0.5).sin() - 1.4
 }
 
+/// Noisy distance from the lake center, normalized by `LAKE_RADII`. The
+/// terrain basin, tree spacing, and props all read the shoreline from it.
 pub fn shore_distance(at: Vec2) -> f32 {
     let offset = (at - LAKE) / LAKE_RADII;
+    let radius = offset.length();
     let banks = 0.29 * (noise(at * 0.108 + Vec2::new(6.2, -1.3)) - 0.5);
     let coves = 0.115 * (noise(at * 0.25) - 0.5);
-    offset.length() + banks + coves
+    radius + banks + coves + shoreline_lobes(at, offset, radius)
+}
+
+/// Low-frequency angular lobes and warped bays that turn the basin into
+/// points and coves. The phases keep the fixed stones in `ROCKS` on dry land.
+fn shoreline_lobes(at: Vec2, offset: Vec2, radius: f32) -> f32 {
+    let warp = Vec2::new(
+        noise(at * 0.09 + Vec2::new(3.1, 8.7)),
+        noise(at * 0.09 + Vec2::new(-4.4, 1.9)),
+    ) - 0.5;
+    let angle = offset.y.atan2(offset.x);
+    let lobes = 0.13 * (3.0 * angle + 3.3 + 2.0 * warp.x).sin()
+        + 0.075 * (5.0 * angle + 0.4 + 2.5 * warp.y).sin()
+        + 0.035 * (9.0 * angle + 2.3 + 3.0 * warp.x).sin();
+    let bays = 0.30 * (noise(at * 0.16 + Vec2::new(11.0, -7.0) + 4.0 * warp) - 0.5);
+    // Fade out toward the center, where the angle is undefined.
+    let shift = (lobes + bays) * smoothstep(0.35, 0.8, radius);
+    // Water may only recede near the trail, so the path stays dry.
+    if shift < 0.0 {
+        shift * smoothstep(2.4, 5.5, (at.x - trail_x(at.y)).abs())
+    } else {
+        shift
+    }
 }
 
 pub fn ground(at: Vec2) -> f32 {
@@ -216,7 +241,7 @@ pub fn spawn_landscape(
             color: SUN_COLOR,
             illuminance: SUN_LUX,
             shadow_maps_enabled: true,
-            shadow_normal_bias: 0.32,
+            shadow_normal_bias: 0.70,
             ..default()
         },
         Transform::IDENTITY.looking_to(-SUN, Vec3::Y),

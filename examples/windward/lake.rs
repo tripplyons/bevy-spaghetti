@@ -10,14 +10,21 @@ use bevy::{
     shader::ShaderRef,
 };
 
+use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset};
+
 use crate::{
-    landscape::{LAKE, SUN, SUN_COLOR, SUN_LUX, WATER_LEVEL, ground, load_tile},
+    landscape::{
+        LAKE, SUN, SUN_COLOR, SUN_LUX, WATER_LEVEL, ground, load_tile, shore_distance,
+    },
+    meadow::Meadow,
     player::HikerCamera,
+    reeds::ReedPatch,
 };
 
 pub const LAKE_SURFACE_LAYER: usize = 2;
 pub const REFLECTED_LAYER: usize = 3;
-const REFLECTION_SIZE: UVec2 = UVec2::new(512, 320);
+/// Half the 1280 x 800 main view in each axis.
+const REFLECTION_SIZE: UVec2 = UVec2::new(640, 400);
 const REFLECTION_PERIOD: f32 = 1.0 / 36.0;
 const PLANE_SIZE: Vec2 = Vec2::new(28.0, 42.0);
 
@@ -50,6 +57,10 @@ pub struct LakeSurface {
     #[texture(105)]
     #[sampler(106)]
     sediment: Handle<Image>,
+    /// The bank albedo, so the shallowest water can match the soil around it.
+    #[texture(107)]
+    #[sampler(108)]
+    bank: Handle<Image>,
 }
 
 impl MaterialExtension for LakeSurface {
@@ -133,6 +144,7 @@ pub fn spawn_lake(
             reflection,
             lakebed_depth: images.add(depth_texture()),
             sediment: load_tile(&server, "windward/trail-color.dds", true),
+            bank: load_tile(&server, "windward/ground-color.dds", true),
         },
     });
     commands.spawn((
@@ -146,15 +158,18 @@ pub fn spawn_lake(
     commands.insert_resource(Lake(water));
 }
 
+/// Water depth in meters, negative under the bank. The signed values keep
+/// the interpolated zero crossing on the real waterline, so the shore fade
+/// is smooth at any texel size.
 fn depth_texture() -> Image {
-    const SIZE: UVec2 = UVec2::new(160, 240);
-    let mut depths = Vec::with_capacity((SIZE.x * SIZE.y) as usize);
+    const SIZE: UVec2 = UVec2::new(224, 336);
+    let mut depths = Vec::with_capacity((SIZE.x * SIZE.y * 2) as usize);
     for row in 0..SIZE.y {
         for column in 0..SIZE.x {
             let uv = (Vec2::new(column as f32, row as f32) + 0.5) / SIZE.as_vec2();
             let at = LAKE + (uv - 0.5) * PLANE_SIZE;
-            let depth = (WATER_LEVEL - ground(at)).clamp(0.0, 2.0);
-            depths.push((depth * 127.5).round() as u8);
+            let depth = (WATER_LEVEL - ground(at)).clamp(-0.5, 2.5);
+            depths.extend(f16_bits(depth).to_le_bytes());
         }
     }
     let mut image = Image::new(
@@ -165,14 +180,71 @@ fn depth_texture() -> Image {
         },
         TextureDimension::D2,
         depths,
-        TextureFormat::R8Unorm,
+        TextureFormat::R16Float,
         RenderAssetUsages::default(),
     );
     image.sampler = ImageSampler::linear();
     image
 }
 
+/// Converts a value in the normal half-float range, flushing tiny values to zero.
+fn f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    if exponent <= 0 {
+        return sign;
+    }
+    let mantissa = bits & 0x7f_ffff;
+    // Round to nearest; a carry correctly bumps the exponent.
+    let rounded = ((exponent as u32) << 10 | mantissa >> 13) + ((mantissa >> 12) & 1);
+    sign | rounded.min(0x7bff) as u16
+}
+
+type ShorePlants<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static Spaghetti3d, &'static Transform, Has<Meadow>),
+    (
+        Or<(With<ReedPatch>, With<Meadow>)>,
+        Without<RenderLayers>,
+        Without<ReflectedView>,
+    ),
+>;
+
+/// Puts reed beds and meadow chunks along the shore into the reflected view.
+/// Others get the default layer so each entity is checked only once.
+fn add_shore_plants_to_reflection(
+    commands: &mut Commands,
+    plants: &ShorePlants<'_, '_>,
+    clouds: &Assets<SpaghettiAsset>,
+) {
+    for (entity, cloud, transform, meadow) in plants {
+        let Some(asset) = clouds.get(&cloud.0) else {
+            continue;
+        };
+        let (low, high) = asset.bounds();
+        let center = transform.transform_point(0.5 * (low + high)).xz();
+        let shore = shore_distance(center);
+        // Grass chunks are large, so test a wider band around the waterline.
+        let near = if meadow {
+            (0.7..1.75).contains(&shore)
+        } else {
+            shore < 1.5
+        };
+        let layers = if near {
+            RenderLayers::default().with(REFLECTED_LAYER)
+        } else {
+            RenderLayers::default()
+        };
+        commands.entity(entity).insert(layers);
+    }
+}
+
 pub fn reflect_lake(
+    mut commands: Commands,
+    plants: ShorePlants,
+    clouds: Res<Assets<SpaghettiAsset>>,
     time: Res<Time>,
     lake: Res<Lake>,
     main: Single<(&Transform, &Projection), (With<HikerCamera>, Without<ReflectedView>)>,
@@ -184,6 +256,7 @@ pub fn reflect_lake(
     )>,
     mut materials: ResMut<Assets<LakeMaterial>>,
 ) {
+    add_shore_plants_to_reflection(&mut commands, &plants, &clouds);
     let (transform, projection) = *main;
     let (mirror, mirror_projection, camera, state) = &mut *reflected;
     let elapsed = time.elapsed_secs();
