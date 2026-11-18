@@ -152,34 +152,10 @@ fn full_scene_renders_in_background() {
         save_review_frame(app.world(), "meadow-low.png");
         pose_review_camera(&mut app, Vec2::new(3.2, 1.5), -0.2, -0.38);
         save_review_frame(app.world(), "grass-low.png");
-        // TEMP backdrop horizon poses (revert).
-        app.add_systems(PostUpdate, temp_horizon_camera.before(bevy::transform::TransformSystems::Propagate));
-        for (name, eye, look) in [
-            ("horizon-south.png", Vec3::new(28.0, 15.0, -38.0), Vec3::new(10.0, 12.0, -400.0)),
-            ("horizon-west.png", Vec3::new(28.0, 15.0, -38.0), Vec3::new(-400.0, 10.0, -60.0)),
-            ("horizon-east.png", Vec3::new(28.0, 15.0, -38.0), Vec3::new(400.0, 10.0, -20.0)),
-            ("horizon-north.png", Vec3::new(0.0, 6.0, 24.0), Vec3::new(-20.0, 6.0, 400.0)),
-            ("horizon-northeast.png", Vec3::new(39.0, 6.0, 24.0), Vec3::new(400.0, 6.0, 300.0)),
-        ] {
-            app.insert_resource(TempHorizonCamera(eye, look));
-            pose_review_camera(&mut app, Vec2::new(-0.6, -7.0), -0.78, 0.10);
-            save_review_frame(app.world(), name);
-        }
-        app.world_mut().remove_resource::<TempHorizonCamera>();
-        // END TEMP backdrop
-        // TEMP hiker close-ups (revert).
-        app.add_systems(PostUpdate, temp_close_camera.before(bevy::transform::TransformSystems::Propagate));
-        for (name, eye, look) in [
-            ("hiker-front.png", Vec3::new(0.35, 1.05, 1.45), Vec3::new(0.0, 0.95, 0.0)),
-            ("hiker-hands.png", Vec3::new(0.9, 1.15, 0.55), Vec3::new(0.45, 1.0, 0.0)),
-            ("hiker-legs-low.png", Vec3::new(-0.7, 0.35, 1.3), Vec3::new(0.0, 0.7, 0.0)),
-            ("hiker-back.png", Vec3::new(-0.6, 1.3, -1.6), Vec3::new(0.0, 1.0, 0.0)),
-        ] {
-            app.insert_resource(TempCloseCamera(eye, look));
-            pose_review_camera(&mut app, Vec2::new(-0.6, -7.0), -0.78, 0.10);
-            save_review_frame(app.world(), name);
-        }
-        // END TEMP
+        // Turn the hiker toward the camera to check the front in shade.
+        pose_review_camera(&mut app, Vec2::new(3.2, 1.5), 2.6, -0.12);
+        turn_hiker_to_camera(&mut app);
+        save_review_frame(app.world(), "hiker-front.png");
     }
     assert_shaders_loaded(&app);
 }
@@ -196,6 +172,16 @@ fn pose_review_camera(app: &mut App, at: Vec2, yaw: f32, pitch: f32) {
     rig.yaw = yaw;
     rig.pitch = pitch;
     for _ in 0..48 {
+        app.update();
+    }
+}
+
+fn turn_hiker_to_camera(app: &mut App) {
+    let world = app.world_mut();
+    let mut hiker = world.query_filtered::<&mut Transform, With<Hiker>>();
+    let mut hiker = hiker.single_mut(world).unwrap();
+    hiker.rotate_y(std::f32::consts::PI);
+    for _ in 0..24 {
         app.update();
     }
 }
@@ -443,29 +429,3 @@ fn capture_offscreen(
     );
 }
 
-// TEMP (revert).
-#[derive(Resource)]
-struct TempCloseCamera(Vec3, Vec3);
-fn temp_close_camera(
-    close: Option<Res<TempCloseCamera>>,
-    hiker: Single<&Transform, (With<Hiker>, Without<HikerCamera>)>,
-    mut camera: Single<&mut Transform, (With<HikerCamera>, Without<Hiker>)>,
-) {
-    let Some(close) = close else { return };
-    let eye = hiker.transform_point(close.0);
-    let look = hiker.transform_point(close.1);
-    **camera = Transform::from_translation(eye).looking_at(look, Vec3::Y);
-}
-// END TEMP TAIL
-
-// TEMP backdrop (revert).
-#[derive(Resource)]
-struct TempHorizonCamera(Vec3, Vec3);
-fn temp_horizon_camera(
-    horizon: Option<Res<TempHorizonCamera>>,
-    mut camera: Single<&mut Transform, With<HikerCamera>>,
-) {
-    let Some(horizon) = horizon else { return };
-    **camera = Transform::from_translation(horizon.0).looking_at(horizon.1, Vec3::Y);
-}
-// END TEMP backdrop

@@ -10,6 +10,7 @@ use crate::{
     detail::{CameraView, ScreenDetail},
     lake::REFLECTED_LAYER,
     landscape::{SUN, WATER_LEVEL, ground, hash01, noise, trail_x},
+    props,
 };
 
 /// Poly Haven "Dead Tree Trunk" (CC0), kept as the shadow caster.
@@ -21,8 +22,16 @@ const TRUNK_CLOUDS: [&str; 3] = [
     "windward/deadfall-far.spag",
 ];
 
-/// The rock lighting is tuned for bright lichen albedo. Bark and gravel are
-/// darker, so these gains match the brightness of the PBR meshes they replace.
+/// The logs share the conifer gains, so the bark doesn't glow beside the
+/// trunks of the standing trees.
+const LOG_LIGHTING: SpaghettiLighting = SpaghettiLighting {
+    direction_to_light: SUN,
+    ambient: Vec3::new(0.24, 0.27, 0.29),
+    directional: Vec3::new(0.62, 0.52, 0.40),
+};
+
+/// Gravel is darker than the rocks' lichen albedo, so these gains match the
+/// brightness of the trail texture around it.
 const LIGHTING: SpaghettiLighting = SpaghettiLighting {
     direction_to_light: SUN,
     ambient: Vec3::new(0.33, 0.37, 0.42),
@@ -60,6 +69,12 @@ pub fn spawn_debris(
             at + Vec2::from_angle(angle) * length * 0.5,
         ];
         let lowest = ground(ends[0]).min(ground(ends[1])).min(ground(at));
+        // Keep the length so the core's sawn ends stay under the splats.
+        let core = props::spawn_core(
+            &mut commands,
+            shadow.clone(),
+            Vec3::new(0.985, props::CORE_SCALE, props::CORE_SCALE),
+        );
         commands
             .spawn((
                 Name::new("Weathered deadfall"),
@@ -68,7 +83,7 @@ pub fn spawn_debris(
                     clouds: clouds.clone(),
                     level: 1,
                 },
-                LIGHTING,
+                LOG_LIGHTING,
                 Transform::from_xyz(at.x, lowest + 0.02 * girth, at.y)
                     .with_rotation(
                         Quat::from_rotation_y(-angle) * Quat::from_rotation_x(roll * 0.15),
@@ -82,10 +97,11 @@ pub fn spawn_debris(
                 parent.spawn((
                     Name::new("Reflected deadfall"),
                     Spaghetti3d(clouds[2].clone()),
-                    LIGHTING,
+                    LOG_LIGHTING,
                     RenderLayers::layer(REFLECTED_LAYER),
                 ));
-            });
+            })
+            .add_child(core);
     }
 
     let mut patches: BTreeMap<(i32, i32), Vec<GaussianSegment>> = BTreeMap::new();

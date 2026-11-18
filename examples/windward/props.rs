@@ -3,7 +3,14 @@
 
 use std::f32::consts::TAU;
 
-use bevy::{camera::visibility::RenderLayers, prelude::*};
+use bevy::{
+    asset::RenderAssetUsages,
+    camera::visibility::{RenderLayers, VisibilityRange},
+    light::{NotShadowCaster, NotShadowReceiver},
+    mesh::{Indices, PrimitiveTopology},
+    prelude::*,
+    world_serialization::WorldInstanceReady,
+};
 use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting};
 
 use crate::{
@@ -12,8 +19,8 @@ use crate::{
     forest::ForestDetail,
     lake::REFLECTED_LAYER,
     landscape::{
-        LAKE, LAKE_RADII, Obstacles, ROCKS, SUN, WATER_LEVEL, ground, hash01, mark_rock_shadow,
-        noise, shore_distance, trail_x,
+        LAKE, LAKE_RADII, Obstacles, ROCKS, RockDetail, SUN, WATER_LEVEL, ground, hash01,
+        mark_rock_shadow, noise, shore_distance, trail_x,
     },
     player::HikerCamera,
 };
@@ -54,10 +61,27 @@ const STONES: [(&str, Vec3); 4] = [
     ("e", Vec3::new(0.111, 0.077, 0.112)),
 ];
 
+/// The conifer gains, so props sit in the same light as the stands.
 const LIGHTING: SpaghettiLighting = SpaghettiLighting {
     direction_to_light: SUN,
-    ambient: Vec3::new(0.20, 0.235, 0.27),
-    directional: Vec3::new(0.52, 0.44, 0.34),
+    ambient: Vec3::new(0.24, 0.27, 0.29),
+    directional: Vec3::new(0.62, 0.52, 0.40),
+};
+
+/// The opaque core is the scan mesh shrunk about its base, so splats overhang
+/// its silhouette by a few centimeters and add only the surface detail.
+pub const CORE_SCALE: f32 = 0.95;
+/// Beyond this range the splats are too small to show the ground through
+/// them, so the core fades out with a dither.
+const CORE_RANGE: VisibilityRange = VisibilityRange {
+    start_margin: 0.0..0.0,
+    end_margin: 24.0..30.0,
+    use_aabb: false,
+};
+const CONTACT_RANGE: VisibilityRange = VisibilityRange {
+    start_margin: 0.0..0.0,
+    end_margin: 34.0..42.0,
+    use_aabb: false,
 };
 
 /// Swaps a prop's splat cloud by its size on screen.
@@ -100,9 +124,13 @@ impl Clearance {
 pub fn spawn_props(
     mut commands: Commands,
     server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut obstacles: ResMut<Obstacles>,
     trees: Query<&Transform, With<ForestDetail>>,
     logs: Query<&Transform, With<LogDetail>>,
+    rocks: Query<(Entity, &Transform, &Children), With<RockDetail>>,
+    scans: Query<&WorldAssetRoot>,
 ) {
     let mut clearance = Clearance {
         trees: trees.iter().map(|t| t.translation.xz()).collect(),
@@ -116,8 +144,130 @@ pub fn spawn_props(
             .collect(),
         props: Vec::new(),
     };
-    spawn_stumps(&mut commands, &server, &mut obstacles, &mut clearance);
-    spawn_stones(&mut commands, &server, &mut obstacles, &mut clearance);
+    let stumps = spawn_stumps(&mut commands, &server, &mut obstacles, &mut clearance);
+    let stones = spawn_stones(&mut commands, &server, &mut obstacles, &mut clearance);
+
+    // The ledges come from the landscape with only a shadow caster, so give
+    // them the same opaque core as the props.
+    let mut contacts = Vec::new();
+    for (entity, transform, children) in &rocks {
+        let Some(scan) = children.iter().find_map(|child| scans.get(child).ok()) else {
+            continue;
+        };
+        let core = spawn_core(&mut commands, scan.0.clone(), Vec3::splat(CORE_SCALE));
+        commands.entity(entity).add_child(core);
+        // The ROCKS scale is the ledge's footprint radius over 0.89.
+        let at = transform.translation.xz();
+        let radius = ROCKS
+            .iter()
+            .map(|&(x, z, scale)| (Vec2::new(x, z).distance_squared(at), 0.89 * scale))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(1.0, |(_, radius)| radius);
+        if ground(at) > WATER_LEVEL + 0.02 {
+            contacts.push((at, 0.55 * radius, 1.3 * radius, 0.72));
+        }
+    }
+    contacts.extend(
+        stumps
+            .iter()
+            .map(|&(at, scale)| (at, 0.35 * scale, 1.0 * scale, 0.7)),
+    );
+    contacts.extend(
+        stones
+            .iter()
+            .map(|&(at, reach)| (at, 0.6 * reach, 1.5 * reach, 0.75)),
+    );
+
+    // A dark soil tone over the ground, strongest where the prop meets it.
+    let soil = materials.add(StandardMaterial {
+        base_color: Color::linear_rgb(0.016, 0.014, 0.010),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    for (index, (at, inner, outer, darkness)) in contacts.into_iter().enumerate() {
+        commands.spawn((
+            Name::new("Prop contact shadow"),
+            Mesh3d(meshes.add(contact_shadow(at, inner, outer, darkness, index as u32))),
+            MeshMaterial3d(soil.clone()),
+            Transform::from_xyz(at.x, ground(at), at.y),
+            NotShadowCaster,
+            NotShadowReceiver,
+            CONTACT_RANGE,
+        ));
+    }
+}
+
+/// Builds a disc that follows the terrain and darkens it toward the center.
+fn contact_shadow(at: Vec2, inner: f32, outer: f32, darkness: f32, seed: u32) -> Mesh {
+    const SIDES: usize = 28;
+    // Radii as fractions from inner to outer, and their opacity.
+    const RINGS: [(f32, f32); 4] = [(0.0, 1.0), (0.35, 0.72), (0.7, 0.28), (1.0, 0.0)];
+    let base = ground(at);
+    let phase = hash01(seed * 31 + 5) * 40.0;
+    let mut positions = vec![[0.0, 0.03, 0.0]];
+    let mut colors = vec![[1.0, 1.0, 1.0, darkness]];
+    for side in 0..SIDES {
+        let direction = Vec2::from_angle(side as f32 * TAU / SIDES as f32);
+        // Wobble the outline so the rings don't read as circles.
+        let wobble = 0.82 + 0.36 * noise(direction * 1.7 + Vec2::splat(phase));
+        for (fraction, opacity) in RINGS {
+            let radius = inner + (outer - inner) * fraction * wobble;
+            let offset = direction * radius;
+            let lift = 0.03 + 0.01 * fraction;
+            positions.push([offset.x, ground(at + offset) - base + lift, offset.y]);
+            colors.push([1.0, 1.0, 1.0, darkness * opacity]);
+        }
+    }
+    let ring = RINGS.len() as u32;
+    let mut indices = Vec::new();
+    for side in 0..SIDES as u32 {
+        let a = 1 + side * ring;
+        let b = 1 + (side + 1) % SIDES as u32 * ring;
+        indices.extend([0, b, a]);
+        for step in 0..ring - 1 {
+            indices.extend([a + step, b + step, a + step + 1]);
+            indices.extend([a + step + 1, b + step, b + step + 1]);
+        }
+    }
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Spawns a visible, shrunk copy of a scan under its splat cloud.
+pub fn spawn_core(commands: &mut Commands, scan: Handle<WorldAsset>, scale: Vec3) -> Entity {
+    commands
+        .spawn((
+            Name::new("Prop core"),
+            WorldAssetRoot(scan),
+            Transform::from_scale(scale),
+        ))
+        .observe(mark_prop_core)
+        .id()
+}
+
+/// The splats carry the lighting, and the separate scan casts the shadow, so
+/// the core neither casts nor receives shadows.
+pub fn mark_prop_core(
+    ready: On<WorldInstanceReady>,
+    children: Query<&Children>,
+    meshes: Query<(), With<Mesh3d>>,
+    mut commands: Commands,
+) {
+    for child in children.iter_descendants(ready.entity) {
+        if meshes.contains(child) {
+            commands
+                .entity(child)
+                .insert((NotShadowCaster, NotShadowReceiver, CORE_RANGE));
+        }
+    }
 }
 
 fn spawn_stumps(
@@ -125,7 +275,8 @@ fn spawn_stumps(
     server: &AssetServer,
     obstacles: &mut Obstacles,
     clearance: &mut Clearance,
-) {
+) -> Vec<(Vec2, f32)> {
+    let mut placed = Vec::new();
     let shadow = server.load(GltfAssetLabel::Scene(0).from_asset(STUMP));
     let clouds = STUMP_CLOUDS.map(|path| server.load::<SpaghettiAsset>(path));
     for (index, anchor) in STUMP_ANCHORS.into_iter().enumerate() {
@@ -133,16 +284,18 @@ fn spawn_stumps(
         let scale = 1.1 + 0.5 * hash01(seed);
         let reach = STUMP_REACH * scale;
         // Search outward from the anchor on a golden-angle spiral.
-        let Some(at) = (0..40).map(|step| {
-            let angle = step as f32 * 2.39996 + hash01(seed + 1) * TAU;
-            anchor + Vec2::from_angle(angle) * 0.45 * (step as f32).sqrt()
-        })
-        .find(|&at| {
-            (at.x - trail_x(at.y)).abs() >= 2.3 + reach
-                && shore_distance(at) >= 1.22
-                && ground(at) >= WATER_LEVEL + 0.25
-                && clearance.is_clear(at, reach, 1.0)
-        }) else {
+        let Some(at) = (0..40)
+            .map(|step| {
+                let angle = step as f32 * 2.39996 + hash01(seed + 1) * TAU;
+                anchor + Vec2::from_angle(angle) * 0.45 * (step as f32).sqrt()
+            })
+            .find(|&at| {
+                (at.x - trail_x(at.y)).abs() >= 2.3 + reach
+                    && shore_distance(at) >= 1.22
+                    && ground(at) >= WATER_LEVEL + 0.25
+                    && clearance.is_clear(at, reach, 1.0)
+            })
+        else {
             continue;
         };
         let floor = footprint_floor(at, reach);
@@ -158,9 +311,11 @@ fn spawn_stumps(
             (178.0, 54.0),
         );
         clearance.props.push((at, reach));
+        placed.push((at, scale));
         // The cut trunk is about 0.32 m in radius and 0.55 m tall.
         obstacles.add_boulder(at, 0.36 * scale, 0.55 * scale);
     }
+    placed
 }
 
 fn spawn_stones(
@@ -168,7 +323,8 @@ fn spawn_stones(
     server: &AssetServer,
     obstacles: &mut Obstacles,
     clearance: &mut Clearance,
-) {
+) -> Vec<(Vec2, f32)> {
+    let mut contacts = Vec::new();
     let kinds = STONES.map(|(name, size)| {
         let clouds = [
             format!("windward/stone-{name}.spag"),
@@ -181,9 +337,8 @@ fn spawn_stones(
         );
         (clouds, shadow, size)
     });
-    let mut placed = 0;
     for seed in 1..=900u32 {
-        if placed >= 34 {
+        if contacts.len() >= 34 {
             break;
         }
         let id = 7700 + seed * 211;
@@ -220,13 +375,21 @@ fn spawn_stones(
         let transform = Transform::from_xyz(at.x, floor - 0.25 * size.y * scale, at.y)
             .with_rotation(Quat::from_rotation_y(turn) * tilt)
             .with_scale(Vec3::splat(scale));
-        spawn_prop(commands, "Loose stone", transform, clouds, shadow, (80.0, 30.0));
+        spawn_prop(
+            commands,
+            "Loose stone",
+            transform,
+            clouds,
+            shadow,
+            (80.0, 30.0),
+        );
         clearance.props.push((at, reach));
         if length > 0.36 {
             obstacles.add_boulder(at, 0.4 * length, size.y * scale * 0.75);
         }
-        placed += 1;
+        contacts.push((at, reach));
     }
+    contacts
 }
 
 fn spawn_prop(
@@ -237,6 +400,7 @@ fn spawn_prop(
     shadow: &Handle<WorldAsset>,
     (near, middle): (f32, f32),
 ) {
+    let core = spawn_core(commands, shadow.clone(), Vec3::splat(CORE_SCALE));
     commands
         .spawn((
             Name::new(name),
@@ -251,7 +415,7 @@ fn spawn_prop(
             transform,
         ))
         .with_children(|parent| {
-            // The glTF only casts the shadow.
+            // This copy of the glTF only casts the shadow.
             parent
                 .spawn(WorldAssetRoot(shadow.clone()))
                 .observe(mark_rock_shadow);
@@ -261,7 +425,8 @@ fn spawn_prop(
                 LIGHTING,
                 RenderLayers::layer(REFLECTED_LAYER),
             ));
-        });
+        })
+        .add_child(core);
 }
 
 /// Returns the lowest ground under a round footprint, so no edge floats.
