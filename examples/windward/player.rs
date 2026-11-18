@@ -52,6 +52,8 @@ pub struct Hiker {
     pub velocity: Vec2,
     pub vertical_speed: f32,
     pub grounded: bool,
+    /// Walking backward, so the clips play in reverse.
+    pub backward: bool,
 }
 
 #[derive(Component)]
@@ -190,7 +192,9 @@ pub fn read_controls(
         && let Some(mut camera) = camera
     {
         camera.yaw = (camera.yaw - delta.delta.x * 0.0028).rem_euclid(std::f32::consts::TAU);
-        camera.pitch = (camera.pitch - delta.delta.y * 0.0028).clamp(-0.36, 0.77);
+        // Positive pitch raises the camera to look down, so moving the mouse
+        // up (negative delta) lowers it to look up.
+        camera.pitch = (camera.pitch + delta.delta.y * 0.0028).clamp(-0.36, 0.77);
         controls.turned = true;
     }
 }
@@ -281,10 +285,20 @@ pub fn move_hiker(
     }
 
     // The hiker faces where the camera looks while walking or turning the
-    // view, and strafes with A and D. Standing still keeps the last facing.
+    // view. Standing still keeps the last facing. As in Minecraft, the body
+    // turns part of the way toward a sideways step, and backing up walks
+    // backward while still facing ahead.
     let turned = std::mem::take(&mut controls.turned);
     if relative != Vec2::ZERO || turned {
-        let forward = (basis * Vec3::NEG_Z).xz();
+        body.backward = relative.y < 0.0;
+        let stride = if body.backward { -relative } else { relative };
+        let lean = if relative == Vec2::ZERO {
+            0.0
+        } else {
+            stride.x.atan2(stride.y).clamp(-1.05, 1.05)
+        };
+        // Yaw turns counterclockwise, so a step to the right turns clockwise.
+        let forward = (basis * Quat::from_rotation_y(-lean) * Vec3::NEG_Z).xz();
         let target = Quat::from_rotation_y(forward.x.atan2(forward.y));
         transform.rotation = transform.rotation.slerp(target, 1.0 - (-14.0 * dt).exp());
     }
@@ -316,11 +330,19 @@ pub fn animate_hiker(
                 .repeat();
         }
         if let Some(animation) = player.animation_mut(target) {
-            animation.set_speed(if hiker.grounded {
-                playback
+            let direction = if hiker.backward && target != clips.idle {
+                -1.0
             } else {
-                playback * 0.25
-            });
+                1.0
+            };
+            animation.set_speed(
+                direction
+                    * if hiker.grounded {
+                        playback
+                    } else {
+                        playback * 0.25
+                    },
+            );
         }
     }
 }
