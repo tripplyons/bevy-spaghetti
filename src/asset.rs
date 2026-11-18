@@ -4,11 +4,15 @@ use bevy_math::{Quat, Vec3};
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
-const MAGIC: &[u8; 8] = b"SPAG\x01\0\0\0";
+const MAGIC_V1: &[u8; 8] = b"SPAG\x01\0\0\0";
+const MAGIC_V2: &[u8; 8] = b"SPAG\x02\0\0\0";
 const HEADER_BYTES: usize = 12;
 const SEGMENT_BYTES: usize = size_of::<GaussianSegment>();
 /// Caps GPU storage at 80 MB per cloud.
 const MAX_SEGMENTS: usize = 1_000_000;
+// The renderer sends this small table in the draw uniform.
+pub(crate) const MAX_DETAIL_TRANSITIONS: usize = 3;
+const TRANSITION_BYTES: usize = 12;
 
 /// A finite segment convolved with a Gaussian of constant covariance.
 ///
@@ -115,7 +119,7 @@ impl GaussianSegment {
 
 #[derive(Debug, Error)]
 pub enum AssetError {
-    #[error("expected a version 1 SPAG file")]
+    #[error("expected a version 1 or 2 SPAG file")]
     Header,
     #[error("expected between 1 and {MAX_SEGMENTS} segments, found {0}")]
     Count(usize),
@@ -123,6 +127,10 @@ pub enum AssetError {
     Length,
     #[error("segment {0} has invalid endpoints, covariance, mass, or color")]
     InvalidSegment(usize),
+    #[error(
+        "invalid detail transitions: expected up to {MAX_DETAIL_TRANSITIONS} ordered transitions between nonempty levels"
+    )]
+    InvalidDetail,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -136,11 +144,52 @@ pub enum AssetError {
 pub struct SpaghettiAsset {
     segments: Arc<Vec<GaussianSegment>>,
     bounds: (Vec3, Vec3),
+    detail: Arc<[DetailTransition]>,
+}
+
+/// One transition in a cloud whose segments are grouped from finest to coarsest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetailTransition {
+    /// Exclusive end index of the finer level's segments in the merged cloud.
+    pub finer_end: u32,
+    /// Projected pixels per asset unit at which the cross-fade starts and ends.
+    /// Only the coarser level draws below the first value. Only the finer level
+    /// draws above the second value.
+    pub pixels_per_unit: [f32; 2],
 }
 
 impl SpaghettiAsset {
     pub fn new(segments: Vec<GaussianSegment>) -> Result<Self, AssetError> {
+        Self::with_detail(segments, &[])
+    }
+
+    /// Creates a cloud from up to four consecutive levels, finest first. Each
+    /// transition separates two adjacent levels. Pixel ranges must descend
+    /// without overlap.
+    pub fn with_detail(
+        segments: Vec<GaussianSegment>,
+        detail: &[DetailTransition],
+    ) -> Result<Self, AssetError> {
         check_count(segments.len())?;
+        if detail.len() > MAX_DETAIL_TRANSITIONS {
+            return Err(AssetError::InvalidDetail);
+        }
+        let mut previous_end = 0;
+        let mut previous_min = f32::INFINITY;
+        for &DetailTransition {
+            finer_end,
+            pixels_per_unit: [min, max],
+        } in detail
+        {
+            if finer_end <= previous_end
+                || finer_end as usize >= segments.len()
+                || !(0.0 < min && min < max && max <= previous_min && max.is_finite())
+            {
+                return Err(AssetError::InvalidDetail);
+            }
+            previous_end = finer_end;
+            previous_min = min;
+        }
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
         for (index, segment) in segments.iter().enumerate() {
@@ -158,11 +207,16 @@ impl SpaghettiAsset {
         Ok(Self {
             segments: Arc::new(segments),
             bounds: (min, max),
+            detail: Arc::from(detail),
         })
     }
 
     pub fn segments(&self) -> &[GaussianSegment] {
         &self.segments
+    }
+
+    pub fn detail_transitions(&self) -> &[DetailTransition] {
+        &self.detail
     }
 
     /// Local-space minimum and maximum, including four standard deviations
@@ -172,16 +226,36 @@ impl SpaghettiAsset {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AssetError> {
-        if !bytes.starts_with(MAGIC) || bytes.len() < HEADER_BYTES {
+        let has_detail = bytes.starts_with(MAGIC_V2);
+        if !(has_detail || bytes.starts_with(MAGIC_V1)) || bytes.len() < HEADER_BYTES {
             return Err(AssetError::Header);
         }
         let count = u32::from_le_bytes(bytes[8..HEADER_BYTES].try_into().unwrap()) as usize;
         check_count(count)?;
-        if bytes.len() != HEADER_BYTES + count * SEGMENT_BYTES {
+        let segment_end = HEADER_BYTES + count * SEGMENT_BYTES;
+        let Some(trailer) = bytes.get(segment_end..) else {
             return Err(AssetError::Length);
-        }
+        };
+        let records = if has_detail {
+            let Some((count, data)) = trailer.split_first_chunk::<4>() else {
+                return Err(AssetError::Length);
+            };
+            let count = u32::from_le_bytes(*count) as usize;
+            if !(1..=MAX_DETAIL_TRANSITIONS).contains(&count) {
+                return Err(AssetError::InvalidDetail);
+            }
+            if data.len() != count * TRANSITION_BYTES {
+                return Err(AssetError::Length);
+            }
+            data.as_chunks::<TRANSITION_BYTES>().0
+        } else {
+            if !trailer.is_empty() {
+                return Err(AssetError::Length);
+            }
+            &[]
+        };
 
-        let segments = bytes[HEADER_BYTES..]
+        let segments = bytes[HEADER_BYTES..segment_end]
             .as_chunks::<SEGMENT_BYTES>()
             .0
             .iter()
@@ -193,16 +267,39 @@ impl SpaghettiAsset {
                 bytemuck::cast(fields)
             })
             .collect();
-        Self::new(segments)
+        let detail: Vec<_> = records
+            .iter()
+            .map(|record| {
+                let [end, min, max] = bytemuck::cast::<_, [[u8; 4]; 3]>(*record);
+                DetailTransition {
+                    finer_end: u32::from_le_bytes(end),
+                    pixels_per_unit: [f32::from_le_bytes(min), f32::from_le_bytes(max)],
+                }
+            })
+            .collect();
+        Self::with_detail(segments, &detail)
     }
 
     pub fn write(&self, mut writer: impl Write) -> Result<(), AssetError> {
-        writer.write_all(MAGIC)?;
+        writer.write_all(if self.detail.is_empty() {
+            MAGIC_V1
+        } else {
+            MAGIC_V2
+        })?;
         writer.write_all(&(self.segments.len() as u32).to_le_bytes())?;
         for segment in self.segments.iter() {
             let fields: [f32; SEGMENT_BYTES / 4] = bytemuck::cast(*segment);
             let bytes: [[u8; 4]; SEGMENT_BYTES / 4] = fields.map(f32::to_le_bytes);
             writer.write_all(bytemuck::cast_slice(&bytes))?;
+        }
+        if !self.detail.is_empty() {
+            writer.write_all(&(self.detail.len() as u32).to_le_bytes())?;
+            for transition in &*self.detail {
+                writer.write_all(&transition.finer_end.to_le_bytes())?;
+                for edge in transition.pixels_per_unit {
+                    writer.write_all(&edge.to_le_bytes())?;
+                }
+            }
         }
         Ok(())
     }
@@ -233,6 +330,7 @@ mod tests {
         let asset = SpaghettiAsset::new(vec![segment]).unwrap();
         let mut bytes = Vec::new();
         asset.write(&mut bytes).unwrap();
+        assert!(bytes.starts_with(MAGIC_V1));
         assert_eq!(
             SpaghettiAsset::from_bytes(&bytes).unwrap().segments(),
             &[segment]
@@ -240,6 +338,43 @@ mod tests {
         assert!(matches!(
             SpaghettiAsset::from_bytes(&bytes[..bytes.len() - 1]),
             Err(AssetError::Length)
+        ));
+    }
+
+    #[test]
+    fn detail_round_trip_and_validation() {
+        let segment = GaussianSegment::new(
+            Vec3::ZERO,
+            Vec3::Y,
+            Vec3::splat(0.1),
+            Quat::IDENTITY,
+            1.0,
+            Vec3::ONE,
+        );
+        let transitions = [
+            DetailTransition {
+                finer_end: 1,
+                pixels_per_unit: [40.0, 60.0],
+            },
+            DetailTransition {
+                finer_end: 2,
+                pixels_per_unit: [10.0, 20.0],
+            },
+        ];
+        let asset = SpaghettiAsset::with_detail(vec![segment; 3], &transitions).unwrap();
+        let mut bytes = Vec::new();
+        asset.write(&mut bytes).unwrap();
+        assert!(bytes.starts_with(MAGIC_V2));
+        let round_trip = SpaghettiAsset::from_bytes(&bytes).unwrap();
+        assert_eq!(round_trip.segments(), asset.segments());
+        assert_eq!(round_trip.detail_transitions(), &transitions);
+        assert!(matches!(
+            SpaghettiAsset::from_bytes(&bytes[..bytes.len() - TRANSITION_BYTES]),
+            Err(AssetError::Length)
+        ));
+        assert!(matches!(
+            SpaghettiAsset::with_detail(vec![segment; 2], &transitions),
+            Err(AssetError::InvalidDetail)
         ));
     }
 }

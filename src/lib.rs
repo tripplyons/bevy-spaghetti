@@ -6,7 +6,7 @@
 )]
 
 mod asset;
-pub use asset::{AssetError, GaussianSegment, SpaghettiAsset};
+pub use asset::{AssetError, DetailTransition, GaussianSegment, SpaghettiAsset};
 
 #[cfg(feature = "render")]
 mod render;

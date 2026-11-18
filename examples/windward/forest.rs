@@ -2,15 +2,13 @@ use bevy::prelude::*;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy_spaghetti::{
-    Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting, SpaghettiNearFade,
+    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting, SpaghettiNearFade,
 };
 
 use crate::{
     conifer,
-    detail::{CameraView, ScreenDetail},
     lake::REFLECTED_LAYER,
     landscape::{Obstacles, SUN, ground, hash01, mark_rock_shadow, noise, shore_distance, trail_x},
-    player::HikerCamera,
 };
 
 const HEIGHTS: [f32; 3] = [8.93, 7.94, 5.76];
@@ -169,10 +167,39 @@ const VARIANTS: [Variant; 20] = [
 ];
 
 #[derive(Component)]
-pub struct ForestDetail {
-    clouds: [Handle<SpaghettiAsset>; conifer::LEVEL_COUNT],
+pub struct ForestDetail;
+
+struct TreeClouds {
+    adaptive: Handle<SpaghettiAsset>,
+    reflection: Handle<SpaghettiAsset>,
+}
+
+fn tree_clouds(
+    clouds: &mut Assets<SpaghettiAsset>,
     height: f32,
-    level: usize,
+    levels: [Vec<GaussianSegment>; conifer::LEVEL_COUNT],
+) -> TreeClouds {
+    let reflection = clouds.add(
+        SpaghettiAsset::new(levels[conifer::LEVEL_COUNT - 1].clone())
+            .expect("procedural firs are valid"),
+    );
+    let mut finer_end = 0;
+    let transitions: [_; LOD_PIXELS.len()] = std::array::from_fn(|level| {
+        finer_end += levels[level].len() as u32;
+        let pixels = LOD_PIXELS[level] / height;
+        DetailTransition {
+            finer_end,
+            pixels_per_unit: [0.8 * pixels, 1.2 * pixels],
+        }
+    });
+    let adaptive = clouds.add(
+        SpaghettiAsset::with_detail(levels.into_iter().flatten().collect(), &transitions)
+            .expect("procedural firs have valid detail levels"),
+    );
+    TreeClouds {
+        adaptive,
+        reflection,
+    }
 }
 
 /// Picks a variant of `kind`, and for living trees a species and size.
@@ -216,21 +243,21 @@ pub fn spawn_trees(
     mut obstacles: ResMut<Obstacles>,
     mut clouds: ResMut<Assets<SpaghettiAsset>>,
 ) {
-    let splats: Vec<[Handle<SpaghettiAsset>; conifer::LEVEL_COUNT]> = VARIANTS
+    let splats: Vec<_> = VARIANTS
         .iter()
         .enumerate()
         .map(|(index, variant)| {
-            std::array::from_fn(|level| {
-                let segments = conifer::fir(
+            let levels = std::array::from_fn(|level| {
+                conifer::fir(
                     index as u32 * 101 + 17,
                     variant.habit,
                     &variant.form,
                     variant.height,
                     variant.radius,
                     level,
-                );
-                clouds.add(SpaghettiAsset::new(segments).expect("procedural firs are valid"))
-            })
+                )
+            });
+            tree_clouds(&mut clouds, variant.top(), levels)
         })
         .collect();
     let lighting = SpaghettiLighting {
@@ -271,12 +298,8 @@ pub fn spawn_trees(
             .spawn((
                 Name::new(if near { "Conifer" } else { "Distant conifer" }),
                 transform,
-                Spaghetti3d(detail[level].clone()),
-                ForestDetail {
-                    clouds: detail.clone(),
-                    height: variant.top() * scale,
-                    level,
-                },
+                Spaghetti3d(detail.adaptive.clone()),
+                ForestDetail,
                 lighting,
                 // Limbs between the follow camera and the hiker dissolve
                 // instead of smearing across the frame.
@@ -306,7 +329,7 @@ pub fn spawn_trees(
                 }
                 children.spawn((
                     Name::new("Reflected conifer"),
-                    Spaghetti3d(detail[far].clone()),
+                    Spaghetti3d(detail.reflection.clone()),
                     lighting,
                     RenderLayers::layer(REFLECTED_LAYER),
                 ));
@@ -436,28 +459,4 @@ fn placement(at: Vec2, scale: f32, seed: u32) -> Transform {
         .with_rotation(Quat::from_rotation_y(
             hash01(seed + 3) * std::f32::consts::TAU,
         ))
-}
-
-pub fn select_tree_detail(
-    camera: Single<CameraView, With<HikerCamera>>,
-    mut trees: Query<(&Transform, &mut ForestDetail, &mut Spaghetti3d)>,
-) {
-    let Some(view) = ScreenDetail::new(*camera) else {
-        return;
-    };
-    for (transform, mut tree, mut cloud) in &mut trees {
-        let center = transform.translation + Vec3::Y * tree.height * 0.52;
-        let span = view.span_pixels(center, tree.height, tree.height * 0.37);
-        // Hysteresis keeps the level stable as the shoulder camera bobs.
-        let level = (0..LOD_PIXELS.len())
-            .find(|&level| {
-                let keep = if level < tree.level { 1.12 } else { 0.9 };
-                span >= LOD_PIXELS[level] * keep
-            })
-            .unwrap_or(LOD_PIXELS.len());
-        if level != tree.level {
-            cloud.0 = tree.clouds[level].clone();
-            tree.level = level;
-        }
-    }
 }

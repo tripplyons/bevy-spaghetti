@@ -35,6 +35,8 @@ struct View {
     local_from_world: mat3x3<f32>,
     pusher: vec4<f32>,
     motion: vec4<f32>,
+    detail_depths: array<vec4<f32>, 3>,
+    detail_ends: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -48,6 +50,40 @@ struct Raster {
     @location(2) @interpolate(flat) depth: vec2<f32>,
     @location(3) @interpolate(flat) color_mass: vec4<f32>,
     @location(4) @interpolate(flat) coverage: f32,
+    @location(5) @interpolate(flat) detail: vec2<f32>,
+}
+
+// At each transition, the finer level keeps the thresholds below its
+// coverage and the coarser level keeps the rest.
+fn detail_interval(index: u32, depth: f32) -> vec2<f32> {
+    var lower = 0.0;
+    for (var i = 0u; i < view.detail_ends.w; i += 1u) {
+        let edges = view.detail_depths[i].xy;
+        var fine = 1.0;
+        if depth >= edges.y {
+            fine = 0.0;
+        } else if depth > edges.x {
+            fine = 1.0 - smoothstep(edges.x, edges.y, depth);
+        }
+        if index < view.detail_ends[i] {
+            return vec2(lower, fine);
+        }
+        lower = fine;
+    }
+    return vec2(lower, 1.0);
+}
+
+fn screen_threshold(pixel: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(floor(pixel), vec2(0.06711056, 0.00583715))));
+}
+
+fn detail_visible(pixel: vec2<f32>, interval: vec2<f32>) -> bool {
+    if interval.x == 0.0 && interval.y == 1.0 {
+        return true;
+    }
+    // Offset the pattern from the cutout's visibility-range mask.
+    let threshold = screen_threshold(pixel + vec2(17.0, 29.0));
+    return threshold >= interval.x && threshold < interval.y;
 }
 
 // Opacity factor for segments close to the camera; viewport.zw hold the fade
@@ -177,7 +213,8 @@ fn apply_distance_fog(color: vec3<f32>, local_midpoint: vec3<f32>) -> vec3<f32> 
 
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance: u32) -> Raster {
-    let splat = splats[order[instance]];
+    let index = order[instance];
+    let splat = splats[index];
     let transform = view.clip_from_local;
     var local_start = splat.start_mass.xyz;
     var local_end = splat.end.xyz;
@@ -200,8 +237,13 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
         return out;
     }
 
-    let half_viewport = view.viewport.xy * 0.5;
     let midpoint = (a + b) * 0.5;
+    out.detail = detail_interval(index, midpoint.w);
+    if out.detail.x >= out.detail.y {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
+    let half_viewport = view.viewport.xy * 0.5;
     let jx = project_axis(transform[0], midpoint, half_viewport);
     let jy = project_axis(transform[1], midpoint, half_viewport);
     let jz = project_axis(transform[2], midpoint, half_viewport);
@@ -303,6 +345,9 @@ struct Fragment {
 
 @fragment
 fn fragment(in: Raster) -> Fragment {
+    if !detail_visible(in.position.xy, in.detail) {
+        discard;
+    }
     let length_sigma = length(in.segment);
     var along = 0.5;
     var average: f32;
@@ -333,6 +378,7 @@ struct CutoutRaster {
     @location(1) @interpolate(flat) shape: vec4<f32>,
     @location(2) @interpolate(flat) color: vec3<f32>,
     @location(3) @interpolate(flat) profile: vec4<f32>,
+    @location(4) @interpolate(flat) detail: vec2<f32>,
 }
 
 // Evaluate a Gaussian cutout in projected segment coordinates. Fixed-function
@@ -359,6 +405,12 @@ fn cutout_vertex(
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
     }
+    let midpoint = (a + b) * 0.5;
+    out.detail = detail_interval(instance, midpoint.w);
+    if out.detail.x >= out.detail.y {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
     let a_ndc = a.xyz / a.w;
     let b_ndc = b.xyz / b.w;
     let half_viewport = view.viewport.xy * 0.5;
@@ -367,7 +419,6 @@ fn cutout_vertex(
     let point = length_px < 1e-4;
     let tangent = select(line / max(length_px, 1e-4), vec2(1.0, 0.0), point);
     let across = vec2(-tangent.y, tangent.x);
-    let midpoint = (a + b) * 0.5;
     let q = splat.rotation;
     let local_to_kernel = vec4(-q.xyz, q.w);
     let jx = project_axis(transform[0], midpoint, half_viewport);
@@ -429,6 +480,9 @@ fn cutout_vertex(
 
 @fragment
 fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
+    if !detail_visible(in.position.xy, in.detail) {
+        discard;
+    }
     let along = in.coordinate.x;
     let across = in.coordinate.y;
     let beyond = max(0.0, max(-along, along - in.shape.x)) / in.shape.y;
@@ -437,7 +491,7 @@ fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
     }
     if abs(in.shape.w) < 1.0 {
         // A shared screen-space threshold makes paired LOD fades complementary.
-        let threshold = fract(52.9829189 * fract(dot(floor(in.position.xy), vec2(0.06711056, 0.00583715))));
+        let threshold = screen_threshold(in.position.xy);
         if select(threshold >= in.shape.w, threshold < 1.0 + in.shape.w, in.shape.w < 0.0) {
             discard;
         }

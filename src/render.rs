@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU64};
+use std::{collections::HashMap, num::NonZeroU64, ops::Range};
 
 use bevy::{
     asset::{AssetLoader, LoadContext, embedded_asset, io::Reader, load_embedded_asset},
@@ -41,7 +41,7 @@ use bevy_math::{Affine3A, Vec3A};
 use bevy_pbr::{DistanceFog, FogFalloff, MAX_DIRECTIONAL_LIGHTS};
 use bytemuck::{Pod, Zeroable};
 
-use crate::{AssetError, SpaghettiAsset};
+use crate::{AssetError, DetailTransition, SpaghettiAsset, asset::MAX_DETAIL_TRANSITIONS};
 
 /// Renders a cloud using the entity's transform, visibility and render layers.
 #[derive(Component, Clone, Debug)]
@@ -213,6 +213,7 @@ struct GpuCloud {
     centers: Box<[Vec3]>,
     bounds: Aabb,
     max_bend_height: f32,
+    detail: Box<[DetailTransition]>,
     revision: u64,
 }
 
@@ -242,6 +243,7 @@ impl RenderAsset for GpuCloud {
                 centers: Box::new([]),
                 bounds: Aabb::from_min_max(Vec3::ZERO, Vec3::ZERO),
                 max_bend_height: 0.0,
+                detail: Box::new([]),
                 revision,
             });
         }
@@ -269,8 +271,55 @@ impl RenderAsset for GpuCloud {
             centers,
             bounds: Aabb::from_min_max(min, max),
             max_bend_height: asset.segments().iter().map(|segment| segment.max_bend_height()).fold(0.0, f32::max),
+            detail: asset.detail_transitions().into(),
             revision,
         })
+    }
+}
+
+impl GpuCloud {
+    // Drop complete levels whose bands are outside the depth interval of the
+    // cloud. This also keeps distant draws at the cost of a single coarse level.
+    fn select_segments(
+        &self,
+        clip_from_local: Mat4,
+        viewport_height: f32,
+        bounds: Aabb,
+        uniform: &mut DrawUniform,
+    ) -> Range<u32> {
+        let count = self.centers.len() as u32;
+        if self.detail.is_empty() {
+            return 0..count;
+        }
+
+        // A local reference length projects to scale / clip.w pixels. The Y row
+        // accounts for viewport focal length and asset scale without depending
+        // on segment orientation or its distance from the center of the screen.
+        let scale = clip_from_local.row(1).truncate().length() * viewport_height * 0.5;
+        let depth = clip_from_local.row(3);
+        let center = depth.dot(Vec3::from(bounds.center).extend(1.0));
+        let radius = depth.truncate().abs().dot(bounds.half_extents.into());
+        let padding = (center.abs() + radius + 1.0) * 1e-5;
+        let closest = center - radius - padding;
+        let farthest = center + radius + padding;
+        let mut segments = 0..count;
+        for transition in &self.detail {
+            let [low, high] = transition.pixels_per_unit;
+            let near = scale / high;
+            let far = scale / low;
+            if closest >= far {
+                segments.start = transition.finer_end;
+            } else if farthest <= near {
+                segments.end = transition.finer_end;
+                break;
+            } else {
+                let slot = uniform.detail_ends[3] as usize;
+                uniform.detail_depths[slot] = [near, far, 0.0, 0.0];
+                uniform.detail_ends[slot] = transition.finer_end;
+                uniform.detail_ends[3] += 1;
+            }
+        }
+        segments
     }
 }
 
@@ -463,6 +512,10 @@ struct DrawUniform {
     pusher: [f32; 4],
     // Time, wind enabled, range coverage, reverse range dither.
     motion: [f32; 4],
+    // Near and far clip.w for each active transition.
+    detail_depths: [[f32; 4]; MAX_DETAIL_TRANSITIONS],
+    // Exclusive finer-level end indices, followed by active transition count.
+    detail_ends: [u32; 4],
 }
 
 impl DrawUniform {
@@ -491,7 +544,7 @@ struct CloudDraw {
     bindings: BindGroup,
     direction: Vec3,
     revision: u64,
-    count: u32,
+    segments: Range<u32>,
     idle_frames: u8,
 }
 
@@ -609,8 +662,9 @@ fn queue_clouds(
             {
                 continue;
             }
+            let clip_from_local = clip_from_world * cloud.world_from_local;
             let mut uniform = DrawUniform {
-                clip_from_local: (clip_from_world * cloud.world_from_local).to_cols_array_2d(),
+                clip_from_local: clip_from_local.to_cols_array_2d(),
                 viewport: [size.x as f32, size.y as f32, 0.0, 0.0],
                 motion: [0.0, 0.0, coverage, reverse_dither],
                 ..DrawUniform::zeroed()
@@ -649,6 +703,7 @@ fn queue_clouds(
                 uniform.fog = *fog;
             }
             let key = (view.retained_view_entity, entity);
+            let segments = gpu.select_segments(clip_from_local, size.y as f32, bounds, &mut uniform);
             let new_draw = || make_draw(&device, &bind_group_layout, source, gpu.centers.len(), *main_entity, cloud.cutout);
             let draw = draws.0.entry(key).or_insert_with(new_draw);
             if draw.source.id() != source.id() || draw.order.is_none() != cloud.cutout {
@@ -658,25 +713,34 @@ fn queue_clouds(
                 *draw = new_draw();
             }
             if let Some(order_buffer) = &draw.order {
-                let direction = (view_from_world * cloud.world_from_local).row(2).truncate().normalize_or_zero();
-                if draw.direction != direction || draw.revision != gpu.revision {
-                // Camera translation adds the same depth offset to every segment.
-                // Re-sort when the view rotates or the cloud's centers can change.
-                depths.clear();
-                depths.extend(
-                    gpu.centers
-                        .iter()
-                        .enumerate()
-                        .map(|(index, &center)| (center.dot(direction), index as u32)),
-                );
-                radsort::sort_by_key(&mut depths, |entry| entry.0);
-                order.clear();
-                order.extend(depths.iter().map(|&(_, index)| index));
-                queue.write_buffer(order_buffer, 0, bytemuck::cast_slice(&order));
-                draw.direction = direction;
-                draw.revision = gpu.revision;
+                let direction = (view_from_world * cloud.world_from_local)
+                    .row(2)
+                    .truncate()
+                    .normalize_or_zero();
+                if draw.direction != direction
+                    || draw.revision != gpu.revision
+                    || draw.segments != segments
+                {
+                    // Translation preserves relative depths. Re-sort only if the
+                    // view direction, asset data, or submitted levels changed.
+                    depths.clear();
+                    depths.extend(
+                        gpu.centers[segments.start as usize..segments.end as usize]
+                            .iter()
+                            .enumerate()
+                            .map(|(index, &center)| {
+                                (center.dot(direction), segments.start + index as u32)
+                            }),
+                    );
+                    radsort::sort_by_key(&mut depths, |entry| entry.0);
+                    order.clear();
+                    order.extend(depths.iter().map(|&(_, index)| index));
+                    queue.write_buffer(order_buffer, 0, bytemuck::cast_slice(&order));
+                    draw.direction = direction;
+                    draw.revision = gpu.revision;
                 }
             }
+            draw.segments = segments;
             queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&uniform));
             draw.idle_frames = 0;
             let pipeline_id = *pipeline_ids[usize::from(cloud.cutout)].get_or_insert_with(|| {
@@ -780,7 +844,7 @@ fn make_draw(
         bindings,
         direction: Vec3::NAN,
         revision: 0,
-        count: count as u32,
+        segments: 0..count as u32,
         idle_frames: 0,
     }
 }
@@ -804,7 +868,12 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
             return RenderCommandResult::Skip;
         };
         pass.set_bind_group(0, &draw.bindings, &[]);
-        pass.draw(0..4, 0..draw.count);
+        let instances = if draw.order.is_some() {
+            0..draw.segments.len() as u32
+        } else {
+            draw.segments.clone()
+        };
+        pass.draw(0..4, instances);
         RenderCommandResult::Success
     }
 }
