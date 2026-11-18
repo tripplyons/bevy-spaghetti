@@ -19,13 +19,9 @@ mod tests;
 
 use bevy::{
     anti_alias::smaa::{Smaa, SmaaPreset},
-    camera::{Exposure, Hdr, visibility::RenderLayers},
-    core_pipeline::tonemapping::Tonemapping,
+    camera::{Hdr, visibility::RenderLayers},
     light::{GeneratedEnvironmentMapLight, Skybox},
-    pbr::{DistanceFog, FogFalloff},
-    post_process::bloom::Bloom,
     prelude::*,
-    render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
     window::WindowResolution,
 };
 use bevy_spaghetti::SpaghettiPlugin;
@@ -78,11 +74,13 @@ fn add_scene(app: &mut App) {
             atmosphere::spawn_atmosphere,
             debris::spawn_debris,
             spawn_reeds,
+            // Props first, so the meadow leaves their footprints bare.
+            props::spawn_props,
             meadow::spawn_meadow,
             understory::spawn_understory,
-            props::spawn_props,
             spawn_hiker,
             spawn_camera,
+            atmosphere::unblock_sun_shafts,
             lake::spawn_lake,
         )
             .chain(),
@@ -121,7 +119,7 @@ fn spawn_camera(
         (
             Camera3d::default(),
             IsDefaultUiCamera,
-            atmosphere::camera_fog(),
+            atmosphere::camera_haze(),
         ),
         Projection::Perspective(PerspectiveProjection {
             fov: 54.0_f32.to_radians(),
@@ -132,30 +130,7 @@ fn spawn_camera(
         player::initial_view(&obstacles),
         RenderLayers::default().with(lake::LAKE_SURFACE_LAYER),
         Hdr,
-        Exposure { ev100: 11.5 },
-        (
-            Tonemapping::AgX,
-            ColorGrading {
-                global: ColorGradingGlobal {
-                    temperature: 0.015,
-                    post_saturation: 1.04,
-                    ..default()
-                },
-                shadows: ColorGradingSection {
-                    gamma: 0.96,
-                    ..default()
-                },
-                midtones: ColorGradingSection {
-                    contrast: 1.035,
-                    ..default()
-                },
-                ..default()
-            },
-            Bloom {
-                intensity: 0.045,
-                ..Bloom::NATURAL
-            },
-        ),
+        atmosphere::camera_grade(),
         Msaa::Off,
         Smaa {
             preset: SmaaPreset::Ultra,
@@ -172,12 +147,6 @@ fn spawn_camera(
             intensity: 1450.0,
             rotation: SKY_ROTATION,
             ..default()
-        },
-        DistanceFog {
-            color: Color::srgba(0.46, 0.53, 0.61, 0.59),
-            directional_light_color: Color::srgba(0.98, 0.79, 0.63, 0.095),
-            directional_light_exponent: 29.0,
-            falloff: FogFalloff::ExponentialSquared { density: 0.0072 },
         },
     ));
 }

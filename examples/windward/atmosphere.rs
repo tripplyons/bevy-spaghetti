@@ -1,22 +1,118 @@
+//! The camera's look and the air it sees through: haze, sun shafts, and the
+//! color grade.
 use bevy::{
     asset::RenderAssetUsages,
+    camera::{Exposure, visibility::RenderLayers},
+    core_pipeline::tonemapping::Tonemapping,
     image::ImageSampler,
-    light::{FogVolume, VolumetricFog},
+    light::{CascadeShadowConfigBuilder, FogVolume, VolumetricFog, VolumetricLight},
+    pbr::{DistanceFog, FogFalloff},
+    post_process::{bloom::Bloom, effect_stack::Vignette},
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+    render::{
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
+        view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
+    },
 };
 
-use crate::landscape::{WATER_LEVEL, ground, noise, shore_distance, smoothstep};
+use crate::{
+    landscape::{WATER_LEVEL, ground, noise, shore_distance, smoothstep},
+    player::HikerCamera,
+};
 
 const CENTER: Vec3 = Vec3::new(1.0, 3.5, -25.0);
 const SIZE: Vec3 = Vec3::new(124.0, 12.0, 116.0);
 
-pub fn camera_fog() -> VolumetricFog {
-    VolumetricFog {
-        ambient_color: Color::linear_rgb(0.72, 0.82, 0.96),
-        ambient_intensity: 0.0,
-        step_count: 20,
-        jitter: 0.035,
+/// Volumetric fog for sun shafts, and distance fog for aerial perspective.
+pub fn camera_haze() -> impl Bundle {
+    (
+        VolumetricFog {
+            ambient_color: Color::linear_rgb(0.72, 0.82, 0.96),
+            // Sky light keeps haze in terrain shadow blue-gray. Without it,
+            // shaded fog only absorbs and the low-sun valley turns brown-black.
+            ambient_intensity: 0.04,
+            step_count: 14,
+            jitter: 0.035,
+        },
+        DistanceFog {
+            color: Color::srgba(0.46, 0.53, 0.61, 0.59),
+            // A broad warm glow toward the low sun, as in backlit haze.
+            directional_light_color: Color::srgba(0.98, 0.79, 0.63, 0.13),
+            directional_light_exponent: 18.0,
+            falloff: FogFalloff::ExponentialSquared { density: 0.0072 },
+        },
+    )
+}
+
+/// Exposure, tone mapping, and a restrained photographic grade.
+pub fn camera_grade() -> impl Bundle {
+    (
+        Exposure { ev100: 11.5 },
+        Tonemapping::AgX,
+        ColorGrading {
+            global: ColorGradingGlobal {
+                temperature: 0.015,
+                post_saturation: 1.04,
+                ..default()
+            },
+            shadows: ColorGradingSection {
+                gamma: 0.96,
+                ..default()
+            },
+            midtones: ColorGradingSection {
+                contrast: 1.07,
+                ..default()
+            },
+            ..default()
+        },
+        Bloom {
+            intensity: 0.045,
+            ..Bloom::NATURAL
+        },
+        // A faint lens falloff toward the corners.
+        Vignette {
+            intensity: 0.2,
+            radius: 0.9,
+            smoothness: 2.5,
+            ..default()
+        },
+    )
+}
+
+/// Lets the sun light the volumetric fog.
+///
+/// Bevy 0.20.1 sorts directional lights by `(volumetric, shadows, entity)` in
+/// ascending order, so volumetric lights come last. The fog shader stops at
+/// the first light that is not volumetric, so any plain directional light that
+/// the camera sees hides the sun from the fog. This system marks the camera's
+/// other directional lights as volumetric, with shadow maps on and a single
+/// cascade 0.1 m long. All of them then sort with the sun, and the sun sorts
+/// first because it was spawned first. Fog samples beyond a light's cascade
+/// get no light from it, so these lights add no visible fog.
+pub fn unblock_sun_shafts(
+    mut commands: Commands,
+    camera: Single<&RenderLayers, With<HikerCamera>>,
+    mut lights: Query<
+        (Entity, &mut DirectionalLight, Option<&RenderLayers>),
+        Without<VolumetricLight>,
+    >,
+) {
+    for (entity, mut light, layers) in &mut lights {
+        if !layers.unwrap_or_default().intersects(&camera) {
+            continue;
+        }
+        light.shadow_maps_enabled = true;
+        commands.entity(entity).insert((
+            VolumetricLight,
+            CascadeShadowConfigBuilder {
+                num_cascades: 1,
+                minimum_distance: 0.05,
+                first_cascade_far_bound: 0.1,
+                maximum_distance: 0.1,
+                ..default()
+            }
+            .build(),
+        ));
     }
 }
 
@@ -30,7 +126,8 @@ pub fn spawn_atmosphere(mut commands: Commands, mut images: ResMut<Assets<Image>
             scattering: 0.31,
             scattering_asymmetry: 0.59,
             fog_color: Color::linear_rgb(0.75, 0.84, 0.95),
-            light_intensity: 0.66,
+            // Tuned with the sun visible to the fog; see `unblock_sun_shafts`.
+            light_intensity: 0.3,
             ..default()
         },
         Transform::from_translation(CENTER).with_scale(SIZE),
