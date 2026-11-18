@@ -67,6 +67,39 @@ impl GaussianSegment {
         Vec3::from_slice(&self.color)
     }
 
+    /// Sets the bend height of each endpoint above the root, in world units.
+    ///
+    /// A renderer with wind enabled pins endpoints with zero bend height.
+    pub fn with_bend_heights(mut self, start: f32, end: f32) -> Self {
+        self.end[3] = start.max(0.0);
+        self.sigma[3] = end.max(0.0);
+        self
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn max_bend_height(&self) -> f32 {
+        self.end[3].max(self.sigma[3]).max(0.0)
+    }
+
+    /// Sets the blade height, endpoint fractions along it, and the ratio of
+    /// end width to start width for a tapered foliage cutout.
+    ///
+    /// The stored height is rounded to the nearest millimeter, up to 8.191 m.
+    /// Use the same height and fraction where two segments meet.
+    pub fn with_blade_profile(mut self, height: f32, fractions: [f32; 2], end_width: f32) -> Self {
+        let height_mm = (height * 1000.0).round().clamp(1.0, 8191.0) as u32;
+        let height = height_mm as f32 * 0.001;
+        self = self.with_bend_heights(
+            height * fractions[0].clamp(0.0, 1.0),
+            height * fractions[1].clamp(0.0, 1.0),
+        );
+        let width = (end_width.clamp(0.0, 1.0) * 1023.0).round() as u32;
+        // Keep the profile in a finite float with a fixed exponent. The
+        // mantissa holds 13 height bits followed by 10 taper bits.
+        self.color[3] = f32::from_bits(0x3f80_0000 | (height_mm << 10) | width);
+        self
+    }
+
     fn is_valid(&self) -> bool {
         self.start().is_finite()
             && self.end().is_finite()
@@ -101,7 +134,7 @@ pub enum AssetError {
     derive(bevy::asset::Asset, bevy::reflect::TypePath)
 )]
 pub struct SpaghettiAsset {
-    segments: Arc<[GaussianSegment]>,
+    segments: Arc<Vec<GaussianSegment>>,
     bounds: (Vec3, Vec3),
 }
 
@@ -123,7 +156,7 @@ impl SpaghettiAsset {
             max = max.max(high);
         }
         Ok(Self {
-            segments: segments.into(),
+            segments: Arc::new(segments),
             bounds: (min, max),
         })
     }

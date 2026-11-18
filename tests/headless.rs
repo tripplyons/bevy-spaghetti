@@ -16,15 +16,20 @@ use bevy::{
     window::ExitCondition,
     winit::WinitPlugin,
 };
-use bevy_spaghetti::{GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiPlugin};
+use bevy_spaghetti::{
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiPlugin,
+};
 
 const SIZE: usize = 128;
 
 #[derive(Resource, Default)]
 struct Samples {
-    strand: Option<[[u8; 4]; 7]>,
+    strand: Option<[[u8; 4]; 9]>,
     bust: Option<usize>,
 }
+
+#[derive(Component)]
+struct EditableCloud;
 
 #[test]
 #[ignore = "requires a native GPU adapter; no display server required"]
@@ -60,7 +65,17 @@ fn renders_strands_and_bundled_asset_offscreen() {
         app.update();
         let samples = app.world().resource::<Samples>();
         if let (Some(pixels), Some(bust)) = (samples.strand, samples.bust) {
-            let [left, joint, blocked, gap, point, blended, tapered] = pixels;
+            let [
+                left,
+                joint,
+                blocked,
+                gap,
+                point,
+                blended,
+                tapered,
+                lit,
+                unlit,
+            ] = pixels;
             println!(
                 "strand: {pixels:?}, bust coverage: {bust} / {}",
                 SIZE * SIZE
@@ -91,11 +106,54 @@ fn renders_strands_and_bundled_asset_offscreen() {
                 "missing Gaussian end taper"
             );
             assert!((1500..9000).contains(&bust), "unexpected bust coverage");
-            return;
+            assert!(
+                lit[0] > 200 && unlit[0] > 35 && lit[0] > unlit[0] + 100,
+                "oriented splats did not receive distinct lighting"
+            );
+            return check_same_size_update(&mut app);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
     panic!("no complete offscreen result before deadline");
+}
+
+fn check_same_size_update(app: &mut App) {
+    let world = app.world_mut();
+    let cloud = world
+        .query_filtered::<&Spaghetti3d, With<EditableCloud>>()
+        .single(world)
+        .unwrap()
+        .0
+        .clone();
+    let mut assets = world.resource_mut::<Assets<SpaghettiAsset>>();
+    let mut segments = assets.get(&cloud).unwrap().segments().to_vec();
+    // Flip the points' depths while preserving the source buffer size and
+    // camera pose. The upload and per-view draw order must both refresh.
+    for segment in &mut segments[2..4] {
+        let position = segment.start() * Vec3::new(1.0, 1.0, -1.0);
+        *segment = GaussianSegment::new(
+            position,
+            position,
+            segment.sigma(),
+            segment.rotation(),
+            segment.mass(),
+            segment.color(),
+        );
+    }
+    assets
+        .insert(cloud.id(), SpaghettiAsset::new(segments).unwrap())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        app.update();
+        let samples = app.world().resource::<Samples>().strand.unwrap();
+        if samples[5][2] > samples[5][0] {
+            println!("same-size edit reversed depth order: {:?}", samples[5]);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("same-size edit did not update overlapping point depth order");
 }
 
 fn setup(
@@ -120,8 +178,29 @@ fn setup(
         make_splat(far, far, 0.04, Vec3::Z),
         make_splat(point, point, 0.12, Vec3::Y + Vec3::Z),
     ];
-    commands.spawn(Spaghetti3d(
-        splats.add(SpaghettiAsset::new(segments).unwrap()),
+    commands.spawn((
+        EditableCloud,
+        Spaghetti3d(splats.add(SpaghettiAsset::new(segments).unwrap())),
+    ));
+    let lit_points = [
+        (
+            Vec3::new(-1.14, 0.9, 0.0),
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+        ),
+        (Vec3::new(-0.58, 0.9, 0.0), Quat::IDENTITY),
+    ]
+    .into_iter()
+    .map(|(pos, rotation)| {
+        GaussianSegment::new(pos, pos, Vec3::splat(0.08), rotation, 0.12, Vec3::ONE)
+    })
+    .collect();
+    commands.spawn((
+        Spaghetti3d(splats.add(SpaghettiAsset::new(lit_points).unwrap())),
+        SpaghettiLighting {
+            direction_to_light: Vec3::X,
+            ambient: Vec3::splat(0.045),
+            directional: Vec3::splat(0.85),
+        },
     ));
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(0.35, 0.55, 0.1))),
@@ -160,8 +239,10 @@ fn setup(
                 pixel(83, 35),
                 pixel(64, 92),
                 pixel(99, 64),
+                pixel(27, 35),
+                pixel(45, 35),
             ];
-            if pixels[2][1] > 240 && pixels[0][0] > 200 {
+            if pixels[2][1] > 240 && pixels[0][0] > 200 && pixels[7][0] > 5 {
                 samples.strand = Some(pixels);
             }
         },

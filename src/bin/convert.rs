@@ -1,7 +1,12 @@
-use std::{fs::File, io::BufWriter, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::BufWriter,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, ensure};
-use bevy_math::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
+use bevy_math::{IVec3, Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 use bevy_spaghetti::{GaussianSegment, SpaghettiAsset};
 use clap::Parser;
 use gltf::{image, mesh::Mode, texture::WrappingMode};
@@ -84,6 +89,7 @@ struct Vertex {
     color: Vec4,
     uv: Vec2,
     normal_uv: Vec2,
+    tangent: Vec4,
 }
 
 struct Surface<'a> {
@@ -91,7 +97,8 @@ struct Surface<'a> {
     material: Material<'a>,
     area: f64,
     frame: Mat3,
-    tangent_frame: Option<(Vec3, Vec3)>,
+    uv_frame: UvFrame,
+    normal_tangents: Option<(Vec3, Vec3)>,
 }
 
 impl<'a> Conversion<'a> {
@@ -131,6 +138,7 @@ impl<'a> Conversion<'a> {
             .context("missing POSITION accessor")?;
         let material = Material::new(primitive.material(), self.images, self.args.bake_light);
         let mut normals = reader.read_normals();
+        let mut tangents = reader.read_tangents();
         let mut colors = reader.read_colors(0).map(|colors| colors.into_rgba_f32());
         let mut uvs = material
             .base
@@ -176,6 +184,15 @@ impl<'a> Conversion<'a> {
                     .as_mut()
                     .and_then(Iterator::next)
                     .map_or(Vec2::ZERO, Vec2::from_array),
+                tangent: tangents
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .map_or(Vec4::ZERO, |tangent| {
+                        let tangent = Vec4::from_array(tangent);
+                        (linear * tangent.truncate())
+                            .normalize_or_zero()
+                            .extend(if mirrored { -tangent.w } else { tangent.w })
+                    }),
             })
             .collect();
         ensure!(
@@ -192,6 +209,7 @@ impl<'a> Conversion<'a> {
         );
         let vertex = |i: usize| vertices[indices[i]];
         let count = indices.len();
+        let first_surface = self.surfaces.len();
         let mut triangle = |first: usize, mut second: usize, mut third: usize| {
             if mirrored {
                 std::mem::swap(&mut second, &mut third);
@@ -239,6 +257,9 @@ impl<'a> Conversion<'a> {
                 }
             }
         }
+        if material.base.is_some() || material.normal.is_some() {
+            mark_uv_boundaries(&mut self.surfaces[first_surface..]);
+        }
         Ok(())
     }
 
@@ -272,26 +293,66 @@ impl<'a> Conversion<'a> {
         }
 
         let count = self.args.samples as usize;
-        let area: f64 = self.surfaces.iter().map(|triangle| triangle.area).sum();
-        let area_per_sample = area / count as f64;
-        let spacing = area_per_sample.sqrt() as f32;
-        let mut surface_index = 0;
-        let mut end_area = self.surfaces[0].area;
+        let mut area = 0.0;
+        let end_areas: Vec<_> = self
+            .surfaces
+            .iter()
+            .map(|surface| {
+                area += surface.area;
+                area
+            })
+            .collect();
+        let spacing = (area / count as f64).sqrt() as f32;
+        let first_separation = 0.76;
+        let cell_size = first_separation * f64::from(spacing);
+        let adjacent_cells: Vec<_> = (-1..=1)
+            .flat_map(|z| (-1..=1).flat_map(move |y| (-1..=1).map(move |x| IVec3::new(x, y, z))))
+            .collect();
+        let mut grid = HashMap::<IVec3, Vec<(Vec3, Vec3)>>::new();
+        let mut accepted = 0;
+        let mut i = 0;
 
-        // Jitter one sample per equal-area stratum. Independent dimensions
-        // select the triangle, barycentric position, and in-plane direction.
-        for i in 0..count {
-            let offset = (i as f64 + sequence(i, 2)) * area_per_sample;
-            while end_area < offset && surface_index + 1 < self.surfaces.len() {
-                surface_index += 1;
-                end_area += self.surfaces[surface_index].area;
-            }
-            let u = sequence(i, 3).sqrt() as f32;
-            let v = sequence(i, 5) as f32;
-            let weights = [1.0 - u, u * (1.0 - v), u * v];
-            let angle = std::f32::consts::TAU * sequence(i, 7) as f32;
-            if let Some(segment) = self.surfaces[surface_index].sample(weights, angle, spacing) {
-                self.segments.push(segment);
+        // Reject clusters so narrower footprints still cover the surface.
+        // Relax the minimum separation if the first pass cannot fill the budget.
+        for (separation, attempts) in [(first_separation, 6), (0.60, 3), (0.0, 1)] {
+            let min_distance_squared = (separation as f32 * spacing).powi(2);
+            for _ in 0..attempts * count {
+                if accepted == count {
+                    return;
+                }
+                let offset = sequence(i, 2) * area;
+                let surface = &self.surfaces[end_areas.partition_point(|&end| end <= offset)];
+                let u = sequence(i, 3).sqrt() as f32;
+                let v = sequence(i, 5) as f32;
+                let weights = Vec3::new(1.0 - u, u * (1.0 - v), u * v);
+                let angle = std::f32::consts::TAU * sequence(i, 7) as f32;
+                i += 1;
+                let [a, b, c] = surface.vertices;
+                let center =
+                    a.position * weights.x + b.position * weights.y + c.position * weights.z;
+                let normal = surface.frame.z_axis;
+                let cell = (center.as_dvec3() / cell_size)
+                    .floor()
+                    .as_ivec3()
+                    .clamp(IVec3::splat(i32::MIN + 1), IVec3::splat(i32::MAX - 1));
+                let too_close = separation > 0.0
+                    && adjacent_cells.iter().any(|&offset| {
+                        grid.get(&(cell + offset)).is_some_and(|neighbors| {
+                            // Opposite sides of a thin sheet need their own samples.
+                            neighbors.iter().any(|&(point, facing)| {
+                                normal.dot(facing) > 0.0
+                                    && center.distance_squared(point) < min_distance_squared
+                            })
+                        })
+                    });
+                if too_close {
+                    continue;
+                }
+                grid.entry(cell).or_default().push((center, normal));
+                accepted += 1;
+                if let Some(segment) = surface.sample(center, weights, angle, spacing) {
+                    self.segments.push(segment);
+                }
             }
         }
     }
@@ -326,7 +387,7 @@ impl<'a> Surface<'a> {
         let delta1 = b.normal_uv - a.normal_uv;
         let delta2 = c.normal_uv - a.normal_uv;
         let determinant = delta1.perp_dot(delta2);
-        let tangent_frame = (determinant.abs() > 1e-12).then(|| {
+        let normal_tangents = (determinant.abs() > 1e-12).then(|| {
             (
                 (first * delta2.y - second * delta1.y) / determinant,
                 (second * delta1.x - first * delta2.x) / determinant,
@@ -337,60 +398,263 @@ impl<'a> Surface<'a> {
             material,
             area: f64::from(twice_area) * 0.5,
             frame,
-            tangent_frame,
+            uv_frame: UvFrame::new(first.length(), second.dot(tangent), twice_area),
+            normal_tangents,
         })
     }
 
-    fn sample(&self, [wa, wb, wc]: [f32; 3], angle: f32, spacing: f32) -> Option<GaussianSegment> {
+    fn sample(
+        &self,
+        center: Vec3,
+        weights: Vec3,
+        angle: f32,
+        spacing: f32,
+    ) -> Option<GaussianSegment> {
         let [a, b, c] = self.vertices;
-        let (mut color, coverage) = self.material.color(
-            a.color * wa + b.color * wb + c.color * wc,
-            a.uv * wa + b.uv * wb + c.uv * wc,
+        let vertex_color = a.color * weights.x + b.color * weights.y + c.color * weights.z;
+        let base = TexturePoint::new(
+            self.material.base,
+            [a.uv, b.uv, c.uv],
+            weights,
+            self.uv_frame,
         );
+        let normal_map = TexturePoint::new(
+            self.material.normal,
+            [a.normal_uv, b.normal_uv, c.normal_uv],
+            weights,
+            self.uv_frame,
+        );
+        let (along, coherence) = texture_direction(base, normal_map, spacing, angle);
+        let across = along.perp();
+        let half_length = (0.39 + 0.63 * coherence) * spacing;
+        let sigma = Vec3::new(0.34, 0.37 - 0.14 * coherence, 0.085) * spacing;
+
+        // The uniformly weighted centerline adds length²/12 to the variance.
+        let footprint = along * (sigma.x * sigma.x + half_length * half_length / 3.0).sqrt();
+        let width = across * (0.7 * sigma.y);
+        let rgba = base.map_or(Vec4::ONE, |base| {
+            if self.material.alpha == gltf::material::AlphaMode::Opaque {
+                // A second blur here compounds the renderer's footprint.
+                // Recover some contrast from the center-to-neighbor difference.
+                base.footprint_sample(footprint, width, true, -0.35)
+                    .max(Vec4::ZERO)
+            } else {
+                base.sample(Vec2::ZERO, true)
+            }
+        });
+        let (mut color, coverage) = self.material.color_from_texel(vertex_color, rgba);
         if coverage == 0.0 {
             return None;
         }
-        if self.material.bake_light {
-            let mut normal = (a.normal * wa + b.normal * wb + c.normal * wc)
-                .try_normalize()
-                .unwrap_or(self.frame.z_axis);
-            if let (Some(map), Some((tangent, bitangent))) =
-                (&self.material.normal, self.tangent_frame)
-            {
-                let sampled = 2.0
-                    * map
-                        .sample(
-                            a.normal_uv * wa + b.normal_uv * wb + c.normal_uv * wc,
-                            false,
-                        )
+
+        let smooth_normal = (a.normal * weights.x + b.normal * weights.y + c.normal * weights.z)
+            .try_normalize()
+            .unwrap_or(self.frame.z_axis);
+        let mut normal = smooth_normal;
+        if let Some(map) = normal_map {
+            let tangent = a.tangent * weights.x + b.tangent * weights.y + c.tangent * weights.z;
+            let tangents = if tangent.w != 0.0 {
+                Some((
+                    tangent.truncate(),
+                    smooth_normal.cross(tangent.truncate()) * tangent.w,
+                ))
+            } else {
+                self.normal_tangents
+            };
+            if let Some((tangent, bitangent)) = tangents {
+                normal = self.mapped_normal(
+                    smooth_normal,
+                    tangent,
+                    bitangent,
+                    map.footprint_sample(footprint, width, false, 0.25)
                         .truncate()
-                    - Vec3::ONE;
-                let tangent = (tangent - normal * normal.dot(tangent)).normalize_or_zero();
-                let cross = normal.cross(tangent);
-                let handedness = cross.dot(bitangent).signum();
-                let scale = self.material.normal_scale;
-                normal = (tangent * sampled.x * scale
-                    + cross * handedness * sampled.y * scale
-                    + normal * sampled.z)
-                    .try_normalize()
-                    .unwrap_or(normal);
+                        * 2.0
+                        - Vec3::ONE,
+                );
             }
+        }
+        if self.material.bake_light {
             let key = normal.dot(Vec3::new(-0.55, 0.78, 0.3)).max(0.0);
             let fill = normal.dot(Vec3::new(0.71, 0.18, -0.68)).max(0.0);
             color *= 0.27 + 0.67 * key + 0.26 * fill;
         }
-        let center = a.position * wa + b.position * wb + c.position * wc;
-        let (sin, cos) = angle.sin_cos();
-        let offset = (self.frame.x_axis * cos + self.frame.y_axis * sin) * (0.58 * spacing);
+
+        let tangent = self.frame.x_axis * along.x + self.frame.y_axis * along.y;
+        let offset = tangent * half_length;
+        let geometric_frame =
+            Mat3::from_cols(tangent, self.frame.z_axis.cross(tangent), self.frame.z_axis);
+        // The renderer reads local +Z for lighting. Tilt the covariance frame
+        // to carry the shading normal while keeping the centerline on the mesh.
+        let rotation =
+            Quat::from_rotation_arc(self.frame.z_axis, normal) * Quat::from_mat3(&geometric_frame);
         Some(GaussianSegment::new(
             center - offset,
             center + offset,
-            Vec3::new(0.70, 0.70, 0.17) * spacing,
-            Quat::from_mat3(&self.frame).normalize(),
+            sigma,
+            rotation.normalize(),
             4.5 * coverage * spacing * spacing,
             color,
         ))
     }
+
+    fn mapped_normal(&self, normal: Vec3, tangent: Vec3, bitangent: Vec3, sampled: Vec3) -> Vec3 {
+        let tangent = (tangent - normal * normal.dot(tangent)).normalize_or_zero();
+        let cross = normal.cross(tangent);
+        let handedness = cross.dot(bitangent).signum();
+        let scale = self.material.normal_scale;
+        (tangent * sampled.x * scale + cross * handedness * sampled.y * scale + normal * sampled.z)
+            .try_normalize()
+            .unwrap_or(normal)
+    }
+}
+
+fn mark_uv_boundaries(surfaces: &mut [Surface<'_>]) {
+    // Match by position and both UV sets so duplicated vertices can still
+    // share an edge. An atlas seam has no matching edge with the same UVs.
+    let keys = |surface: &Surface<'_>| {
+        surface.vertices.map(|v| {
+            let [x, y, z] = v.position.to_array();
+            [x, y, z, v.uv.x, v.uv.y, v.normal_uv.x, v.normal_uv.y]
+                .map(|value| if value == 0.0 { 0 } else { value.to_bits() })
+        })
+    };
+    let edges: HashSet<_> = surfaces
+        .iter()
+        .flat_map(|surface| {
+            let [a, b, c] = keys(surface);
+            [(a, b), (b, c), (c, a)]
+        })
+        .collect();
+    for surface in surfaces {
+        let [a, b, c] = keys(surface);
+        surface.uv_frame.boundaries = [(c, b), (a, c), (b, a)].map(|edge| !edges.contains(&edge));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UvFrame {
+    dx: Vec3,
+    dy: Vec3,
+    boundaries: [bool; 3],
+}
+
+impl UvFrame {
+    fn new(ab_length: f32, ac_parallel: f32, twice_area: f32) -> Self {
+        // Invert the triangle's two planar edges to get barycentric offsets
+        // per unit displacement in the tangent and bitangent directions.
+        let dx_b = ab_length.recip();
+        let dy_b = -ac_parallel / twice_area;
+        let dy_c = ab_length / twice_area;
+        Self {
+            dx: Vec3::new(-dx_b, dx_b, 0.0),
+            dy: Vec3::new(-dy_b - dy_c, dy_b, dy_c),
+            boundaries: [false; 3],
+        }
+    }
+
+    fn clip(self, weights: Vec3, offset: Vec2) -> Vec2 {
+        let delta = self.dx * offset.x + self.dy * offset.y;
+        let mut fraction = 1.0_f32;
+        for i in 0..3 {
+            if self.boundaries[i] && delta[i] < -weights[i] {
+                fraction = fraction.min(-weights[i] / delta[i]);
+            }
+        }
+        offset * fraction
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TexturePoint<'a> {
+    texture: Texture<'a>,
+    uv: Vec2,
+    dx: Vec2,
+    dy: Vec2,
+    frame: UvFrame,
+    weights: Vec3,
+}
+
+impl<'a> TexturePoint<'a> {
+    fn new(
+        texture: Option<Texture<'a>>,
+        [a, b, c]: [Vec2; 3],
+        weights: Vec3,
+        frame: UvFrame,
+    ) -> Option<Self> {
+        let texture = texture?;
+        let project = |weights: Vec3| a * weights.x + b * weights.y + c * weights.z;
+        Some(Self {
+            texture,
+            uv: project(weights),
+            dx: (b - a) * frame.dx.y,
+            dy: (b - a) * frame.dy.y + (c - a) * frame.dy.z,
+            frame,
+            weights,
+        })
+    }
+
+    fn sample(self, offset: Vec2, srgb: bool) -> Vec4 {
+        let offset = self.frame.clip(self.weights, offset);
+        self.texture
+            .sample(self.uv + self.dx * offset.x + self.dy * offset.y, srgb)
+    }
+
+    fn footprint_sample(self, along: Vec2, across: Vec2, srgb: bool, neighbor_weight: f32) -> Vec4 {
+        let center = self.sample(Vec2::ZERO, srgb);
+        let neighbors = (self.sample(along, srgb)
+            + self.sample(-along, srgb)
+            + self.sample(across, srgb)
+            + self.sample(-across, srgb))
+            * 0.25;
+        center.lerp(neighbors, neighbor_weight)
+    }
+}
+
+fn texture_direction(
+    base: Option<TexturePoint<'_>>,
+    normal: Option<TexturePoint<'_>>,
+    spacing: f32,
+    angle: f32,
+) -> (Vec2, f32) {
+    let probe = 0.29 * spacing;
+    let offsets = [
+        Vec2::new(-probe, -probe),
+        Vec2::new(probe, -probe),
+        Vec2::new(-probe, probe),
+        Vec2::new(probe, probe),
+    ];
+    let mut tensor = Vec3::ZERO;
+    if let Some(base) = base {
+        tensor += gradient_tensor(
+            offsets.map(|offset| base.sample(offset, true).truncate().max(Vec3::ZERO).sqrt()),
+        );
+    }
+    if let Some(normal) = normal {
+        tensor +=
+            0.08 * gradient_tensor(offsets.map(|offset| normal.sample(offset, false).truncate()));
+    }
+    // The major eigenvector is the direction of greatest texture change.
+    // Extend the segment along the perpendicular, where texture is steadier.
+    let difference = tensor.x - tensor.z;
+    let twice_cross = 2.0 * tensor.y;
+    let strength = difference.hypot(twice_cross);
+    let coherence = strength / (tensor.x + tensor.z + 0.001);
+    let direction = if coherence > 0.1 {
+        Vec2::from_angle(0.5 * twice_cross.atan2(difference)).perp()
+    } else {
+        Vec2::from_angle(angle)
+    };
+    (direction, coherence)
+}
+
+fn gradient_tensor([a, b, c, d]: [Vec3; 4]) -> Vec3 {
+    let [bottom, top] = [b - a, d - c];
+    let [left, right] = [c - a, d - b];
+    Vec3::new(
+        bottom.length_squared() + top.length_squared(),
+        (bottom + top).dot(left + right) * 0.5,
+        left.length_squared() + right.length_squared(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -408,7 +672,9 @@ impl<'a> Material<'a> {
     fn new(material: gltf::Material<'_>, images: &'a [image::Data], bake_light: bool) -> Self {
         let pbr = material.pbr_metallic_roughness();
         let bake_light = bake_light && !material.unlit();
-        let normal = bake_light.then(|| material.normal_texture()).flatten();
+        let normal = (!material.unlit())
+            .then(|| material.normal_texture())
+            .flatten();
         Self {
             factor: Vec4::from_array(pbr.base_color_factor()),
             base: pbr
@@ -425,8 +691,14 @@ impl<'a> Material<'a> {
     }
 
     fn color(&self, vertex_color: Vec4, uv: Vec2) -> (Vec3, f32) {
-        let rgba =
-            self.factor * vertex_color * self.base.map_or(Vec4::ONE, |map| map.sample(uv, true));
+        self.color_from_texel(
+            vertex_color,
+            self.base.map_or(Vec4::ONE, |map| map.sample(uv, true)),
+        )
+    }
+
+    fn color_from_texel(&self, vertex_color: Vec4, texel: Vec4) -> (Vec3, f32) {
+        let rgba = self.factor * vertex_color * texel;
         let coverage = match self.alpha {
             gltf::material::AlphaMode::Opaque => 1.0,
             gltf::material::AlphaMode::Mask => f32::from(rgba.w >= self.cutoff),
