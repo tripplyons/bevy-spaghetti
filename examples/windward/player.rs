@@ -6,6 +6,7 @@ use bevy::{
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
     transform::TransformSystems,
+    window::{CursorGrabMode, CursorOptions, PrimaryWindow},
     world_serialization::WorldInstanceReady,
 };
 
@@ -42,6 +43,8 @@ pub struct Controls {
     pub run: bool,
     pub jump: bool,
     pub reset: bool,
+    /// Set when the mouse turned the view since the last physics step.
+    pub turned: bool,
 }
 
 #[derive(Component, Default)]
@@ -167,6 +170,7 @@ pub fn read_controls(
     mouse: Res<ButtonInput<MouseButton>>,
     delta: Res<AccumulatedMouseMotion>,
     mut controls: ResMut<Controls>,
+    cursor: Option<Single<&CursorOptions, With<PrimaryWindow>>>,
     camera: Option<Single<&mut HikerCamera>>,
 ) {
     let axis =
@@ -178,11 +182,34 @@ pub fn read_controls(
     controls.run = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     controls.jump |= keys.just_pressed(KeyCode::Space);
     controls.reset |= keys.just_pressed(KeyCode::KeyR);
-    if mouse.pressed(MouseButton::Right)
+    // With the cursor captured, the mouse always steers the view. Otherwise
+    // a right drag does.
+    let captured = cursor.is_some_and(|cursor| cursor.grab_mode != CursorGrabMode::None);
+    if (captured || mouse.pressed(MouseButton::Right))
+        && delta.delta != Vec2::ZERO
         && let Some(mut camera) = camera
     {
-        camera.yaw = (camera.yaw - delta.delta.x * 0.0035).rem_euclid(std::f32::consts::TAU);
-        camera.pitch = (camera.pitch - delta.delta.y * 0.0035).clamp(-0.36, 0.77);
+        camera.yaw = (camera.yaw - delta.delta.x * 0.0028).rem_euclid(std::f32::consts::TAU);
+        camera.pitch = (camera.pitch - delta.delta.y * 0.0028).clamp(-0.36, 0.77);
+        controls.turned = true;
+    }
+}
+
+/// A click captures the cursor for mouse look, and Escape releases it.
+pub fn capture_cursor(
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    cursor: Option<Single<&mut CursorOptions, With<PrimaryWindow>>>,
+) {
+    let Some(mut cursor) = cursor else {
+        return;
+    };
+    if mouse.just_pressed(MouseButton::Left) {
+        cursor.grab_mode = CursorGrabMode::Locked;
+        cursor.visible = false;
+    } else if keys.just_pressed(KeyCode::Escape) {
+        cursor.grab_mode = CursorGrabMode::None;
+        cursor.visible = true;
     }
 }
 
@@ -253,14 +280,13 @@ pub fn move_hiker(
         }
     }
 
-    let heading = if body.velocity.length_squared() > 0.15 {
-        body.velocity
-    } else {
-        desired
-    };
-    if heading.length_squared() > 0.15 {
-        let target = Quat::from_rotation_y(heading.x.atan2(heading.y));
-        transform.rotation = transform.rotation.slerp(target, 1.0 - (-11.0 * dt).exp());
+    // The hiker faces where the camera looks while walking or turning the
+    // view, and strafes with A and D. Standing still keeps the last facing.
+    let turned = std::mem::take(&mut controls.turned);
+    if relative != Vec2::ZERO || turned {
+        let forward = (basis * Vec3::NEG_Z).xz();
+        let target = Quat::from_rotation_y(forward.x.atan2(forward.y));
+        transform.rotation = transform.rotation.slerp(target, 1.0 - (-14.0 * dt).exp());
     }
 }
 

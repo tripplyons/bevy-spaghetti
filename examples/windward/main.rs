@@ -24,7 +24,7 @@ use bevy::{
     camera::{Hdr, visibility::RenderLayers},
     light::{GeneratedEnvironmentMapLight, Skybox},
     prelude::*,
-    window::WindowResolution,
+    window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
 use bevy_spaghetti::SpaghettiPlugin;
 
@@ -38,6 +38,12 @@ fn main() {
         primary_window: Some(Window {
             title: "Windward | Wetland trail".into(),
             resolution: WindowResolution::new(1280, 800),
+            ..default()
+        }),
+        // Start with the cursor captured for mouse look.
+        primary_cursor_options: Some(CursorOptions {
+            grab_mode: CursorGrabMode::Locked,
+            visible: false,
             ..default()
         }),
         ..default()
@@ -87,7 +93,12 @@ fn add_scene(app: &mut App) {
         )
             .chain(),
     )
-    .add_systems(PreUpdate, read_controls.after(bevy::input::InputSystems))
+    .add_systems(
+        PreUpdate,
+        (player::capture_cursor, read_controls)
+            .chain()
+            .after(bevy::input::InputSystems),
+    )
     .add_systems(FixedUpdate, (move_hiker, step_reeds).chain())
     .add_systems(
         Update,
@@ -186,7 +197,7 @@ fn spawn_hud(mut commands: Commands) {
                     BackgroundColor(Color::srgba(0.02, 0.025, 0.035, 0.68)),
                 ))
                 .with_child((
-                    Text::new("WASD  Move    ·    Shift  Run    ·    Space  Jump    ·    Right drag  Look    ·    R  Reset"),
+                    Text::new("WASD  Move    ·    Shift  Run    ·    Space  Jump    ·    Mouse  Look    ·    Esc  Free cursor    ·    R  Reset"),
                     TextFont::from_font_size(13.0),
                     TextColor(Color::srgb(0.94, 0.94, 0.93)),
                 ));
