@@ -69,6 +69,10 @@ Add `SpaghettiDetailScale` to let entities share one multilevel asset while usin
 
 With `SpaghettiLighting`, add `SpaghettiGroundAmbient` to set a separate linear RGB multiplier for ground bounce. Upward-facing splats receive the sky color from `SpaghettiLighting::ambient`, and side-facing splats receive a blend of sky and ground light.
 
+Add `SpaghettiSpecular` to a lit cloud for a view-dependent highlight. Its `strand` field blends between a highlight off each segment's surface normal, for wet stone, and one off the segment's axis, for hair, needles and blades.
+
+Add `SpaghettiAdditive` to a translucent cloud to add its light to the frame, for flames, sparks and sunlit dust. Update `SpaghettiFlow` to move each segment along a looping path with its own start time, a smooth wander, growth and a fade at both ends. Flow animates smoke, mist, fire and drifting particles on the GPU with no asset upload.
+
 ## Convert a model
 
 The converter accepts static glTF 2.0 and GLB. Keep external buffers and textures next to the source glTF at their referenced paths.

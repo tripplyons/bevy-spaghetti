@@ -133,6 +133,76 @@ pub struct SpaghettiWind {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct SpaghettiSway(pub Vec3);
 
+/// Adds a view-dependent highlight to a cloud with [`SpaghettiLighting`].
+///
+/// The highlight uses the lighting's direction and `directional` color, and
+/// baked occlusion and received shadows dim it. Each segment gets one
+/// highlight value, so dense clouds glint splat by splat.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SpaghettiSpecular {
+    /// Peak highlight as a multiple of [`SpaghettiLighting::directional`].
+    pub strength: f32,
+    /// Phong exponent. Higher values give a tighter highlight.
+    pub shininess: f32,
+    /// Zero reflects light off each segment's surface normal, as wet stone
+    /// does. One reflects it off the segment's axis, as hair, needles and
+    /// thin blades do. Values between blend the two.
+    pub strand: f32,
+}
+
+/// Adds a translucent cloud's light to the frame instead of covering it.
+///
+/// Use it for flames, sparks, sunlit dust and other glowing media. Draw order
+/// has no effect on the result, and distance fog only dims the cloud. This
+/// component has no effect on a [`SpaghettiCutout`] cloud.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct SpaghettiAdditive;
+
+/// Moves each segment of a translucent cloud along a looping path.
+///
+/// A segment starts each loop at its authored place and travels
+/// `velocity * period`. Each segment starts its loop at its own random time,
+/// so the cloud flows without a visible restart. Update `time` to animate the
+/// cloud without changing its asset. This component has no effect on a
+/// [`SpaghettiCutout`] cloud, and a non-positive `period` turns it off.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SpaghettiFlow {
+    /// Time in seconds.
+    pub time: f32,
+    /// World-space travel per second.
+    pub velocity: Vec3,
+    /// Length of one loop in seconds.
+    pub period: f32,
+    /// World-space reach of each segment's smooth random wander.
+    pub turbulence: f32,
+    /// Growth of the distance from the flow axis over one loop. The axis
+    /// passes through the cloud's origin along `velocity`. Negative values
+    /// draw segments toward the axis, as a flame narrows to its tip.
+    pub spread: f32,
+    /// Growth of each segment's kernel over one loop. A grown kernel keeps
+    /// its optical mass, so it thins out as smoke does.
+    pub growth: f32,
+    /// Depth of each segment's random brightness pulsing, from 0 to 1.
+    pub flicker: f32,
+    /// Fractions of the loop spent fading in and fading out.
+    pub fade: [f32; 2],
+}
+
+impl Default for SpaghettiFlow {
+    fn default() -> Self {
+        Self {
+            time: 0.0,
+            velocity: Vec3::ZERO,
+            period: 1.0,
+            turbulence: 0.0,
+            spread: 0.0,
+            growth: 0.0,
+            flicker: 0.0,
+            fade: [0.1, 0.3],
+        }
+    }
+}
+
 /// Registers the `.spag` asset loader and the Bevy 3D render pipeline.
 ///
 /// Add this after the plugins that provide Bevy's asset server and 3D renderer.
@@ -210,6 +280,9 @@ pub struct ExtractedCloud {
     range: Option<VisibilityRange>,
     near_fade: Option<SpaghettiNearFade>,
     detail_scale: f32,
+    specular: Option<SpaghettiSpecular>,
+    additive: bool,
+    flow: Option<SpaghettiFlow>,
 }
 
 impl SyncComponent<RenderApp> for Spaghetti3d {
@@ -231,8 +304,13 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
         Option<&'static SpaghettiWind>,
         Option<&'static SpaghettiSway>,
         Option<&'static VisibilityRange>,
-        Option<&'static SpaghettiNearFade>,
-        Option<&'static SpaghettiDetailScale>,
+        (
+            Option<&'static SpaghettiNearFade>,
+            Option<&'static SpaghettiDetailScale>,
+            Option<&'static SpaghettiSpecular>,
+            Has<SpaghettiAdditive>,
+            Option<&'static SpaghettiFlow>,
+        ),
     );
     type QueryFilter = ();
     type Out = ExtractedCloud;
@@ -252,8 +330,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             wind,
             sway,
             range,
-            near_fade,
-            detail_scale,
+            (near_fade, detail_scale, specular, additive, flow),
         ): QueryItem<'_, '_, Self::QueryData>,
     ) -> Option<Self::Out> {
         visibility.get().then(|| ExtractedCloud {
@@ -274,6 +351,17 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
                 .map(|scale| scale.0)
                 .filter(|scale| scale.is_finite() && *scale > 0.0)
                 .unwrap_or(1.0),
+            specular: specular
+                .copied()
+                .filter(|specular| specular.strength > 0.0 && specular.shininess.is_finite()),
+            additive: additive && !cutout,
+            flow: flow.copied().filter(|flow| {
+                !cutout
+                    && flow.period > 0.0
+                    && flow.period.is_finite()
+                    && flow.time.is_finite()
+                    && flow.velocity.is_finite()
+            }),
         })
     }
 }
@@ -462,7 +550,22 @@ struct PipelineKey {
     cutout: bool,
     shadowed: bool,
     baked_occlusion: bool,
+    additive: bool,
 }
+
+// Adds premultiplied color and leaves the target's alpha unchanged.
+const ADDITIVE_BLENDING: BlendState = BlendState {
+    color: BlendComponent {
+        src_factor: BlendFactor::One,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    },
+    alpha: BlendComponent {
+        src_factor: BlendFactor::Zero,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    },
+};
 
 impl SpecializedRenderPipeline for SplatPipeline {
     type Key = PipelineKey;
@@ -485,7 +588,11 @@ impl SpecializedRenderPipeline for SplatPipeline {
                 entry_point: Some(if key.cutout { "cutout_fragment" } else { "fragment" }.into()),
                 targets: vec![Some(ColorTargetState {
                     format: key.target,
-                    blend: (!key.cutout).then_some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    blend: (!key.cutout).then_some(if key.additive {
+                        ADDITIVE_BLENDING
+                    } else {
+                        BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
                 ..default()
@@ -633,6 +740,15 @@ struct DrawUniform {
     detail_depths: [[f32; 4]; MAX_DETAIL_TRANSITIONS],
     // Exclusive finer-level end indices, followed by active transition count.
     detail_ends: [u32; 4],
+    eye_world: [f32; 4],
+    // Specular strength, exponent, strand fraction, additive flag.
+    material: [f32; 4],
+    // Local travel over one loop, then elapsed loops.
+    flow_span: [f32; 4],
+    // Local turbulence reach, flicker depth, spread, growth.
+    flow_shape: [f32; 4],
+    // Fade-in and fade-out fractions, time, enabled flag.
+    flow_fade: [f32; 4],
 }
 
 impl DrawUniform {
@@ -728,7 +844,8 @@ fn queue_clouds(
         } else {
             view.clip_from_world.unwrap_or(projection * view_from_world)
         };
-        let mut pipeline_ids = [None; 8];
+        let mut pipeline_ids = [None; 16];
+        let eye_world = view.world_from_view.translation();
         let mut view_shadows = None;
 
         for (entity, main_entity, cloud) in &clouds {
@@ -761,7 +878,7 @@ fn queue_clouds(
             if coverage <= 0.0 || (cloud.cutout && cutout_phase.is_none()) {
                 continue;
             }
-            let inverse_basis = (cloud.sway.is_some() || cloud.wind.is_some())
+            let inverse_basis = (cloud.sway.is_some() || cloud.wind.is_some() || cloud.flow.is_some())
                 .then(|| Mat3::from_mat4(cloud.world_from_local).inverse())
                 .filter(|inverse| inverse.is_finite());
             let sway = cloud
@@ -778,6 +895,16 @@ fn queue_clouds(
                 // Maximum displacement combines horizontal reach and vertical shortening.
                 bounds.half_extents += Vec3A::from(stretch * (gpu.max_bend_height * 1.11));
             }
+            // Local travel per loop and local turbulence reach.
+            let flow = cloud.flow.zip(inverse_basis).map(|(flow, inverse)| {
+                let rows = inverse.transpose();
+                let stretch = Vec3::new(rows.x_axis.length(), rows.y_axis.length(), rows.z_axis.length());
+                let span = inverse * (flow.velocity * flow.period);
+                let reach = stretch * flow.turbulence.abs();
+                let spread = Vec3::from(bounds.half_extents + bounds.center.abs()) * flow.spread.abs();
+                bounds.half_extents += Vec3A::from(span.abs() + reach + spread);
+                (flow, span, reach.max_element())
+            });
             if !cloud.disable_culling
                 && frustum.is_some_and(|frustum| {
                     !frustum.intersects_obb(
@@ -795,8 +922,17 @@ fn queue_clouds(
                 clip_from_local: clip_from_local.to_cols_array_2d(),
                 viewport: [size.x as f32, size.y as f32, 0.0, 0.0],
                 motion: [0.0, 0.0, coverage, reverse_dither],
+                world_from_local: cloud.world_from_local.to_cols_array_2d(),
+                eye_world: eye_world.extend(0.0).to_array(),
                 ..DrawUniform::zeroed()
             };
+            uniform.material[3] = f32::from(u8::from(cloud.additive));
+            if let Some((flow, span, reach)) = flow {
+                uniform.flow_span = span.extend(flow.time / flow.period).to_array();
+                uniform.flow_shape = [reach, flow.flicker.clamp(0.0, 1.0), flow.spread, flow.growth];
+                let [fade_in, fade_out] = flow.fade.map(|fade| fade.clamp(0.0, 1.0));
+                uniform.flow_fade = [fade_in, fade_out, flow.time, 1.0];
+            }
             if let Some(fade) = cloud.near_fade.filter(|fade| fade.end > fade.start) {
                 uniform.viewport[2] = fade.start;
                 uniform.viewport[3] = fade.end;
@@ -805,7 +941,6 @@ fn queue_clouds(
                 uniform.motion[1] = 2.0;
                 uniform.pusher = sway.extend(0.0).to_array();
             } else if let (Some(wind), Some(inverse)) = (cloud.wind, inverse_basis) {
-                uniform.world_from_local = cloud.world_from_local.to_cols_array_2d();
                 uniform.local_from_world = [inverse.x_axis, inverse.y_axis, inverse.z_axis]
                     .map(|axis| axis.extend(0.0).to_array());
                 if wind.push_radius > 0.0 {
@@ -828,6 +963,11 @@ fn queue_clouds(
             if let Some(lighting) = cloud.lighting {
                 uniform.set_lighting(lighting, cloud.world_from_local);
                 uniform.ambient[3] = cloud.transmission;
+                if let Some(specular) = cloud.specular {
+                    uniform.material[0] = specular.strength;
+                    uniform.material[1] = specular.shininess.max(1.0);
+                    uniform.material[2] = specular.strand.clamp(0.0, 1.0);
+                }
                 if let Some(ground) = cloud.ground_ambient {
                     uniform.ground_ambient_delta =
                         (ground.0 - lighting.ambient).extend(0.0).to_array();
@@ -851,7 +991,6 @@ fn queue_clouds(
                     {
                         shadows = binding;
                         shadowed = true;
-                        uniform.world_from_local = cloud.world_from_local.to_cols_array_2d();
                     }
                 }
             }
@@ -918,7 +1057,8 @@ fn queue_clouds(
             let baked_occlusion = gpu.occlusion.is_some() && cloud.lighting.is_some();
             let variant = usize::from(cloud.cutout)
                 + 2 * usize::from(shadowed)
-                + 4 * usize::from(baked_occlusion);
+                + 4 * usize::from(baked_occlusion)
+                + 8 * usize::from(cloud.additive);
             let pipeline_id = *pipeline_ids[variant].get_or_insert_with(|| {
                 pipelines.specialize(
                     &cache,
@@ -929,6 +1069,7 @@ fn queue_clouds(
                         cutout: cloud.cutout,
                         shadowed,
                         baked_occlusion,
+                        additive: cloud.additive,
                     },
                 )
             });

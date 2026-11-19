@@ -17,9 +17,9 @@ use bevy::{
     winit::WinitPlugin,
 };
 use bevy_spaghetti::{
-    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
-    SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting, SpaghettiPlugin,
-    SpaghettiSway,
+    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAdditive, SpaghettiAsset,
+    SpaghettiCutout, SpaghettiDetailScale, SpaghettiFlow, SpaghettiGroundAmbient,
+    SpaghettiLighting, SpaghettiPlugin, SpaghettiSpecular, SpaghettiSway,
 };
 
 const SIZE: usize = 128;
@@ -28,6 +28,7 @@ const SIZE: usize = 128;
 struct Samples {
     strand: Option<[[u8; 4]; 16]>,
     bust: Option<usize>,
+    effects: Option<[[u8; 4]; 6]>,
 }
 
 #[derive(Component)]
@@ -66,7 +67,27 @@ fn renders_strands_and_bundled_asset_offscreen() {
     while Instant::now() < deadline {
         app.update();
         let samples = app.world().resource::<Samples>();
-        if let (Some(pixels), Some(bust)) = (samples.strand, samples.bust) {
+        if let (Some(pixels), Some(bust), Some(effects)) =
+            (samples.strand, samples.bust, samples.effects)
+        {
+            let [added, covered, glint, matte, flow_start, flow_middle] = effects;
+            println!("effects: {effects:?}");
+            assert!(
+                added[0] > 200 && added[1] > 240,
+                "additive splat did not keep the color behind it"
+            );
+            assert!(
+                covered[0] > 200 && covered[1] < 60,
+                "blended splat did not cover the color behind it"
+            );
+            assert!(
+                glint[0] > 120 && matte[0] < 20,
+                "highlight did not follow the segment normals"
+            );
+            assert!(
+                flow_middle[0] > 200 && flow_start[0] < 20,
+                "flow did not carry the splat half of its loop"
+            );
             let [
                 left,
                 joint,
@@ -312,6 +333,13 @@ fn setup(
         })),
         Transform::from_xyz(0.5, 0.0, 0.5),
     ));
+    spawn_effects(
+        &mut commands,
+        &mut images,
+        &mut splats,
+        &mut meshes,
+        &mut materials,
+    );
     let strand_target = target(&mut images);
     commands.spawn((
         Camera3d::default(),
@@ -390,6 +418,115 @@ fn setup(
                 .count();
             if colored > 100 {
                 samples.bust = Some(colored);
+            }
+        },
+    );
+}
+
+/// Spawns the additive, highlight and flow cases on render layer 2.
+/// The camera maps one unit to 32 pixels around pixel (64, 64).
+fn spawn_effects(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    splats: &mut Assets<SpaghettiAsset>,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let layer = RenderLayers::layer(2);
+    let point = |at: Vec3, rotation, color| {
+        GaussianSegment::new(at, at, Vec3::splat(0.08), rotation, 0.3, color)
+    };
+    let mut cloud = |segments| Spaghetti3d(splats.add(SpaghettiAsset::new(segments).unwrap()));
+    let green = materials.add(StandardMaterial {
+        base_color: Color::linear_rgb(0.0, 1.0, 0.0),
+        unlit: true,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(1.7, 0.6, 0.1))),
+        MeshMaterial3d(green),
+        Transform::from_xyz(-0.5, 1.0, -0.5),
+        layer.clone(),
+    ));
+    commands.spawn((
+        cloud(vec![point(Vec3::new(-1.0, 1.0, 0.0), Quat::IDENTITY, Vec3::X)]),
+        SpaghettiAdditive,
+        layer.clone(),
+    ));
+    commands.spawn((
+        cloud(vec![point(Vec3::new(0.0, 1.0, 0.0), Quat::IDENTITY, Vec3::X)]),
+        layer.clone(),
+    ));
+    // Black splats show only the highlight. One faces the light and the eye,
+    // and the other is edge-on to both.
+    commands.spawn((
+        cloud(vec![
+            point(Vec3::new(1.0, 1.0, 0.0), Quat::IDENTITY, Vec3::ZERO),
+            point(
+                Vec3::new(1.6, 1.0, 0.0),
+                Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                Vec3::ZERO,
+            ),
+        ]),
+        SpaghettiLighting {
+            direction_to_light: Vec3::Z,
+            ambient: Vec3::ZERO,
+            directional: Vec3::X,
+        },
+        SpaghettiSpecular {
+            strength: 1.0,
+            shininess: 20.0,
+            strand: 0.0,
+        },
+        layer.clone(),
+    ));
+    // The shader gives segment 0 this start time within the loop.
+    let state = 2_891_336_453_u32;
+    let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277_803_737);
+    let start = (((word >> 22) ^ word) >> 8) as f32 / 16_777_216.0;
+    let period = 2.0;
+    commands.spawn((
+        cloud(vec![point(Vec3::new(-1.0, -1.0, 0.0), Quat::IDENTITY, Vec3::X)]),
+        SpaghettiFlow {
+            time: period * (1.5 - start),
+            velocity: Vec3::X,
+            period,
+            fade: [0.0, 0.0],
+            ..default()
+        },
+        layer.clone(),
+    ));
+    let effects_target = target(images);
+    commands.spawn((
+        Camera3d::default(),
+        RenderTarget::Image(effects_target.clone().into()),
+        Projection::Orthographic(OrthographicProjection {
+            scaling_mode: ScalingMode::FixedVertical {
+                viewport_height: 4.0,
+            },
+            ..OrthographicProjection::default_3d()
+        }),
+        Transform::from_xyz(0.0, 0.0, 4.0),
+        Tonemapping::Linear,
+        Msaa::Off,
+        layer,
+    ));
+    commands.spawn(Readback::texture(effects_target)).observe(
+        |readback: On<ReadbackComplete>, mut samples: ResMut<Samples>| {
+            let pixel = |x, y| {
+                let offset: usize = (y * SIZE + x) * 4;
+                <[u8; 4]>::try_from(&readback.data[offset..offset + 4]).unwrap()
+            };
+            let pixels = [
+                pixel(32, 32),
+                pixel(64, 32),
+                pixel(96, 32),
+                pixel(115, 32),
+                pixel(32, 96),
+                pixel(64, 96),
+            ];
+            if pixels[0][1] > 200 && pixels[1][0] > 5 {
+                samples.effects = Some(pixels);
             }
         },
     );

@@ -38,6 +38,15 @@ struct View {
     motion: vec4<f32>,
     detail_depths: array<vec4<f32>, 3>,
     detail_ends: vec4<u32>,
+    eye_world: vec4<f32>,
+    // Specular strength, exponent, strand fraction, additive flag.
+    material: vec4<f32>,
+    // Local travel over one loop, then elapsed loops.
+    flow_span: vec4<f32>,
+    // Local turbulence reach, flicker depth, spread, growth.
+    flow_shape: vec4<f32>,
+    // Fade-in and fade-out fractions, time, enabled flag.
+    flow_fade: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -79,7 +88,39 @@ fn scene_shadow(midpoint: vec3<f32>, normal: vec3<f32>) -> f32 {
     return textureSampleCompareLevel(sun_depth, sun_compare, uv, sun_shadow.layers.x + cascade, ndc.z);
 }
 
-fn segment_light(index: u32, midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+// One highlight value for a segment. `normal` is its world-space surface
+// normal and `axis` is its local centerline, which may be zero for a point.
+fn segment_highlight(midpoint: vec3<f32>, normal: vec3<f32>, axis: vec3<f32>) -> f32 {
+    let world = (view.world_from_local * vec4(midpoint, 1.0)).xyz;
+    let to_eye = normalize(view.eye_world.xyz - world);
+    let to_light = view.direction_to_light.xyz;
+    let half_vector = normalize(to_light + to_eye);
+    // Splats are two-sided, so the face toward the eye reflects the light.
+    let toward = select(-normal, normal, dot(normal, to_eye) >= 0.0);
+    let surface = pow(max(dot(toward, half_vector), 0.0), view.material.y)
+        * smoothstep(0.0, 0.12, dot(toward, to_light));
+    if view.material.z <= 0.0 {
+        return surface;
+    }
+    let tangent = (view.world_from_local * vec4(axis, 0.0)).xyz;
+    let length_squared = dot(tangent, tangent);
+    if length_squared < 1e-12 {
+        return surface;
+    }
+    // Kajiya-Kay: a thin fiber reflects a cone of light around its axis.
+    let along = dot(tangent, half_vector) * inverseSqrt(length_squared);
+    let strand = pow(sqrt(max(1.0 - along * along, 0.0)), view.material.y)
+        * smoothstep(-0.5, 0.1, dot(normal, to_light));
+    return mix(surface, strand, view.material.z);
+}
+
+fn segment_light(
+    index: u32,
+    color: vec3<f32>,
+    midpoint: vec3<f32>,
+    normal: vec3<f32>,
+    axis: vec3<f32>,
+) -> vec3<f32> {
     var light = vec2(1.0);
     if BAKED_OCCLUSION {
         light = unpack2x16unorm(occlusion[index]);
@@ -87,12 +128,64 @@ fn segment_light(index: u32, midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32
     let facing = dot(normal, view.direction_to_light.xyz);
     // Thin foliage passes part of the light through from its back face.
     let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
-    if SCENE_SHADOWS && incident > 0.0 {
+    var highlight = 0.0;
+    if view.material.x > 0.0 {
+        highlight = view.material.x * segment_highlight(midpoint, normal, axis);
+    }
+    if SCENE_SHADOWS && (incident > 0.0 || highlight > 0.0) {
         light.y *= scene_shadow(midpoint, select(-normal, normal, facing >= 0.0));
     }
     let ground_weight = 0.5 - 0.5 * normal.y;
     let ambient = view.ambient.rgb + ground_weight * view.ground_ambient_delta.rgb;
-    return light.x * ambient + (incident * light.y) * view.directional.rgb;
+    return color * (light.x * ambient + (incident * light.y) * view.directional.rgb)
+        + (highlight * light.y) * view.directional.rgb;
+}
+
+// Three uniform random numbers per segment (PCG, then two LCG steps).
+fn segment_random(index: u32) -> vec3<f32> {
+    let state = index * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    let a = (word >> 22u) ^ word;
+    let b = a * 1664525u + 1013904223u;
+    let c = b * 1664525u + 1013904223u;
+    return vec3(f32(a >> 8u), f32(b >> 8u), f32(c >> 8u)) * (1.0 / 16777216.0);
+}
+
+struct Flow {
+    offset: vec3<f32>,
+    // Factors on optical mass and kernel size.
+    mass: f32,
+    size: f32,
+}
+
+// Each segment loops from its authored place along the flow span, with its
+// own start time, a smooth wander, and a fade at both ends of the loop.
+fn segment_flow(index: u32, center: vec3<f32>) -> Flow {
+    let random = segment_random(index);
+    let loops = view.flow_span.w;
+    let t = fract(loops + random.x);
+    let span = view.flow_span.xyz;
+    var radial = center;
+    let span_squared = dot(span, span);
+    if span_squared > 0.0 {
+        radial -= span * (dot(center, span) / span_squared);
+    }
+    let rate = 0.6 + random.yzx;
+    let wander = sin(6.2831853 * (loops * rate + random.zxy));
+    var flow: Flow;
+    flow.offset = span * t + radial * (view.flow_shape.z * t) + view.flow_shape.x * wander;
+    let fade = view.flow_fade.xy;
+    flow.mass = 1.0;
+    if fade.x > 0.0 {
+        flow.mass *= clamp(t / fade.x, 0.0, 1.0);
+    }
+    if fade.y > 0.0 {
+        flow.mass *= clamp((1.0 - t) / fade.y, 0.0, 1.0);
+    }
+    let pulse = 0.5 + 0.5 * sin(view.flow_fade.z * (9.0 + 13.0 * random.y) + 6.2831853 * random.z);
+    flow.mass *= 1.0 - view.flow_shape.y * pulse;
+    flow.size = max(1.0 + view.flow_shape.w * t, 0.05);
+    return flow;
 }
 
 struct Raster {
@@ -273,6 +366,15 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     let transform = view.clip_from_local;
     var local_start = splat.start_mass.xyz;
     var local_end = splat.end.xyz;
+    var mass = splat.start_mass.w;
+    var s = splat.sigma.xyz;
+    if view.flow_fade.w > 0.0 {
+        let flow = segment_flow(index, (local_start + local_end) * 0.5);
+        local_start += flow.offset;
+        local_end += flow.offset;
+        mass *= flow.mass;
+        s *= flow.size;
+    }
     if view.motion.y > 0.0 {
         let height = blade_profile(splat.color.w).x;
         local_start = bend_endpoint(local_start, splat.end.w, height);
@@ -287,7 +389,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     let span = clip_interval(near, start.z, end.z);
     let a = mix(start, end, span.x);
     let b = mix(start, end, span.y);
-    if span.x >= span.y || min(a.w, b.w) <= 0.0 || splat.start_mass.w == 0.0 {
+    if span.x >= span.y || min(a.w, b.w) <= 0.0 || mass <= 0.0 {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
     }
@@ -307,7 +409,6 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
 
     // Each projected principal axis contributes an outer product to J Σ Jᵀ.
     let q = splat.rotation;
-    let s = splat.sigma.xyz;
     let axis_x = rotate(q, vec3(s.x, 0.0, 0.0));
     let axis_y = rotate(q, vec3(0.0, s.y, 0.0));
     let axis_z = rotate(q, vec3(0.0, 0.0, s.z));
@@ -355,16 +456,23 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     out.color_mass = vec4(0.0);
     if vertex_index == 1u {
         let area_scale = length(cross(j0, j1));
-        let peak = (splat.start_mass.w * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
+        let peak = (mass * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
         var color = splat.color.rgb;
         if view.direction_to_light.w > 0.0 {
             let normal = view.normal_from_local * rotate(q, vec3(0.0, 0.0, 1.0));
             let unit = normal * inverseSqrt(max(1e-10, dot(normal, normal)));
-            color *= segment_light(index, (local_start + local_end) * 0.5, unit);
+            color = segment_light(index, color, (local_start + local_end) * 0.5, unit, local_end - local_start);
         }
         if view.fog.mode != 0u {
             let local_midpoint = mix(local_start, local_end, (span.x + span.y) * 0.5);
-            color = apply_distance_fog(color, local_midpoint);
+            let fogged = apply_distance_fog(color, local_midpoint);
+            if view.material.w > 0.0 {
+                // Added light has no surface for the haze to cover, so the
+                // fog only dims it.
+                color = max(fogged - apply_distance_fog(vec3(0.0), local_midpoint), vec3(0.0));
+            } else {
+                color = fogged;
+            }
         }
         // The fragment stage premultiplies the fogged color by optical alpha.
         out.color_mass = vec4(color, peak * near_fade(midpoint.w));
@@ -524,7 +632,7 @@ fn cutout_vertex(
         if view.direction_to_light.w > 0.0 {
             let normal = rotate(q, vec3(0.0, 0.0, 1.0));
             let unit = normalize(view.normal_from_local * normal);
-            color *= segment_light(instance, (local_a + local_b) * 0.5, unit);
+            color = segment_light(instance, color, (local_a + local_b) * 0.5, unit, local_b - local_a);
         }
         if view.fog.mode != 0u {
             color = apply_distance_fog(color, (local_a + local_b) * 0.5);
