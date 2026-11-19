@@ -145,7 +145,25 @@ fn full_scene_renders_in_background() {
         (landed.y - ground(landed.xz())).abs() < 1e-5,
         "hiker did not land"
     );
-    if app.world().contains_resource::<ReviewFrames>() {
+    if let Some(poses) = std::env::var("WINDWARD_REVIEW_POSES")
+        .ok()
+        .filter(|_| app.world().contains_resource::<ReviewFrames>())
+    {
+        // Extra views for one-off checks, as `name:x,z,yaw,pitch` entries
+        // separated by semicolons. They replace the standard set.
+        for pose in poses.split(';').filter(|pose| !pose.is_empty()) {
+            let (name, numbers) = pose.split_once(':').expect("pose needs a name");
+            let numbers: Vec<f32> = numbers
+                .split(',')
+                .map(|number| number.trim().parse().expect("pose needs numbers"))
+                .collect();
+            let [x, z, yaw, pitch] = numbers[..] else {
+                panic!("pose needs x, z, yaw and pitch");
+            };
+            pose_review_camera(&mut app, Vec2::new(x, z), yaw, pitch);
+            save_review_frame(app.world(), &format!("{name}.png"));
+        }
+    } else if app.world().contains_resource::<ReviewFrames>() {
         pose_review_camera(&mut app, Vec2::new(-0.6, -7.0), -0.78, 0.10);
         save_review_frame(app.world(), "lakeshore.png");
         pose_review_camera(&mut app, Vec2::new(-5.7, -29.0), 0.18, 0.11);

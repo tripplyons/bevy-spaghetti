@@ -449,12 +449,20 @@ fn spawn_effects(
         layer.clone(),
     ));
     commands.spawn((
-        cloud(vec![point(Vec3::new(-1.0, 1.0, 0.0), Quat::IDENTITY, Vec3::X)]),
+        cloud(vec![point(
+            Vec3::new(-1.0, 1.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::X,
+        )]),
         SpaghettiAdditive,
         layer.clone(),
     ));
     commands.spawn((
-        cloud(vec![point(Vec3::new(0.0, 1.0, 0.0), Quat::IDENTITY, Vec3::X)]),
+        cloud(vec![point(
+            Vec3::new(0.0, 1.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::X,
+        )]),
         layer.clone(),
     ));
     // Black splats show only the highlight. One faces the light and the eye,
@@ -486,7 +494,11 @@ fn spawn_effects(
     let start = (((word >> 22) ^ word) >> 8) as f32 / 16_777_216.0;
     let period = 2.0;
     commands.spawn((
-        cloud(vec![point(Vec3::new(-1.0, -1.0, 0.0), Quat::IDENTITY, Vec3::X)]),
+        cloud(vec![point(
+            Vec3::new(-1.0, -1.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::X,
+        )]),
         SpaghettiFlow {
             time: period * (1.5 - start),
             velocity: Vec3::X,

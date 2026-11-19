@@ -126,7 +126,7 @@ impl Rng {
 
 /// Where grass may root: zero on the trail, in the lake, under stones, and
 /// in the needle litter under the conifer crowns.
-fn ground_mask(at: Vec2) -> f32 {
+pub(super) fn ground_mask(at: Vec2) -> f32 {
     let height = ground(at);
     let shore = smoothstep(WATER_LEVEL + 0.03, WATER_LEVEL + 0.22, height);
     let path = (at.x - trail_x(at.y)).abs() + (noise(at * 0.85) - 0.5) * 0.36;
@@ -143,7 +143,7 @@ fn ground_mask(at: Vec2) -> f32 {
 }
 
 /// Lush patches grow tall tufts; elsewhere the turf stays short.
-fn lushness(at: Vec2) -> f32 {
+pub(super) fn lushness(at: Vec2) -> f32 {
     let patches = 0.62 * noise(at * 0.19 + Vec2::new(3.1, 7.7)) + 0.38 * noise(at * 0.71);
     smoothstep(0.22, 0.62, patches)
 }

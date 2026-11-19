@@ -6,6 +6,7 @@ mod conifer;
 mod debris;
 mod detail;
 mod fern;
+mod flowers;
 mod forest;
 mod hair;
 mod lake;
@@ -87,6 +88,7 @@ fn add_scene(app: &mut App) {
             // Props first, so the meadow leaves their footprints bare.
             props::spawn_props,
             meadow::spawn_meadow,
+            flowers::spawn_flowers,
             understory::spawn_understory,
             spawn_hiker,
             spawn_camera,
