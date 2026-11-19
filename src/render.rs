@@ -762,16 +762,16 @@ impl ExtractedPointLight {
 #[derive(Resource, Default)]
 struct PointLights(Vec<ExtractedPointLight>);
 
+type PointLightSource = (
+    &'static SpaghettiPointLight,
+    &'static GlobalTransform,
+    &'static InheritedVisibility,
+    Option<&'static RenderLayers>,
+);
+
 fn extract_point_lights(
     mut extracted: ResMut<PointLights>,
-    lights: Extract<
-        Query<(
-            &SpaghettiPointLight,
-            &GlobalTransform,
-            &InheritedVisibility,
-            Option<&RenderLayers>,
-        )>,
-    >,
+    lights: Extract<Query<PointLightSource>>,
 ) {
     extracted.0.clear();
     extracted.0.extend(
