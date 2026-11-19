@@ -5,6 +5,7 @@ mod backdrop;
 mod bark;
 mod camp;
 mod conifer;
+mod cutout;
 mod debris;
 mod detail;
 mod fern;
@@ -13,6 +14,7 @@ mod forest;
 mod hair;
 mod lake;
 mod landscape;
+mod litter;
 mod meadow;
 mod player;
 mod props;
@@ -90,6 +92,7 @@ fn add_scene(app: &mut App) {
             // Props first, so the meadow leaves their footprints bare.
             props::spawn_props,
             camp::spawn_camp,
+            litter::spawn_litter,
             air::spawn_air,
             meadow::spawn_meadow,
             flowers::spawn_flowers,

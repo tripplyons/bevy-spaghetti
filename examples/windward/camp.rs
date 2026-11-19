@@ -16,6 +16,7 @@ use bevy_spaghetti::{
 };
 
 use crate::{
+    cutout::{disc, strap},
     flowers::Rng,
     forest::ForestDetail,
     landscape::{Obstacles, ROCKS, SUN, ground, shore_distance, trail_x},
@@ -288,42 +289,6 @@ fn spawn_ring(commands: &mut Commands, server: &AssetServer, site: Vec2, rng: &m
             (80.0, 30.0),
         );
     }
-}
-
-/// A flat strap from `a` to `b` that faces `face` and is `width` wide.
-fn strap(out: &mut Vec<GaussianSegment>, a: Vec3, b: Vec3, face: Vec3, width: f32, color: Vec3) {
-    let length = a.distance(b);
-    if length < 1e-5 {
-        return;
-    }
-    let tangent = (b - a) / length;
-    let normal = (face - tangent * face.dot(tangent))
-        .try_normalize()
-        .unwrap_or_else(|| tangent.any_orthonormal_vector());
-    // The cutout edge sits about 1.5 standard deviations from the axis.
-    let sigma = width / 3.05;
-    let extent = Vec3::new(sigma, sigma * 0.5, sigma * 0.3);
-    out.push(GaussianSegment::new(
-        a,
-        b,
-        extent,
-        Quat::from_mat3(&Mat3::from_cols(tangent.cross(normal), tangent, normal)),
-        8.0 * sigma * length.max(2.5066 * extent.y),
-        color,
-    ));
-}
-
-/// A round disc of visible radius `radius` that faces `face`.
-fn disc(out: &mut Vec<GaussianSegment>, at: Vec3, face: Vec3, radius: f32, color: Vec3) {
-    let sigma = radius / 1.52;
-    out.push(GaussianSegment::new(
-        at,
-        at,
-        Vec3::new(sigma, sigma, sigma * 0.4),
-        Quat::from_rotation_arc(Vec3::Z, face.normalize_or(Vec3::Y)),
-        sigma * sigma * 21.0,
-        color,
-    ));
 }
 
 const CHAR: Vec3 = Vec3::new(0.014, 0.013, 0.013);

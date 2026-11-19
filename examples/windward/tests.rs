@@ -150,16 +150,25 @@ fn full_scene_renders_in_background() {
         .filter(|_| app.world().contains_resource::<ReviewFrames>())
     {
         // Extra views for one-off checks, as `name:x,z,yaw,pitch` entries
-        // separated by semicolons. They replace the standard set.
+        // separated by semicolons. They replace the standard set. A fifth
+        // number sets the field of view in degrees, to look closer.
         for pose in poses.split(';').filter(|pose| !pose.is_empty()) {
             let (name, numbers) = pose.split_once(':').expect("pose needs a name");
             let numbers: Vec<f32> = numbers
                 .split(',')
                 .map(|number| number.trim().parse().expect("pose needs numbers"))
                 .collect();
-            let [x, z, yaw, pitch] = numbers[..] else {
-                panic!("pose needs x, z, yaw and pitch");
+            let (x, z, yaw, pitch, fov) = match numbers[..] {
+                [x, z, yaw, pitch] => (x, z, yaw, pitch, 54.0),
+                [x, z, yaw, pitch, fov] => (x, z, yaw, pitch, fov),
+                _ => panic!("pose needs x, z, yaw, pitch and an optional field of view"),
             };
+            let mut lens = app
+                .world_mut()
+                .query_filtered::<&mut Projection, With<HikerCamera>>();
+            if let Projection::Perspective(lens) = &mut *lens.single_mut(app.world_mut()).unwrap() {
+                lens.fov = fov.to_radians();
+            }
             pose_review_camera(&mut app, Vec2::new(x, z), yaw, pitch);
             save_review_frame(app.world(), &format!("{name}.png"));
         }
