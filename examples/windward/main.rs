@@ -1,7 +1,9 @@
 //! Explore a windswept wetland. Run with `cargo run --example windward`.
+mod air;
 mod atmosphere;
 mod backdrop;
 mod bark;
+mod camp;
 mod conifer;
 mod debris;
 mod detail;
@@ -87,6 +89,8 @@ fn add_scene(app: &mut App) {
             spawn_reeds,
             // Props first, so the meadow leaves their footprints bare.
             props::spawn_props,
+            camp::spawn_camp,
+            air::spawn_air,
             meadow::spawn_meadow,
             flowers::spawn_flowers,
             understory::spawn_understory,
@@ -120,6 +124,7 @@ fn add_scene(app: &mut App) {
             props::select_prop_detail.after(follow_hiker),
             bark::select_detail.after(follow_hiker),
             meadow::part_meadow,
+            air::advance_flows,
             stone_grade::grade_stones,
         ),
     );

@@ -61,7 +61,7 @@ const STONES: [(&str, Vec3); 4] = [
 ];
 
 /// The conifer gains, so props sit in the same light as the stands.
-const LIGHTING: SpaghettiLighting = SpaghettiLighting {
+pub const LIGHTING: SpaghettiLighting = SpaghettiLighting {
     direction_to_light: SUN,
     ambient: Vec3::new(0.24, 0.27, 0.29),
     directional: Vec3::new(0.62, 0.52, 0.40),
@@ -77,7 +77,7 @@ const CORE_RANGE: VisibilityRange = VisibilityRange {
     end_margin: 24.0..30.0,
     use_aabb: false,
 };
-const CONTACT_RANGE: VisibilityRange = VisibilityRange {
+pub const CONTACT_RANGE: VisibilityRange = VisibilityRange {
     start_margin: 0.0..0.0,
     end_margin: 34.0..42.0,
     use_aabb: false,
@@ -217,7 +217,7 @@ pub fn spawn_props(
 }
 
 /// Builds a disc that follows the terrain and darkens it toward the center.
-fn contact_shadow(at: Vec2, inner: f32, outer: f32, darkness: f32, seed: u32) -> Mesh {
+pub fn contact_shadow(at: Vec2, inner: f32, outer: f32, darkness: f32, seed: u32) -> Mesh {
     const SIDES: usize = 28;
     // Radii as fractions from inner to outer, and their opacity.
     const RINGS: [(f32, f32); 4] = [(0.0, 1.0), (0.35, 0.72), (0.7, 0.28), (1.0, 0.0)];
@@ -343,14 +343,11 @@ fn spawn_stumps(
     placed
 }
 
-fn spawn_stones(
-    commands: &mut Commands,
-    server: &AssetServer,
-    obstacles: &mut Obstacles,
-    clearance: &mut Clearance,
-) -> Vec<(Vec2, f32)> {
-    let mut contacts = Vec::new();
-    let kinds = STONES.map(|(name, size)| {
+/// The splat levels, the scan, and the scan's size for one kind of stone.
+pub type StoneKind = ([Handle<SpaghettiAsset>; 3], Handle<WorldAsset>, Vec3);
+
+pub fn stone_kinds(server: &AssetServer) -> [StoneKind; 4] {
+    STONES.map(|(name, size)| {
         let clouds = [
             format!("windward/stone-{name}.spag"),
             format!("windward/stone-{name}-mid.spag"),
@@ -361,7 +358,17 @@ fn spawn_stones(
             GltfAssetLabel::Scene(0).from_asset(format!("windward/stones/stone_{name}.gltf")),
         );
         (clouds, shadow, size)
-    });
+    })
+}
+
+fn spawn_stones(
+    commands: &mut Commands,
+    server: &AssetServer,
+    obstacles: &mut Obstacles,
+    clearance: &mut Clearance,
+) -> Vec<(Vec2, f32)> {
+    let mut contacts = Vec::new();
+    let kinds = stone_kinds(server);
     for seed in 1..=900u32 {
         if contacts.len() >= 34 {
             break;
@@ -417,7 +424,7 @@ fn spawn_stones(
     contacts
 }
 
-fn spawn_prop(
+pub fn spawn_prop(
     commands: &mut Commands,
     name: &'static str,
     transform: Transform,
@@ -457,7 +464,7 @@ fn spawn_prop(
 }
 
 /// Returns the lowest ground under a round footprint, so no edge floats.
-fn footprint_floor(at: Vec2, reach: f32) -> f32 {
+pub fn footprint_floor(at: Vec2, reach: f32) -> f32 {
     (0..8)
         .map(|i| at + Vec2::from_angle(i as f32 * TAU / 8.0) * reach)
         .chain([at])

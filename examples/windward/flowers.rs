@@ -30,28 +30,28 @@ const GOLDEN_ANGLE: f32 = 2.399_963;
 const STEM: Vec3 = Vec3::new(0.060, 0.105, 0.034);
 const LEAF: Vec3 = Vec3::new(0.052, 0.112, 0.036);
 
-struct Rng(u32);
+pub(super) struct Rng(u32);
 
 impl Rng {
-    fn new(seed: u32) -> Self {
+    pub(super) fn new(seed: u32) -> Self {
         Self(seed.wrapping_mul(0x9E37_79B9) | 1)
     }
 
-    fn next(&mut self) -> f32 {
+    pub(super) fn next(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
         self.0 ^= self.0 << 5;
         (self.0 >> 8) as f32 / 16_777_216.0
     }
 
-    fn range(&mut self, low: f32, high: f32) -> f32 {
+    pub(super) fn range(&mut self, low: f32, high: f32) -> f32 {
         low + (high - low) * self.next()
     }
 
     /// Starts a separate stream. A part that draws from its own stream uses
     /// one value of this one at every detail level, so the parts after it
     /// keep their shape as the level changes.
-    fn fork(&mut self) -> Rng {
+    pub(super) fn fork(&mut self) -> Rng {
         Rng::new((self.next() * 16_777_216.0) as u32)
     }
 }

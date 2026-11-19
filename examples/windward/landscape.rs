@@ -9,9 +9,7 @@ use bevy::{
     render::render_resource::AsBindGroup,
     shader::ShaderRef,
 };
-use bevy_spaghetti::{
-    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows,
-};
+use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows};
 
 use crate::{
     detail::{CameraView, ScreenDetail, load_lit_cloud},
@@ -242,7 +240,6 @@ pub fn spawn_landscape(
     mut meshes: ResMut<Assets<Mesh>>,
     mut ground_materials: ResMut<Assets<GroundMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut splats: ResMut<Assets<SpaghettiAsset>>,
 ) {
     commands.spawn((
         Name::new("Sun"),
@@ -299,8 +296,6 @@ pub fn spawn_landscape(
         MeshMaterial3d(terrain_material),
         reflected_layers(),
     ));
-
-    spawn_mist(&mut commands, &mut splats);
 
     let mut obstacles = Obstacles::default();
     spawn_rocks(&mut commands, &server, &mut materials, &mut obstacles);
@@ -388,32 +383,6 @@ fn repeating_sampler() -> ImageSampler {
         anisotropy_clamp: 8,
         ..ImageSamplerDescriptor::linear()
     })
-}
-
-fn spawn_mist(commands: &mut Commands, splats: &mut Assets<SpaghettiAsset>) {
-    let mut banks = Vec::new();
-    for i in 0..22 {
-        let seed = 610 + i * 9;
-        let z = -22.0 + 18.0 * hash01(seed);
-        let x = 7.5 + 5.6 * hash01(seed + 1);
-        let y = WATER_LEVEL + 0.36 + 0.38 * hash01(seed + 2);
-        let length = 1.8 + 3.6 * hash01(seed + 3);
-        let height = 0.13 + 0.13 * hash01(seed + 4);
-        let start = Vec3::new(x - 0.5 * length, y, z);
-        let end = Vec3::new(x + 0.5 * length, y + 0.14 * hash01(seed + 5), z - 1.0);
-        banks.push(GaussianSegment::new(
-            start,
-            end,
-            Vec3::new(1.8, height, 0.76 + hash01(seed + 6)),
-            Quat::IDENTITY,
-            length * height * 0.11,
-            Vec3::new(0.32, 0.40, 0.45),
-        ));
-    }
-    commands.spawn((
-        Name::new("Low lake mist"),
-        Spaghetti3d(splats.add(SpaghettiAsset::new(banks).expect("valid lake mist"))),
-    ));
 }
 
 /// Stone centers on the ground plane and their uniform scales.
