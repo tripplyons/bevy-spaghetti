@@ -21,6 +21,7 @@ mod props;
 mod reeds;
 mod stone_grade;
 mod understory;
+mod webs;
 
 #[cfg(test)]
 mod tests;
@@ -93,6 +94,7 @@ fn add_scene(app: &mut App) {
             props::spawn_props,
             camp::spawn_camp,
             litter::spawn_litter,
+            webs::spawn_webs,
             air::spawn_air,
             meadow::spawn_meadow,
             flowers::spawn_flowers,
