@@ -19,7 +19,7 @@ use bevy::{
 use bevy_spaghetti::{
     DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAdditive, SpaghettiAsset,
     SpaghettiCutout, SpaghettiDetailScale, SpaghettiFlow, SpaghettiGroundAmbient,
-    SpaghettiLighting, SpaghettiPlugin, SpaghettiSpecular, SpaghettiSway,
+    SpaghettiLighting, SpaghettiPlugin, SpaghettiPointLight, SpaghettiSpecular, SpaghettiSway,
 };
 
 const SIZE: usize = 128;
@@ -28,7 +28,7 @@ const SIZE: usize = 128;
 struct Samples {
     strand: Option<[[u8; 4]; 16]>,
     bust: Option<usize>,
-    effects: Option<[[u8; 4]; 6]>,
+    effects: Option<[[u8; 4]; 8]>,
     beside: Option<[[u8; 4]; 2]>,
 }
 
@@ -83,7 +83,16 @@ fn renders_strands_and_bundled_asset_offscreen() {
                 beside[1][0] < 5,
                 "a soft kernel beside the camera smeared across the frame"
             );
-            let [added, covered, glint, matte, flow_start, flow_middle] = effects;
+            let [
+                added,
+                covered,
+                glint,
+                matte,
+                flow_start,
+                flow_middle,
+                lamp_near,
+                lamp_far,
+            ] = effects;
             println!("effects: {effects:?}");
             assert!(
                 added[0] > 200 && added[1] > 240,
@@ -104,6 +113,14 @@ fn renders_strands_and_bundled_asset_offscreen() {
             assert!(
                 flow_middle[0] < 240,
                 "flow did not tint the splat toward its end color"
+            );
+            assert!(
+                lamp_near[1] > 150 && lamp_near[0] < 10,
+                "point light did not light the splat in its range"
+            );
+            assert!(
+                lamp_far[1] < 10,
+                "point light reached a splat beyond its range"
             );
             let [
                 left,
@@ -528,6 +545,30 @@ fn spawn_effects(
         },
         layer.clone(),
     ));
+    // White splats with no sun and no ambient light show only the green
+    // point light. The first is 0.8 units from it and the second is 1.17
+    // units from it, beyond its range.
+    commands.spawn((
+        cloud(vec![
+            point(Vec3::new(0.9, -1.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+            point(Vec3::new(1.75, -1.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ]),
+        SpaghettiLighting {
+            direction_to_light: Vec3::Z,
+            ambient: Vec3::ZERO,
+            directional: Vec3::ZERO,
+        },
+        layer.clone(),
+    ));
+    commands.spawn((
+        SpaghettiPointLight {
+            color: Vec3::Y,
+            range: 1.0,
+            radius: 0.1,
+        },
+        Transform::from_xyz(0.9, -1.0, 0.8),
+        layer.clone(),
+    ));
     let effects_target = target(images);
     commands.spawn((
         Camera3d::default(),
@@ -556,6 +597,8 @@ fn spawn_effects(
                 pixel(115, 32),
                 pixel(32, 96),
                 pixel(64, 96),
+                pixel(93, 96),
+                pixel(120, 96),
             ];
             if pixels[0][1] > 200 && pixels[1][0] > 5 {
                 samples.effects = Some(pixels);

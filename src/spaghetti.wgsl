@@ -49,6 +49,10 @@ struct View {
     flow_fade: vec4<f32>,
     // Color factor at the end of a loop.
     flow_tint: vec4<f32>,
+    // World position and range of the local light. A zero range turns it off.
+    lamp: vec4<f32>,
+    // Color at one unit of distance, then the squared source radius.
+    lamp_color: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -116,6 +120,23 @@ fn segment_highlight(midpoint: vec3<f32>, normal: vec3<f32>, axis: vec3<f32>) ->
     return mix(surface, strand, view.material.z);
 }
 
+// Light from the local source on a segment. It follows the inverse square
+// law and a window brings it smoothly to zero at the range.
+fn lamp_light(midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    let world = (view.world_from_local * vec4(midpoint, 1.0)).xyz;
+    let to_lamp = view.lamp.xyz - world;
+    let distance_squared = dot(to_lamp, to_lamp);
+    let fraction = distance_squared / (view.lamp.w * view.lamp.w);
+    if fraction >= 1.0 {
+        return vec3(0.0);
+    }
+    let facing = dot(normal, to_lamp) * inverseSqrt(max(distance_squared, 1e-12));
+    let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
+    let window = 1.0 - fraction * fraction;
+    return view.lamp_color.rgb
+        * (incident * window * window / (distance_squared + view.lamp_color.w));
+}
+
 fn segment_light(
     index: u32,
     color: vec3<f32>,
@@ -139,7 +160,12 @@ fn segment_light(
     }
     let ground_weight = 0.5 - 0.5 * normal.y;
     let ambient = view.ambient.rgb + ground_weight * view.ground_ambient_delta.rgb;
-    return color * (light.x * ambient + (incident * light.y) * view.directional.rgb)
+    var local = vec3(0.0);
+    if view.lamp.w > 0.0 {
+        local = lamp_light(midpoint, normal);
+    }
+    // Baked ambient occlusion also dims the local light inside a dense cloud.
+    return color * (light.x * (ambient + local) + (incident * light.y) * view.directional.rgb)
         + (highlight * light.y) * view.directional.rgb;
 }
 

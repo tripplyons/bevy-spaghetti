@@ -71,6 +71,8 @@ With `SpaghettiLighting`, add `SpaghettiGroundAmbient` to set a separate linear 
 
 Add `SpaghettiSpecular` to a lit cloud for a view-dependent highlight. Its `strand` field blends between a highlight off each segment's surface normal, for wet stone, and one off the segment's axis, for hair, needles and blades.
 
+Add `SpaghettiPointLight` to an entity with a transform for a local light source, such as a fire or a lamp. Each lit cloud takes the source that lights its bounds most strongly. The light follows the inverse square law, reaches zero at its range and casts no shadows.
+
 Add `SpaghettiAdditive` to a translucent cloud to add its light to the frame, for flames, sparks and sunlit dust. Update `SpaghettiFlow` to move each segment along a looping path with its own start time, a smooth wander, growth, a color shift and a fade at both ends. Flow animates smoke, mist, fire and drifting particles on the GPU with no asset upload.
 
 ## Convert a model

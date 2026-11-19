@@ -15,5 +15,5 @@ mod render;
 pub use render::{
     Spaghetti3d, SpaghettiAdditive, SpaghettiCutout, SpaghettiDetailScale, SpaghettiFlow,
     SpaghettiGroundAmbient, SpaghettiLighting, SpaghettiNearFade, SpaghettiPlugin,
-    SpaghettiReceiveShadows, SpaghettiSpecular, SpaghettiSway, SpaghettiTransmission, SpaghettiWind,
+    SpaghettiPointLight, SpaghettiReceiveShadows, SpaghettiSpecular, SpaghettiSway, SpaghettiTransmission, SpaghettiWind,
 };

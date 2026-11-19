@@ -150,6 +150,25 @@ pub struct SpaghettiSpecular {
     pub strand: f32,
 }
 
+/// A local light source for lit clouds, such as a fire or a lamp.
+///
+/// Add it to an entity with a transform. A cloud with [`SpaghettiLighting`]
+/// takes the one source that lights its bounds most strongly, from the
+/// sources that share a render layer with it. The light follows the inverse
+/// square law, falls smoothly to zero at `range`, and casts no shadows.
+/// [`SpaghettiTransmission`] passes it through thin foliage.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[require(Transform, Visibility)]
+pub struct SpaghettiPointLight {
+    /// Light on a surface that faces the source from one unit away, on the
+    /// scale of [`SpaghettiLighting::directional`].
+    pub color: Vec3,
+    /// Distance at which the light reaches zero.
+    pub range: f32,
+    /// Radius of the source. It bounds the light on segments close to it.
+    pub radius: f32,
+}
+
 /// Adds a translucent cloud's light to the frame instead of covering it.
 ///
 /// Use it for flames, sparks, sunlit dust and other glowing media. Draw order
@@ -232,7 +251,8 @@ impl Plugin for SpaghettiPlugin {
                 .init_resource::<SpecializedRenderPipelines<SplatPipeline>>()
                 .init_resource::<ViewDraws>()
                 .init_resource::<ViewFog>()
-                .add_systems(ExtractSchedule, extract_view_fog)
+                .init_resource::<PointLights>()
+                .add_systems(ExtractSchedule, (extract_view_fog, extract_point_lights))
                 .add_systems(RenderStartup, init_pipeline)
                 .add_systems(Render, queue_clouds.in_set(RenderSystems::QueueMeshes));
         }
@@ -723,6 +743,57 @@ fn extract_view_fog(
     }
 }
 
+struct ExtractedPointLight {
+    position: Vec3,
+    light: SpaghettiPointLight,
+    layers: RenderLayers,
+}
+
+impl ExtractedPointLight {
+    /// The light at `distance_squared` from the source, before the facing
+    /// term. The shader evaluates the same expression.
+    fn strength(&self, distance_squared: f32) -> f32 {
+        let fraction = distance_squared / (self.light.range * self.light.range);
+        let window = (1.0 - fraction * fraction).max(0.0);
+        window * window / (distance_squared + self.light.radius * self.light.radius)
+    }
+}
+
+#[derive(Resource, Default)]
+struct PointLights(Vec<ExtractedPointLight>);
+
+fn extract_point_lights(
+    mut extracted: ResMut<PointLights>,
+    lights: Extract<
+        Query<(
+            &SpaghettiPointLight,
+            &GlobalTransform,
+            &InheritedVisibility,
+            Option<&RenderLayers>,
+        )>,
+    >,
+) {
+    extracted.0.clear();
+    extracted.0.extend(
+        lights
+            .iter()
+            .filter(|(light, transform, visibility, _)| {
+                visibility.get()
+                    && light.range > 0.0
+                    && light.range.is_finite()
+                    && light.radius > 0.0
+                    && light.color.is_finite()
+                    && light.color.max_element() > 0.0
+                    && transform.translation().is_finite()
+            })
+            .map(|(light, transform, _, layers)| ExtractedPointLight {
+                position: transform.translation(),
+                light: *light,
+                layers: layers.cloned().unwrap_or_default(),
+            }),
+    );
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
@@ -756,6 +827,10 @@ struct DrawUniform {
     flow_fade: [f32; 4],
     // Color factor at the end of a loop.
     flow_tint: [f32; 4],
+    // World position and range of the local light. A zero range turns it off.
+    lamp: [f32; 4],
+    // Color at one unit of distance, then the squared source radius.
+    lamp_color: [f32; 4],
 }
 
 impl DrawUniform {
@@ -810,7 +885,7 @@ fn queue_clouds(
     gpu_clouds: Res<RenderAssets<GpuCloud>>,
     clouds: Query<(Entity, &MainEntity, &ExtractedCloud)>,
     views: Query<SplatView>,
-    view_fog: Res<ViewFog>,
+    (view_fog, point_lights): (Res<ViewFog>, Res<PointLights>),
     mut phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     draw_functions: Res<DrawFunctions<Transparent3d>>,
     mut cutout_phases: ResMut<ViewBinnedRenderPhases<AlphaMask3d>>,
@@ -979,6 +1054,29 @@ fn queue_clouds(
                 if let Some(ground) = cloud.ground_ambient {
                     uniform.ground_ambient_delta =
                         (ground.0 - lighting.ambient).extend(0.0).to_array();
+                }
+                if !point_lights.0.is_empty() {
+                    // A world-aligned box around the cloud.
+                    let transform = cloud.world_from_local;
+                    let center = transform.transform_point3(bounds.center.into());
+                    let half = bounds.half_extents;
+                    let extent = transform.x_axis.truncate().abs() * half.x
+                        + transform.y_axis.truncate().abs() * half.y
+                        + transform.z_axis.truncate().abs() * half.z;
+                    let lamp = point_lights.0.iter()
+                        .filter(|lamp| lamp.layers.intersects(&cloud.layers))
+                        .map(|lamp| {
+                            let outside = ((lamp.position - center).abs() - extent).max(Vec3::ZERO);
+                            let strength = lamp.strength(outside.length_squared());
+                            (lamp, strength * lamp.light.color.max_element())
+                        })
+                        .filter(|&(_, strength)| strength > 0.0)
+                        .max_by(|a, b| a.1.total_cmp(&b.1));
+                    if let Some((lamp, _)) = lamp {
+                        let radius_squared = lamp.light.radius * lamp.light.radius;
+                        uniform.lamp = lamp.position.extend(lamp.light.range).to_array();
+                        uniform.lamp_color = lamp.light.color.extend(radius_squared).to_array();
+                    }
                 }
                 if cloud.receive_shadows && let Some(data) = shadow_data {
                     let view_shadows = view_shadows.get_or_insert_with(|| {
