@@ -696,6 +696,7 @@ pub fn spawn_flowers(
                 lighting,
                 SpaghettiReceiveShadows,
                 SpaghettiTransmission(0.55),
+                crate::meadow::BLADE_SHEEN,
                 wind,
                 Transform::from_translation(origin),
                 VisibilityRange {

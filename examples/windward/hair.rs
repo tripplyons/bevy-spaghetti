@@ -17,7 +17,9 @@ use bevy::{
     prelude::*,
     world_serialization::WorldInstanceReady,
 };
-use bevy_spaghetti::{GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting};
+use bevy_spaghetti::{
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiSpecular,
+};
 
 use crate::landscape::{SUN, hash01};
 
@@ -108,6 +110,12 @@ pub fn grow_hair(
             direction_to_light: SUN,
             ambient: Vec3::new(0.26, 0.28, 0.31),
             directional: Vec3::new(0.80, 0.68, 0.52),
+        },
+        // Strands reflect the sun in a band across the crown, not a spot.
+        SpaghettiSpecular {
+            strength: 0.085,
+            shininess: 70.0,
+            strand: 1.0,
         },
         Transform::from_matrix(bindposes[index]),
     ));

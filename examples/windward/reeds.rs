@@ -212,6 +212,12 @@ pub fn spawn_reeds(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiAs
                 directional: Vec3::new(1.00, 0.84, 0.64),
             },
             bevy_spaghetti::SpaghettiTransmission(0.6),
+            // Wet, waxy blades glint along their length beside the water.
+            bevy_spaghetti::SpaghettiSpecular {
+                strength: 0.07,
+                shininess: 48.0,
+                strand: 0.7,
+            },
             ReedPatch {
                 cloud,
                 blades,

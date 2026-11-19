@@ -7,7 +7,7 @@ use bevy::{
 use bevy_spaghetti::{
     DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
     SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting, SpaghettiNearFade,
-    SpaghettiReceiveShadows, SpaghettiSway, SpaghettiTransmission,
+    SpaghettiReceiveShadows, SpaghettiSpecular, SpaghettiSway, SpaghettiTransmission,
 };
 
 use crate::{
@@ -32,6 +32,12 @@ const CORE_DETAIL: f32 = 1.8;
 const CROWN: f32 = 0.42;
 /// Thin needle sprays let a little of the low sun through from behind.
 const NEEDLE_TRANSMISSION: SpaghettiTransmission = SpaghettiTransmission(0.28);
+/// Waxy needles glint along their length where the sun grazes a bough.
+const NEEDLE_SHEEN: SpaghettiSpecular = SpaghettiSpecular {
+    strength: 0.045,
+    shininess: 40.0,
+    strand: 0.8,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -733,6 +739,7 @@ pub fn spawn_trees(
             lighting,
             ground_ambient,
             NEEDLE_TRANSMISSION,
+            NEEDLE_SHEEN,
             SpaghettiReceiveShadows,
             // Limbs between the follow camera and the hiker dissolve
             // instead of smearing across the frame.

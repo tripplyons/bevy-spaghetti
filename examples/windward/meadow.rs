@@ -2,7 +2,7 @@
 use bevy::{camera::visibility::VisibilityRange, prelude::*};
 use bevy_spaghetti::{
     GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting,
-    SpaghettiTransmission, SpaghettiWind,
+    SpaghettiSpecular, SpaghettiTransmission, SpaghettiWind,
 };
 
 use crate::{
@@ -18,6 +18,12 @@ const NEAR_END: std::ops::Range<f32> = 10.0..15.0;
 const FAR_END: std::ops::Range<f32> = 74.0..92.0;
 /// Clumps per square meter before the density mask removes some of them.
 const CLUMPS: f32 = 9.0;
+/// Grass and flower stems glint along their length in the low sun.
+pub(super) const BLADE_SHEEN: SpaghettiSpecular = SpaghettiSpecular {
+    strength: 0.045,
+    shininess: 56.0,
+    strand: 0.7,
+};
 /// Every `FAR_STRIDE`-th blade survives in the far cloud, widened to keep coverage.
 const FAR_STRIDE: usize = 6;
 
@@ -305,6 +311,7 @@ pub fn spawn_meadow(
                     SpaghettiCutout,
                     lighting,
                     SpaghettiTransmission(0.45),
+                    BLADE_SHEEN,
                     wind,
                     Transform::from_translation(origin),
                     range,
