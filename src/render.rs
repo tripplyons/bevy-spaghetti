@@ -186,6 +186,10 @@ pub struct SpaghettiFlow {
     pub flicker: f32,
     /// Fractions of the loop spent fading in and fading out.
     pub fade: [f32; 2],
+    /// Color factor that each segment reaches at the end of its loop. The
+    /// factor starts at one, so a flame can cool from yellow to red and
+    /// smoke can pale as it thins.
+    pub tint: Vec3,
 }
 
 impl Default for SpaghettiFlow {
@@ -199,6 +203,7 @@ impl Default for SpaghettiFlow {
             growth: 0.0,
             flicker: 0.0,
             fade: [0.1, 0.3],
+            tint: Vec3::ONE,
         }
     }
 }
@@ -749,6 +754,8 @@ struct DrawUniform {
     flow_shape: [f32; 4],
     // Fade-in and fade-out fractions, time, enabled flag.
     flow_fade: [f32; 4],
+    // Color factor at the end of a loop.
+    flow_tint: [f32; 4],
 }
 
 impl DrawUniform {
@@ -932,6 +939,7 @@ fn queue_clouds(
                 uniform.flow_shape = [reach, flow.flicker.clamp(0.0, 1.0), flow.spread, flow.growth];
                 let [fade_in, fade_out] = flow.fade.map(|fade| fade.clamp(0.0, 1.0));
                 uniform.flow_fade = [fade_in, fade_out, flow.time, 1.0];
+                uniform.flow_tint = flow.tint.max(Vec3::ZERO).extend(0.0).to_array();
             }
             if let Some(fade) = cloud.near_fade.filter(|fade| fade.end > fade.start) {
                 uniform.viewport[2] = fade.start;

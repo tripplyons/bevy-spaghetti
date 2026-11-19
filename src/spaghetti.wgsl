@@ -47,6 +47,8 @@ struct View {
     flow_shape: vec4<f32>,
     // Fade-in and fade-out fractions, time, enabled flag.
     flow_fade: vec4<f32>,
+    // Color factor at the end of a loop.
+    flow_tint: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -156,6 +158,7 @@ struct Flow {
     // Factors on optical mass and kernel size.
     mass: f32,
     size: f32,
+    tint: vec3<f32>,
 }
 
 // Each segment loops from its authored place along the flow span, with its
@@ -185,6 +188,7 @@ fn segment_flow(index: u32, center: vec3<f32>) -> Flow {
     let pulse = 0.5 + 0.5 * sin(view.flow_fade.z * (9.0 + 13.0 * random.y) + 6.2831853 * random.z);
     flow.mass *= 1.0 - view.flow_shape.y * pulse;
     flow.size = max(1.0 + view.flow_shape.w * t, 0.05);
+    flow.tint = mix(vec3(1.0), view.flow_tint.xyz, t);
     return flow;
 }
 
@@ -303,8 +307,16 @@ fn bend_endpoint(local: vec3<f32>, rise: f32, height: f32) -> vec3<f32> {
 }
 
 // Derivative of homogeneous divide, in pixels per local coordinate.
+//
+// The derivative is a linear stand-in for the projection around the
+// midpoint. Far outside the frame and close to the camera plane, its depth
+// term grows without limit, and a soft kernel there would smear across the
+// whole view. Evaluating the depth term no further out than 1.3 frame
+// half-widths keeps such a kernel off screen and leaves kernels in view
+// unchanged.
 fn project_axis(axis: vec4<f32>, midpoint: vec4<f32>, half_viewport: vec2<f32>) -> vec2<f32> {
-    return (axis.xy - midpoint.xy / midpoint.w * axis.w) * half_viewport / midpoint.w;
+    let center = clamp(midpoint.xy / midpoint.w, vec2(-1.3), vec2(1.3));
+    return (axis.xy - center * axis.w) * half_viewport / midpoint.w;
 }
 
 // Restrict the parameter interval to the positive half-space of a clip plane.
@@ -368,12 +380,14 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     var local_end = splat.end.xyz;
     var mass = splat.start_mass.w;
     var s = splat.sigma.xyz;
+    var tint = vec3(1.0);
     if view.flow_fade.w > 0.0 {
         let flow = segment_flow(index, (local_start + local_end) * 0.5);
         local_start += flow.offset;
         local_end += flow.offset;
         mass *= flow.mass;
         s *= flow.size;
+        tint = flow.tint;
     }
     if view.motion.y > 0.0 {
         let height = blade_profile(splat.color.w).x;
@@ -457,7 +471,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     if vertex_index == 1u {
         let area_scale = length(cross(j0, j1));
         let peak = (mass * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
-        var color = splat.color.rgb;
+        var color = splat.color.rgb * tint;
         if view.direction_to_light.w > 0.0 {
             let normal = view.normal_from_local * rotate(q, vec3(0.0, 0.0, 1.0));
             let unit = normal * inverseSqrt(max(1e-10, dot(normal, normal)));

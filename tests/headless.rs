@@ -29,6 +29,7 @@ struct Samples {
     strand: Option<[[u8; 4]; 16]>,
     bust: Option<usize>,
     effects: Option<[[u8; 4]; 6]>,
+    beside: Option<[[u8; 4]; 2]>,
 }
 
 #[derive(Component)]
@@ -67,9 +68,21 @@ fn renders_strands_and_bundled_asset_offscreen() {
     while Instant::now() < deadline {
         app.update();
         let samples = app.world().resource::<Samples>();
-        if let (Some(pixels), Some(bust), Some(effects)) =
-            (samples.strand, samples.bust, samples.effects)
-        {
+        if let (Some(pixels), Some(bust), Some(effects), Some(beside)) = (
+            samples.strand,
+            samples.bust,
+            samples.effects,
+            samples.beside,
+        ) {
+            println!("beside: {beside:?}");
+            assert!(
+                beside[0][1] > 100,
+                "the marker in front of the perspective camera is missing"
+            );
+            assert!(
+                beside[1][0] < 5,
+                "a soft kernel beside the camera smeared across the frame"
+            );
             let [added, covered, glint, matte, flow_start, flow_middle] = effects;
             println!("effects: {effects:?}");
             assert!(
@@ -85,8 +98,12 @@ fn renders_strands_and_bundled_asset_offscreen() {
                 "highlight did not follow the segment normals"
             );
             assert!(
-                flow_middle[0] > 200 && flow_start[0] < 20,
+                flow_middle[0] > 170 && flow_start[0] < 20,
                 "flow did not carry the splat half of its loop"
+            );
+            assert!(
+                flow_middle[0] < 240,
+                "flow did not tint the splat toward its end color"
             );
             let [
                 left,
@@ -340,6 +357,7 @@ fn setup(
         &mut meshes,
         &mut materials,
     );
+    spawn_beside(&mut commands, &mut images, &mut splats);
     let strand_target = target(&mut images);
     commands.spawn((
         Camera3d::default(),
@@ -504,6 +522,8 @@ fn spawn_effects(
             velocity: Vec3::X,
             period,
             fade: [0.0, 0.0],
+            // Half way through the loop, the red channel falls to 0.75.
+            tint: Vec3::new(0.5, 1.0, 1.0),
             ..default()
         },
         layer.clone(),
@@ -539,6 +559,72 @@ fn spawn_effects(
             ];
             if pixels[0][1] > 200 && pixels[1][0] > 5 {
                 samples.effects = Some(pixels);
+            }
+        },
+    );
+}
+
+/// Spawns a wide, soft kernel beside a perspective camera on render layer 3.
+///
+/// The kernel is half a unit in front of the camera plane and twelve units
+/// to the side, far outside the frame. The linear stand-in for the
+/// projection stretches such a kernel toward the view center without limit,
+/// so the renderer must bound it. A small marker in view shows that the
+/// cloud was drawn.
+fn spawn_beside(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    splats: &mut Assets<SpaghettiAsset>,
+) {
+    let layer = RenderLayers::layer(3);
+    let eye = Vec3::new(0.0, 0.0, 100.0);
+    let beside = eye + Vec3::new(12.0, 0.0, -0.5);
+    let marker = eye + Vec3::new(0.0, 0.8, -4.0);
+    commands.spawn((
+        Spaghetti3d(
+            splats.add(
+                SpaghettiAsset::new(vec![
+                    GaussianSegment::new(
+                        beside,
+                        beside,
+                        Vec3::splat(0.6),
+                        Quat::IDENTITY,
+                        5.0,
+                        Vec3::X,
+                    ),
+                    GaussianSegment::new(
+                        marker,
+                        marker,
+                        Vec3::splat(0.08),
+                        Quat::IDENTITY,
+                        0.3,
+                        Vec3::Y,
+                    ),
+                ])
+                .unwrap(),
+            ),
+        ),
+        layer.clone(),
+    ));
+    let beside_target = target(images);
+    commands.spawn((
+        Camera3d::default(),
+        RenderTarget::Image(beside_target.clone().into()),
+        Transform::from_translation(eye),
+        Tonemapping::Linear,
+        Msaa::Off,
+        layer,
+    ));
+    commands.spawn(Readback::texture(beside_target)).observe(
+        |readback: On<ReadbackComplete>, mut samples: ResMut<Samples>| {
+            let pixel = |x, y| {
+                let offset: usize = (y * SIZE + x) * 4;
+                <[u8; 4]>::try_from(&readback.data[offset..offset + 4]).unwrap()
+            };
+            // The marker, then a place below it that should stay empty.
+            let pixels = [pixel(64, 33), pixel(64, 96)];
+            if pixels[0][1] > 100 {
+                samples.beside = Some(pixels);
             }
         },
     );
