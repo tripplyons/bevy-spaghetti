@@ -12,7 +12,8 @@ use bevy::{
 };
 use bevy_spaghetti::{
     GaussianSegment, Spaghetti3d, SpaghettiAdditive, SpaghettiAsset, SpaghettiCutout,
-    SpaghettiFlow, SpaghettiLighting, SpaghettiReceiveShadows, SpaghettiSpecular,
+    SpaghettiFlow, SpaghettiLighting, SpaghettiPointLight, SpaghettiReceiveShadows,
+    SpaghettiSpecular,
 };
 
 use crate::{
@@ -207,6 +208,24 @@ pub fn spawn_camp(
         Transform::from_translation(hearth),
         RANGE,
     ));
+    let flames = hearth + Vec3::Y * 0.3;
+    commands.spawn((
+        Name::new("Firelight"),
+        Firelight { at: flames },
+        SpaghettiPointLight {
+            color: GLOW,
+            range: 5.5,
+            radius: 0.3,
+        },
+        PointLight {
+            color: Color::linear_rgb(1.0, 0.41, 0.094),
+            intensity: LUMENS,
+            range: 5.5,
+            radius: 0.3,
+            ..default()
+        },
+        Transform::from_translation(flames),
+    ));
     // Smoke rises fast over the heat, then the wind takes it. Each puff
     // swells to several times its size and thins out as it goes.
     commands.spawn((
@@ -224,6 +243,41 @@ pub fn spawn_camp(
         },
         Transform::from_translation(hearth),
     ));
+}
+
+/// The fire's light on the splats and on the meshes around it.
+#[derive(Component)]
+pub struct Firelight {
+    at: Vec3,
+}
+
+/// Firelight on a surface that faces the flames from a meter away, on the
+/// scale of the sun's gain in `LIGHTING`.
+const GLOW: Vec3 = Vec3::new(0.52, 0.21, 0.049);
+/// The same light for the ground and the stone cores, in lumens.
+const LUMENS: f32 = 140_000.0;
+
+/// Makes the firelight waver and shift with the flames.
+pub fn flicker_firelight(
+    time: Res<Time>,
+    mut fires: Query<(
+        &Firelight,
+        &mut Transform,
+        &mut SpaghettiPointLight,
+        &mut PointLight,
+    )>,
+) {
+    let t = time.elapsed_secs_wrapped();
+    // Three unrelated rates, so the flicker has no visible beat.
+    let level = 0.84
+        + 0.09 * (7.3 * t).sin()
+        + 0.06 * (13.7 * t + 1.1).sin()
+        + 0.05 * (23.1 * t + 2.4).sin();
+    for (fire, mut transform, mut splats, mut meshes) in &mut fires {
+        transform.translation = fire.at + 0.03 * Vec3::new((5.1 * t).sin(), 0.0, (6.7 * t).cos());
+        splats.color = GLOW * level;
+        meshes.intensity = LUMENS * level;
+    }
 }
 
 /// Walks a spiral out from the anchor to the first level, clear spot.

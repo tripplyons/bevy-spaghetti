@@ -128,6 +128,7 @@ fn add_scene(app: &mut App) {
             bark::select_detail.after(follow_hiker),
             meadow::part_meadow,
             air::advance_flows,
+            camp::flicker_firelight,
             stone_grade::grade_stones,
         ),
     );
