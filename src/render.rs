@@ -696,6 +696,7 @@ impl GpuCloud {
         viewport_height: f32,
         detail_scale: f32,
         bounds: Aabb,
+        snap: bool,
         uniform: &mut DrawUniform,
     ) -> Range<u32> {
         let count = self.centers.len() as u32;
@@ -721,7 +722,9 @@ impl GpuCloud {
             let far = scale / low;
             if closest >= far {
                 segments.start = transition.finer_end;
-            } else if farthest <= near {
+            } else if farthest <= near || snap {
+                // A snapped draw takes the finer level instead of fading
+                // between two, which would draw both.
                 segments.end = transition.finer_end;
                 break;
             } else {
@@ -883,9 +886,10 @@ impl SpecializedRenderPipeline for SplatPipeline {
 // Keep this capacity in sync with the array in spaghetti.wgsl.
 const FOG_LIGHT_CAPACITY: usize = 10;
 
-/// Detail scale of shadow casters relative to the main view. Shadow filtering
-/// blurs needles over several texels, so a coarser level casts the same shade.
-const SHADOW_DETAIL: f32 = 2.0;
+/// Detail scale of shadow casters relative to the main view. Coarse segments
+/// are wide and cover many texels each, so a finer level costs less to draw
+/// and stays closer to the full asset's shade.
+const SHADOW_DETAIL: f32 = 3.0;
 // Segments drawn per cluster of CLUSTER_SIZE in each directional cascade.
 // Far cascades have coarse texels where a spread subset with stronger
 // blocking casts the same average shade.
@@ -1486,6 +1490,9 @@ fn queue_clouds(
                 size.y as f32,
                 cloud.detail_scale * if shadow_view { SHADOW_DETAIL } else { 1.0 },
                 bounds,
+                // A cascade is orthographic, so every segment sits at one
+                // detail depth and a fade would draw two whole levels.
+                shadow_view,
                 &mut uniform,
             );
             let mut instances = 0..segments.len() as u32;
