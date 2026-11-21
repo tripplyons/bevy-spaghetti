@@ -86,7 +86,7 @@ fn start_position() -> Vec3 {
 }
 
 impl HikerCamera {
-    fn pose(&self, feet: Vec3, obstacles: &Obstacles) -> Transform {
+    pub(crate) fn pose(&self, feet: Vec3, obstacles: &Obstacles) -> Transform {
         let target = feet + Vec3::Y * 1.56;
         let rotation = Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(-self.pitch);
         // Frame the hiker off the left of center and leave room to see down the trail.

@@ -126,7 +126,11 @@ impl ShadowBindings {
             let mut uniform = ShadowUniform::zeroed();
             uniform.far_bounds = [f32::MAX; CASCADE_CAPACITY];
             uniform.view_depth = view_depth.to_array();
-            uniform.depth_bias = (direction * light.shadow_depth_bias).extend(0.0).to_array();
+            // The fourth lane holds the share of each cascade that blends
+            // into the next one.
+            uniform.depth_bias = (direction * light.shadow_depth_bias)
+                .extend(light.cascade_shadow_config.overlap_proportion)
+                .to_array();
             uniform.layers[0] = base;
             for (index, (cascade, &far)) in cascades
                 .iter()

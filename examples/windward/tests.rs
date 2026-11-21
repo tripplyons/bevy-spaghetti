@@ -152,6 +152,9 @@ fn full_scene_renders_in_background() {
         // Extra views for one-off checks, as `name:x,z,yaw,pitch` entries
         // separated by semicolons. They replace the standard set. A fifth
         // number sets the field of view in degrees, to look closer.
+        if std::env::var_os("WINDWARD_REVIEW_STILL").is_some() {
+            app.insert_resource(TimeUpdateStrategy::FixedTimesteps(0));
+        }
         for pose in poses.split(';').filter(|pose| !pose.is_empty()) {
             let (name, numbers) = pose.split_once(':').expect("pose needs a name");
             let numbers: Vec<f32> = numbers
@@ -170,6 +173,17 @@ fn full_scene_renders_in_background() {
                 lens.fov = fov.to_radians();
             }
             pose_review_camera(&mut app, Vec2::new(x, z), yaw, pitch);
+            if std::env::var_os("WINDWARD_REVIEW_STILL").is_some() {
+                // Frozen time stops the camera's follow smoothing.
+                let world = app.world_mut();
+                let feet = world.query_filtered::<&Transform, With<Hiker>>().single(world).unwrap().translation;
+                world.resource_scope(|world, obstacles: Mut<crate::landscape::Obstacles>| {
+                    let mut rig = world.query::<(&mut Transform, &HikerCamera)>();
+                    let (mut transform, rig) = rig.single_mut(world).unwrap();
+                    *transform = rig.pose(feet, &obstacles);
+                });
+                step_scene(&mut app, 4);
+            }
             save_review_frame(app.world(), &format!("{name}.png"));
         }
     } else if app.world().contains_resource::<ReviewFrames>() {

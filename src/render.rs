@@ -744,7 +744,7 @@ fn init_pipeline(
         bindings: BindGroupLayoutDescriptor::new(
             "spaghetti bindings",
             &BindGroupLayoutEntries::sequential(
-                ShaderStages::VERTEX,
+                ShaderStages::VERTEX_FRAGMENT,
                 (
                     uniform_buffer_sized(true, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
                     storage_buffer_read_only_sized(false, None),
@@ -1065,6 +1065,9 @@ struct DrawUniform {
     lamp_color: [f32; 4],
     // Offset of this draw's visible clusters in the frame's cluster list.
     clusters: [u32; 4],
+    // The pixel that holds the world origin, in whole pixels. Shadow views
+    // key their random patterns to pixels relative to it.
+    pixel_origin: [f32; 4],
 }
 
 impl DrawUniform {
@@ -1271,6 +1274,16 @@ fn queue_clouds(
         } else {
             view.clip_from_world.unwrap_or(projection * view_from_world)
         };
+        // Bevy moves a cascade in whole texels and keeps its size, so texels
+        // counted from the world origin stay on the same ground as the camera
+        // walks. Main views keep plain screen pixels.
+        let pixel_origin = if shadow_view {
+            let origin = clip_from_world.w_axis;
+            let origin = Vec2::new(origin.x + 1.0, 1.0 - origin.y) * 0.5 * size.as_vec2();
+            origin.round().extend(0.0).extend(0.0).to_array()
+        } else {
+            [0.0; 4]
+        };
         let mut pipeline_ids = [None; 17];
         let eye_world = view.world_from_view.translation();
         let mut view_shadows = None;
@@ -1352,6 +1365,7 @@ fn queue_clouds(
                 motion: [0.0, 0.0, coverage, reverse_dither],
                 world_from_local: cloud.world_from_local.to_cols_array_2d(),
                 eye_world: eye_world.extend(0.0).to_array(),
+                pixel_origin,
                 ..DrawUniform::zeroed()
             };
             uniform.material[3] = f32::from(u8::from(cloud.additive));

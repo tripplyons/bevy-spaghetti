@@ -55,6 +55,9 @@ struct View {
     lamp_color: vec4<f32>,
     // Offset of this draw's visible clusters in `order`.
     clusters: vec4<u32>,
+    // The pixel that holds the world origin. Shadow views set it so their
+    // random patterns stay fixed to the ground when the cascade moves.
+    pixel_origin: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -96,14 +99,40 @@ fn scene_shadow(midpoint: vec3<f32>, normal: vec3<f32>) -> f32 {
     if cascade >= sun_shadow.layers.y {
         return 1.0;
     }
+    var shadow = cascade_shadow(cascade, world.xyz, normal);
+    // Blend into the next cascade across the overlap, as Bevy does for
+    // meshes, so the switch does not sweep through crowns as a hard band.
+    let next = cascade + 1u;
+    if next < sun_shadow.layers.y {
+        let far = sun_shadow.far_bounds[cascade];
+        let near = (1.0 - sun_shadow.depth_bias.w) * far;
+        if depth >= near {
+            let blend = (depth - near) / max(far - near, 1e-6);
+            shadow = mix(shadow, cascade_shadow(next, world.xyz, normal), blend);
+        }
+    }
+    return shadow;
+}
+
+// The lit fraction from one cascade. Four bilinear compare taps half a texel
+// apart give a 3x3 tent, which averages the stochastic splat shadows enough
+// that one segment's sample does not flip between lit and dark.
+fn cascade_shadow(cascade: u32, world: vec3<f32>, normal: vec3<f32>) -> f32 {
     let offset = normal * sun_shadow.normal_bias[cascade] + sun_shadow.depth_bias.xyz;
     // Directional cascades use an orthographic transform and reverse Z.
-    let ndc = (sun_shadow.matrices[cascade] * vec4(world.xyz + offset, 1.0)).xyz;
+    let ndc = (sun_shadow.matrices[cascade] * vec4(world + offset, 1.0)).xyz;
     if any(abs(ndc.xy) >= vec2(1.0)) || ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
     let uv = ndc.xy * vec2(0.5, -0.5) + 0.5;
-    return textureSampleCompareLevel(sun_depth, sun_compare, uv, sun_shadow.layers.x + cascade, ndc.z);
+    let texel = 0.5 / vec2<f32>(textureDimensions(sun_depth));
+    let layer = sun_shadow.layers.x + cascade;
+    return 0.25 * (
+        textureSampleCompareLevel(sun_depth, sun_compare, uv + vec2(-texel.x, -texel.y), layer, ndc.z)
+        + textureSampleCompareLevel(sun_depth, sun_compare, uv + vec2(texel.x, -texel.y), layer, ndc.z)
+        + textureSampleCompareLevel(sun_depth, sun_compare, uv + vec2(-texel.x, texel.y), layer, ndc.z)
+        + textureSampleCompareLevel(sun_depth, sun_compare, uv + vec2(texel.x, texel.y), layer, ndc.z)
+    );
 }
 
 // One highlight value for a segment. `normal` is its world-space surface
@@ -731,7 +760,8 @@ fn cutout_vertex(
 
 // Whether a fragment lies inside the cutout and survives the fade dithers.
 fn cutout_covers(in: CutoutRaster) -> bool {
-    if !detail_visible(in.position.xy, in.detail) {
+    let pixel = in.position.xy - view.pixel_origin.xy;
+    if !detail_visible(pixel, in.detail) {
         return false;
     }
     let along = in.coordinate.x;
@@ -742,7 +772,7 @@ fn cutout_covers(in: CutoutRaster) -> bool {
     }
     if abs(in.shape.w) < 1.0 {
         // A shared screen-space threshold makes paired LOD fades complementary.
-        let threshold = screen_threshold(in.position.xy);
+        let threshold = screen_threshold(pixel);
         if select(threshold >= in.shape.w, threshold < 1.0 + in.shape.w, in.shape.w < 0.0) {
             return false;
         }
@@ -761,7 +791,7 @@ fn cutout_shadow_fragment(in: CutoutRaster) {
     let beyond = max(0.0, max(-in.coordinate.x, in.coordinate.x - in.shape.x)) / in.shape.y;
     let distance_squared = beyond * beyond + in.coordinate.y * in.coordinate.y;
     let depth = in.profile.y * exp(-0.5 * in.profile.z * distance_squared);
-    let pixel = vec2<u32>(in.position.xy);
+    let pixel = bitcast<vec2<u32>>(vec2<i32>(floor(in.position.xy - view.pixel_origin.xy)));
     let seed = u32(in.profile.x);
     if hash_unit(pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u ^ seed * 0xcb1ab31fu) >= 1.0 - exp(-depth) {
         discard;
