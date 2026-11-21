@@ -139,6 +139,7 @@ fn add_scene(app: &mut App) {
             lake::reflect_lake.after(follow_hiker),
             understory::bend_understory,
             props::select_prop_detail.after(follow_hiker),
+            bark::select_detail.after(follow_hiker),
             meadow::part_meadow,
             air::advance_flows,
             camp::flicker_firelight,

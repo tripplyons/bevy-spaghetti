@@ -1,5 +1,9 @@
-use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
+
+use bevy::{
+    camera::visibility::{NoAutoAabb, RenderLayers},
+    light::NotShadowCaster,
+};
 use bevy_spaghetti::{
     DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows,
     SpaghettiCutout, SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting,
@@ -10,7 +14,10 @@ use bevy_spaghetti::{
 use crate::{
     bark, conifer,
     lake::REFLECTED_LAYER,
-    landscape::{Obstacles, SUN, ground, hash01, noise, shore_distance, smoothstep, trail_x},
+    landscape::{
+        Obstacles, SUN, ground, hash01, noise, reflected_layers, shore_distance, smoothstep,
+        trail_x,
+    },
 };
 
 const HEIGHTS: [f32; 3] = [8.93, 7.94, 5.76];
@@ -186,8 +193,8 @@ struct TreeClouds {
 }
 
 enum TreeModel {
-    Crown(TreeClouds),
-    Snag(TreeClouds),
+    Crown(TreeClouds, bark::BarkMeshes),
+    Snag(bark::BarkMeshes),
 }
 
 fn tree_clouds(
@@ -200,11 +207,13 @@ fn tree_clouds(
             .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.30))
             .expect("procedural firs are valid"),
     );
-    let trees = levels.each_ref().map(|level| level.splats.as_slice());
-    let segments: Vec<GaussianSegment> = trees.into_iter().flatten().copied().collect();
+    let crowns = levels
+        .each_ref()
+        .map(|level| &level.splats[level.trunk_end..]);
+    let segments: Vec<GaussianSegment> = crowns.into_iter().flatten().copied().collect();
     let mut finer_end = 0;
     let transitions: [_; LOD_PIXELS.len()] = std::array::from_fn(|level| {
-        finer_end += trees[level].len() as u32;
+        finer_end += crowns[level].len() as u32;
         let pixels = LOD_PIXELS[level] / height;
         DetailTransition {
             finer_end,
@@ -568,27 +577,32 @@ fn layout() -> Vec<Tree> {
 
 pub fn spawn_trees(
     mut commands: Commands,
+    server: Res<AssetServer>,
     mut obstacles: ResMut<Obstacles>,
     mut clouds: ResMut<Assets<SpaghettiAsset>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let bark_material = bark::bark_material(&server);
+    let living_bark = materials.add(StandardMaterial {
+        base_color: Color::linear_rgb(0.52, 0.39, 0.29),
+        ..bark_material.clone()
+    });
+    let snag_bark = materials.add(bark_material);
     let models: Vec<_> = VARIANTS
         .iter()
         .enumerate()
         .map(|(index, variant)| {
             let seed = index as u32 * 101 + 17;
             if variant.kind == Snag {
-                let (adaptive, reflection) = bark::snag_clouds(
-                    &mut clouds,
+                return TreeModel::Snag(bark::BarkMeshes::snag(
+                    &mut meshes,
                     seed,
                     variant.height,
                     variant.top(),
                     variant.radius,
                     variant.form.girth,
-                );
-                return TreeModel::Snag(TreeClouds {
-                    adaptive,
-                    reflection,
-                });
+                ));
             }
             let levels = std::array::from_fn(|level| {
                 conifer::fir(
@@ -600,14 +614,13 @@ pub fn spawn_trees(
                     level,
                 )
             });
-            TreeModel::Crown(tree_clouds(&mut clouds, variant.top(), levels))
+            let stem = conifer::Stem::for_tree(seed, variant.height, &variant.form);
+            TreeModel::Crown(
+                tree_clouds(&mut clouds, variant.top(), levels),
+                bark::BarkMeshes::living(&mut meshes, seed, stem),
+            )
         })
         .collect();
-    let snag_lighting = SpaghettiLighting {
-        direction_to_light: SUN,
-        ambient: Vec3::new(0.56, 0.62, 0.68),
-        directional: Vec3::new(0.84, 0.72, 0.56),
-    };
     for tree in &forest().trees {
         let &Tree {
             at,
@@ -623,29 +636,23 @@ pub fn spawn_trees(
         if obstacle {
             add_obstacle(&mut obstacles, at, scale, variant.height);
         }
-        let detail = match &models[pick] {
-            TreeModel::Crown(detail) => detail,
-            TreeModel::Snag(detail) => {
-                let mut snag = commands.spawn((
+        let (detail, stem) = match &models[pick] {
+            TreeModel::Crown(detail, stem) => (detail, stem),
+            TreeModel::Snag(model) => {
+                let mut tree = commands.spawn((
                     Name::new("Standing deadwood"),
                     transform,
-                    Spaghetti3d(detail.adaptive.clone()),
-                    SpaghettiCutout,
-                    snag_lighting,
-                    SpaghettiReceiveShadows,
+                    model.coarse_mesh(),
+                    model.clone(),
+                    model.bounds,
+                    NoAutoAabb,
+                    MeshMaterial3d(snag_bark.clone()),
+                    reflected_layers(),
                     ForestDetail,
                 ));
-                if !distant {
-                    snag.insert(SpaghettiCastShadows);
+                if distant {
+                    tree.insert(NotShadowCaster);
                 }
-                snag.with_child((
-                    Name::new("Reflected deadwood"),
-                    Spaghetti3d(detail.reflection.clone()),
-                    SpaghettiCutout,
-                    snag_lighting,
-                    SpaghettiReceiveShadows,
-                    RenderLayers::layer(REFLECTED_LAYER),
-                ));
                 continue;
             }
         };
@@ -704,7 +711,19 @@ pub fn spawn_trees(
             // the low sun, distant crowns shade the meadows in front of them.
             SpaghettiCastShadows,
         ));
-        tree.add_child(reflection);
+        tree.add_child(reflection).with_children(|children| {
+            let mut bark = children.spawn((
+                Name::new("Living bark"),
+                stem.coarse_mesh(),
+                stem.clone(),
+                stem.bounds,
+                NoAutoAabb,
+                MeshMaterial3d(living_bark.clone()),
+            ));
+            if distant {
+                bark.insert(NotShadowCaster);
+            }
+        });
         if !distant {
             tree.insert((
                 SpaghettiSway::default(),

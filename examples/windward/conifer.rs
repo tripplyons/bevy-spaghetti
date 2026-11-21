@@ -72,8 +72,8 @@ const LEVELS: [Level; 4] = [
         clothe: true,
         interior: true,
         grow: 1.0,
-        strips: 14,
-        trunk_step: 0.36,
+        strips: 6,
+        trunk_step: 0.22,
         wood: true,
     },
     Level {
@@ -84,8 +84,8 @@ const LEVELS: [Level; 4] = [
         clothe: true,
         interior: true,
         grow: 1.75,
-        strips: 7,
-        trunk_step: 0.65,
+        strips: 4,
+        trunk_step: 0.45,
         wood: true,
     },
     Level {
@@ -227,14 +227,18 @@ impl Habit {
 }
 
 #[derive(Clone, Copy)]
-struct Stem {
-    height: f32,
-    top: f32,
-    bole: f32,
-    radius: f32,
+pub struct Stem {
+    pub height: f32,
+    pub top: f32,
+    pub bole: f32,
+    pub radius: f32,
 }
 
 impl Stem {
+    pub fn for_tree(seed: u32, height: f32, form: &Form) -> Self {
+        Self::new(&mut Rng(seed.wrapping_mul(7919)), height, form)
+    }
+
     fn new(rng: &mut Rng, height: f32, form: &Form) -> Self {
         let bole = if form.bole > 0.0 {
             height * form.bole * rng.range(0.85, 1.15)
@@ -249,7 +253,7 @@ impl Stem {
         }
     }
 
-    fn end(self) -> f32 {
+    pub fn end(self) -> f32 {
         if self.top < self.height {
             self.top
         } else {
@@ -257,7 +261,7 @@ impl Stem {
         }
     }
 
-    fn radius_at(self, y: f32) -> f32 {
+    pub fn radius_at(self, y: f32) -> f32 {
         let y = y.max(0.0);
         let flare = 1.0 + 0.7 * (-y / 0.35).exp();
         self.radius * (1.0 - y / self.height).max(0.06) * flare
@@ -266,6 +270,8 @@ impl Stem {
 
 pub struct Fir {
     pub splats: Vec<GaussianSegment>,
+    /// The stem appears first, so a mesh can supply it in the main view.
+    pub trunk_end: usize,
 }
 
 /// Builds one fir rooted at the origin with its leader at `height`.
@@ -297,6 +303,7 @@ pub fn fir(
     if form.broken_at < 1.0 {
         splinters(&mut out, &mut rng.fork(), height, top, trunk_radius);
     }
+    let trunk_end = out.len();
 
     // Annual whorls get closer together near the leader, where growth is
     // recent and the shoots are short.
@@ -460,7 +467,10 @@ pub fn fir(
     }
     if level >= 2 {
         // A few dead stubs below the crown would vanish at this size anyway.
-        return Fir { splats: out };
+        return Fir {
+            splats: out,
+            trunk_end,
+        };
     }
     // Dead lower branches: bare grey twigs below the living crown.
     let mut y = 0.9;
@@ -487,41 +497,34 @@ pub fn fir(
         );
         y += rng.range(0.12, 0.35);
     }
-    Fir { splats: out }
+    Fir {
+        splats: out,
+        trunk_end,
+    }
 }
 
 fn trunk(out: &mut Vec<GaussianSegment>, rng: &mut Rng, stem: Stem, detail: &Level) {
+    let mut y = 0.0;
     let end = stem.end();
-    for strip in 0..detail.strips {
-        let base_angle = strip as f32 * std::f32::consts::TAU / detail.strips as f32;
-        // Stagger plate starts per strip so neighboring bark plates never form horizontal seams.
-        let mut y = -0.18 - rng.next() * detail.trunk_step * 0.65;
-        while y < end {
-            let step = (detail.trunk_step * rng.range(0.75, 1.35)).min(end - y + 0.08);
-            let y0 = y.max(-0.18);
-            let y1 = (y + step).min(end + 0.04);
-            if y1 <= y0 + 0.01 {
-                y += step;
-                continue;
-            }
-            let r0 = stem.radius_at(y0);
-            let r1 = stem.radius_at(y1);
-            let angle = base_angle + rng.range(-0.12, 0.12);
+    while y < end {
+        let step = detail.trunk_step.min(end - y + 0.05);
+        let r0 = stem.radius_at(y);
+        let r1 = stem.radius_at(y + step);
+        for strip in 0..detail.strips {
+            let angle = strip as f32 * std::f32::consts::TAU / detail.strips as f32
+                + rng.range(-0.15, 0.15);
             let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
-            let relief = 0.60 + 0.14 * rng.next();
-            let start = Vec3::Y * y0 + outward * r0 * relief;
-            let finish = Vec3::Y * y1 + outward * r1 * relief;
+            let start = Vec3::Y * y + outward * r0 * 0.62;
+            let end = Vec3::Y * (y + step) + outward * r1 * 0.62;
             let width = r0 * std::f32::consts::PI / detail.strips as f32;
-            let mid_y = 0.5 * (y0 + y1);
-            let damp = (-mid_y.max(0.0) / 0.46).exp();
-            let shade = 1.0 - 0.57 * crate::landscape::smoothstep(stem.bole, stem.bole + 1.2, mid_y);
-            let base_tint = Vec3::ONE.lerp(Vec3::new(0.58, 0.68, 0.47), damp) * shade;
-            // Ridged bark: warm grey-brown ridges with dark fissures.
+            // Ridged bark: dark grey with warm fissures.
             let fissure = rng.next();
-            let tone = 0.72 + 0.50 * rng.next();
-            let ridge = Vec3::new(0.145, 0.118, 0.092);
-            let groove = Vec3::new(0.055, 0.042, 0.032);
-            let color = ridge.lerp(groove, fissure) * tone * base_tint;
+            // The crown shades the stem above the lowest live limbs.
+            let shade = if y > stem.bole { 0.32 } else { 1.0 };
+            let tone = (0.75 + 0.5 * rng.next()) * shade;
+            let ridge = Vec3::new(0.115, 0.105, 0.095);
+            let groove = Vec3::new(0.060, 0.050, 0.042);
+            let color = ridge.lerp(groove, fissure) * tone;
             let rotation = Quat::from_mat3(&Mat3::from_cols(
                 Vec3::Y.cross(outward).normalize(),
                 Vec3::Y,
@@ -529,14 +532,14 @@ fn trunk(out: &mut Vec<GaussianSegment>, rng: &mut Rng, stem: Stem, detail: &Lev
             ));
             out.push(GaussianSegment::new(
                 start,
-                finish,
-                Vec3::new(width * 0.72, width * 0.48, r0 * 0.28),
+                end,
+                Vec3::new(width * 0.55, width * 0.4, r0 * 0.3),
                 rotation,
-                6.5 * (y1 - y0) * width,
+                6.0 * step * width,
                 color,
             ));
-            y += step * 0.92;
         }
+        y += step;
     }
 }
 
