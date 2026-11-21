@@ -50,7 +50,7 @@ use crate::{
 };
 
 mod shadow;
-use shadow::{ShadowBindings, ShadowViewData};
+use shadow::{CachedShadowBinding, ShadowBindings, ShadowViewData};
 
 /// Renders a cloud using the entity's transform, visibility and render layers.
 #[derive(Component, Clone, Debug)]
@@ -801,7 +801,7 @@ impl GpuCloud {
             center: self.bounds.center,
             half_extents: self.bounds.half_extents + Vec3A::from(bending),
         };
-        let mut planes = [Vec4::ZERO; 6];
+        let mut planes = [(Vec3::ZERO, Vec3::ZERO, 0.0); 6];
         let mut plane_count = 0;
         for half_space in frustum.map_or(&[][..], |frustum| &frustum.half_spaces[..]) {
             let world = half_space.normal_d();
@@ -810,9 +810,10 @@ impl GpuCloud {
             }
             let local = world_from_local.transpose() * world;
             let normal = local.truncate();
+            let abs_normal = normal.abs();
             let center = Vec3::from(object.center);
-            if normal.dot(center) + local.w - normal.abs().dot(object.half_extents.into()) < 0.0 {
-                planes[plane_count] = local;
+            if normal.dot(center) + local.w - abs_normal.dot(object.half_extents.into()) < 0.0 {
+                planes[plane_count] = (normal, abs_normal, local.w);
                 plane_count += 1;
             }
         }
@@ -822,17 +823,19 @@ impl GpuCloud {
             visible.extend(clusters.iter().map(pack));
         } else {
             let depth = clip_from_local.row(3);
+            let depth_xyz = depth.truncate();
+            let depth_abs = depth_xyz.abs();
             for cluster in clusters {
                 let half = cluster.half_extents + bending;
-                if planes.iter().any(|plane| {
-                    let normal = plane.truncate();
-                    normal.dot(cluster.center) + plane.w + normal.abs().dot(half) < 0.0
-                }) {
+                if planes
+                    .iter()
+                    .any(|&(normal, abs_normal, d)| normal.dot(cluster.center) + d + abs_normal.dot(half) < 0.0)
+                {
                     continue;
                 }
                 if bands > 0 {
-                    let center = depth.truncate().dot(cluster.center) + depth.w;
-                    let radius = depth.truncate().abs().dot(half);
+                    let center = depth_xyz.dot(cluster.center) + depth.w;
+                    let radius = depth_abs.dot(half);
                     // Transitions before this cluster set its level within the draw.
                     let level = uniform.detail_ends[..bands]
                         .iter()
@@ -1341,6 +1344,8 @@ struct ViewDraws {
     // count minus one.
     clusters: Vec<u32>,
     cluster_buffer: Option<Buffer>,
+    // Reused per-view shadow uniform buffers and bind groups.
+    cached_shadows: HashMap<(Entity, u32), CachedShadowBinding>,
 }
 
 type SplatView = (
@@ -1495,16 +1500,6 @@ fn queue_clouds(
         } else {
             view.clip_from_world.unwrap_or(projection * view_from_world)
         };
-        // Bevy moves a cascade in whole texels and keeps its size, so texels
-        // counted from the world origin stay on the same ground as the camera
-        // walks. Main views keep plain screen pixels.
-        let pixel_origin = if shadow_view {
-            let origin = clip_from_world.w_axis;
-            let origin = Vec2::new(origin.x + 1.0, 1.0 - origin.y) * 0.5 * size.as_vec2();
-            origin.round().extend(0.0).extend(0.0).to_array()
-        } else {
-            [0.0; 4]
-        };
         let mut pipeline_ids = [None; 17];
         let eye_world = view.world_from_view.translation();
         let mut view_shadows = None;
@@ -1590,7 +1585,6 @@ fn queue_clouds(
                 motion: [0.0, 0.0, coverage, reverse_dither],
                 world_from_local: cloud.world_from_local.to_cols_array_2d(),
                 eye_world: eye_world.extend(0.0).to_array(),
-                pixel_origin,
                 ..DrawUniform::zeroed()
             };
             uniform.material[3] = f32::from(u8::from(cloud.additive));
@@ -1667,7 +1661,9 @@ fn queue_clouds(
                     let view_shadows = view_shadows.get_or_insert_with(|| {
                         pipeline.shadows.for_view(
                             &device,
+                            &queue,
                             &cache,
+                            &mut draws.cached_shadows,
                             view_entity,
                             data,
                             -view_from_world.row(2),
@@ -1953,6 +1949,9 @@ fn queue_clouds(
         }
         draw.idle_frames <= 1
     });
+    draws
+        .cached_shadows
+        .retain(|&(view_entity, _), _| views.contains(view_entity));
 }
 
 fn make_draw(

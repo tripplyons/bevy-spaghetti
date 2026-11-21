@@ -261,7 +261,7 @@ pub fn step_reeds(
     time: Res<Time<Fixed>>,
     hiker: Single<&Transform, With<Hiker>>,
     camera: Single<CameraView, With<HikerCamera>>,
-    mut patches: Query<&mut ReedPatch>,
+    mut patches: Query<(&mut ReedPatch, &ViewVisibility)>,
     mut clouds: ResMut<Assets<SpaghettiAsset>>,
     mut tick: Local<u64>,
 ) {
@@ -270,7 +270,10 @@ pub fn step_reeds(
     let elapsed = time.elapsed_secs();
     let hiker = hiker.translation;
     let view = ScreenDetail::new(*camera);
-    for mut patch in &mut patches {
+    for (mut patch, visibility) in &mut patches {
+        if !visibility.get() {
+            continue;
+        }
         let pixels = view.as_ref().map_or(42.0, |view| {
             view.span_pixels(patch.center, patch.longest_blade, CELL_SIZE * 0.64)
         });

@@ -85,15 +85,14 @@ struct SunShadows {
 @group(1) @binding(1) var sun_depth: texture_depth_2d_array;
 @group(1) @binding(2) var sun_compare: sampler_comparison;
 
-fn scene_shadow(midpoint: vec3<f32>, normal: vec3<f32>) -> f32 {
-    let world = view.world_from_local * vec4(midpoint, 1.0);
-    let depth = dot(sun_shadow.view_depth, world);
+fn scene_shadow(world: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let depth = dot(sun_shadow.view_depth, vec4(world, 1.0));
     let beyond = select(vec4<u32>(0u), vec4<u32>(1u), vec4(depth) >= sun_shadow.far_bounds);
     let cascade = beyond.x + beyond.y + beyond.z + beyond.w;
     if cascade >= sun_shadow.layers.y {
         return 1.0;
     }
-    var shadow = cascade_shadow(cascade, world.xyz, normal);
+    var shadow = cascade_shadow(cascade, world, normal);
     // Blend into the next cascade across the overlap, as Bevy does for
     // meshes, so the switch does not sweep through crowns as a hard band.
     let next = cascade + 1u;
@@ -102,7 +101,7 @@ fn scene_shadow(midpoint: vec3<f32>, normal: vec3<f32>) -> f32 {
         let near = (1.0 - sun_shadow.depth_bias.w) * far;
         if depth >= near {
             let blend = (depth - near) / max(far - near, 1e-6);
-            shadow = mix(shadow, cascade_shadow(next, world.xyz, normal), blend);
+            shadow = mix(shadow, cascade_shadow(next, world, normal), blend);
         }
     }
     return shadow;
@@ -131,8 +130,7 @@ fn cascade_shadow(cascade: u32, world: vec3<f32>, normal: vec3<f32>) -> f32 {
 
 // One highlight value for a segment. `normal` is its world-space surface
 // normal and `axis` is its local centerline, which may be zero for a point.
-fn segment_highlight(midpoint: vec3<f32>, normal: vec3<f32>, axis: vec3<f32>) -> f32 {
-    let world = (view.world_from_local * vec4(midpoint, 1.0)).xyz;
+fn segment_highlight(world: vec3<f32>, normal: vec3<f32>, axis: vec3<f32>) -> f32 {
     let to_eye = normalize(view.eye_world.xyz - world);
     let to_light = view.direction_to_light.xyz;
     let half_vector = normalize(to_light + to_eye);
@@ -157,8 +155,7 @@ fn segment_highlight(midpoint: vec3<f32>, normal: vec3<f32>, axis: vec3<f32>) ->
 
 // Light from the local source on a segment. It follows the inverse square
 // law and a window brings it smoothly to zero at the range.
-fn lamp_light(midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
-    let world = (view.world_from_local * vec4(midpoint, 1.0)).xyz;
+fn lamp_light(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     let to_lamp = view.lamp.xyz - world;
     let distance_squared = dot(to_lamp, to_lamp);
     let fraction = distance_squared / (view.lamp.w * view.lamp.w);
@@ -175,7 +172,7 @@ fn lamp_light(midpoint: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
 fn segment_light(
     index: u32,
     color: vec3<f32>,
-    midpoint: vec3<f32>,
+    world: vec3<f32>,
     normal: vec3<f32>,
     axis: vec3<f32>,
 ) -> vec3<f32> {
@@ -188,16 +185,16 @@ fn segment_light(
     let incident = max(0.0, facing) + view.ambient.w * max(0.0, -facing);
     var highlight = 0.0;
     if view.material.x > 0.0 {
-        highlight = view.material.x * segment_highlight(midpoint, normal, axis);
+        highlight = view.material.x * segment_highlight(world, normal, axis);
     }
     if SCENE_SHADOWS && (incident > 0.0 || highlight > 0.0) {
-        light.y *= scene_shadow(midpoint, select(-normal, normal, facing >= 0.0));
+        light.y *= scene_shadow(world, select(-normal, normal, facing >= 0.0));
     }
     let ground_weight = 0.5 - 0.5 * normal.y;
     let ambient = view.ambient.rgb + ground_weight * view.ground_ambient_delta.rgb;
     var local = vec3(0.0);
     if view.lamp.w > 0.0 {
-        local = lamp_light(midpoint, normal);
+        local = lamp_light(world, normal);
     }
     // Baked ambient occlusion also dims the local light inside a dense cloud.
     return color * (light.x * (ambient + local) + (incident * light.y) * view.directional.rgb)
@@ -553,7 +550,8 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
         if view.direction_to_light.w > 0.0 {
             let normal = view.normal_from_local * rotate(q, vec3(0.0, 0.0, 1.0));
             let unit = normal * inverseSqrt(max(1e-10, dot(normal, normal)));
-            color = segment_light(index, color, (local_start + local_end) * 0.5, unit, local_end - local_start);
+            let world = (view.world_from_local * vec4((local_start + local_end) * 0.5, 1.0)).xyz;
+            color = segment_light(index, color, world, unit, local_end - local_start);
         }
         if view.fog.mode != 0u {
             let local_midpoint = mix(local_start, local_end, (span.x + span.y) * 0.5);
@@ -656,10 +654,21 @@ fn cutout_vertex(
         return out;
     }
     let instance = (cluster >> 7u) + offset;
+    if view.motion.z < 1.0 && view.viewport.w <= view.viewport.z {
+        let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x9e3779b9u);
+        if select(threshold >= view.motion.z, (threshold < 1.0 - view.motion.z), view.motion.w > 0.0) {
+            out.position = vec4(2.0, 2.0, 0.0, 1.0);
+            return out;
+        }
+    }
     let splat = splats[instance];
     let profile = blade_profile(splat.color.w);
-    let local_a = bend_endpoint(splat.start_mass.xyz, splat.end.w, profile.x);
-    let local_b = bend_endpoint(splat.end.xyz, splat.sigma.w, profile.x);
+    var local_a = splat.start_mass.xyz;
+    var local_b = splat.end.xyz;
+    if view.motion.y > 0.0 {
+        local_a = bend_endpoint(local_a, splat.end.w, profile.x);
+        local_b = bend_endpoint(local_b, splat.sigma.w, profile.x);
+    }
     let transform = view.clip_from_local;
     let start = transform * vec4(local_a, 1.0);
     let end = transform * vec4(local_b, 1.0);
@@ -673,37 +682,41 @@ fn cutout_vertex(
         return out;
     }
     let midpoint = (a + b) * 0.5;
-    let detail = detail_interval(instance, midpoint.w);
-    if detail.x >= detail.y {
-        out.position = vec4(2.0, 2.0, 0.0, 1.0);
-        return out;
-    }
-    if detail.x > 0.0 || detail.y < 1.0 {
-        let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x517cc1b7u);
-        if threshold < detail.x || threshold >= detail.y {
+    if view.detail_ends.w > 0u {
+        let detail = detail_interval(instance, midpoint.w);
+        if detail.x >= detail.y {
             out.position = vec4(2.0, 2.0, 0.0, 1.0);
             return out;
         }
+        if detail.x > 0.0 || detail.y < 1.0 {
+            let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x517cc1b7u);
+            if threshold < detail.x || threshold >= detail.y {
+                out.position = vec4(2.0, 2.0, 0.0, 1.0);
+                return out;
+            }
+        }
     }
-    let coverage = view.motion.z * near_fade(midpoint.w);
-    if coverage <= 0.0 {
-        out.position = vec4(2.0, 2.0, 0.0, 1.0);
-        return out;
-    }
-    if coverage < 1.0 {
-        let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x9e3779b9u);
-        if select(threshold >= coverage, (threshold < 1.0 - coverage), view.motion.w > 0.0) {
+    if view.viewport.w > view.viewport.z {
+        let coverage = view.motion.z * near_fade(midpoint.w);
+        if coverage <= 0.0 {
             out.position = vec4(2.0, 2.0, 0.0, 1.0);
             return out;
+        }
+        if coverage < 1.0 {
+            let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x9e3779b9u);
+            if select(threshold >= coverage, (threshold < 1.0 - coverage), view.motion.w > 0.0) {
+                out.position = vec4(2.0, 2.0, 0.0, 1.0);
+                return out;
+            }
         }
     }
     let a_ndc = a.xyz / a.w;
     let b_ndc = b.xyz / b.w;
     let half_viewport = view.viewport.xy * 0.5;
     let line = (b_ndc.xy - a_ndc.xy) * half_viewport;
-    let length_px = length(line);
-    let point = length_px < 1e-4;
-    let tangent = select(line / max(length_px, 1e-4), vec2(1.0, 0.0), point);
+    let length_sq = dot(line, line);
+    let inv_len = inverseSqrt(max(length_sq, 1e-8));
+    let tangent = select(line * inv_len, vec2(1.0, 0.0), length_sq < 1e-8);
     let across = vec2(-tangent.y, tangent.x);
     let q = splat.rotation;
     let local_to_kernel = vec4(-q.xyz, q.w);
@@ -724,12 +737,22 @@ fn cutout_vertex(
         return out;
     }
 
+    let cross_r = cross_sigma * radius;
+    let cap = clamp(along_sigma * radius, 0.45, max(cross_r, 0.45) * 1.4) * 0.78539816;
+    let max_width = max(cross_r * midpoint.w / min(a.w, b.w), 0.42);
+    let pad = (abs(across) * max_width + abs(tangent) * cap) / half_viewport;
+    if max(a_ndc.x, b_ndc.x) + pad.x < -1.0 || min(a_ndc.x, b_ndc.x) - pad.x > 1.0
+        || max(a_ndc.y, b_ndc.y) + pad.y < -1.0 || min(a_ndc.y, b_ndc.y) - pad.y > 1.0
+    {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
+
     let tip = (vertex_index & 1u) != 0u;
     let edge = select(-1.0, 1.0, (vertex_index & 2u) != 0u);
     let width_scale = mix(1.0, profile.y, select(span.x, span.y, tip));
     let clip_w = select(a.w, b.w, tip);
-    let width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
-    let cap = clamp(along_sigma * radius, 0.45, max(cross_sigma * radius, 0.45) * 1.4) * 0.78539816;
+    let width = max(cross_r * width_scale * midpoint.w / clip_w, 0.42);
     let along = select(-cap, cap, tip);
     let endpoint = select(a_ndc, b_ndc, tip);
     out.position = vec4(
@@ -743,30 +766,25 @@ fn cutout_vertex(
 
     out.color_leaf = vec4(0.0);
     if vertex_index == 1u {
-        let max_width = max(cross_sigma * radius * midpoint.w / min(a.w, b.w), 0.42);
-        let pad = (abs(across) * max_width + abs(tangent) * cap) / half_viewport;
-        if max(a_ndc.x, b_ndc.x) + pad.x >= -1.0 && min(a_ndc.x, b_ndc.x) - pad.x <= 1.0
-            && max(a_ndc.y, b_ndc.y) + pad.y >= -1.0 && min(a_ndc.y, b_ndc.y) - pad.y <= 1.0
-        {
-            var color = splat.color.rgb;
-            if view.direction_to_light.w > 0.0 {
-                let normal = rotate(q, vec3(0.0, 0.0, 1.0));
-                let unit = normalize(view.normal_from_local * normal);
-                color = segment_light(instance, color, (local_a + local_b) * 0.5, unit, local_b - local_a);
-            }
-            if view.fog.mode != 0u {
-                color = apply_distance_fog(color, (local_a + local_b) * 0.5);
-            }
-            var packed_leaf = 0.0;
-            let blade_px = cross_sigma * radius;
-            if profile.x > 0.0 && profile.y < 1.0 && blade_px >= 1.0 {
-                let seed_frac = fract(profile.x * (127.0 / 6.28318530718));
-                let visible_detail = smoothstep(1.0, 3.0, blade_px);
-                packed_leaf = round(seed_frac * 4095.0) * 4096.0
-                    + (1.0 + round(visible_detail * 4094.0));
-            }
-            out.color_leaf = vec4(color, packed_leaf);
+        var color = splat.color.rgb;
+        let local_mid = (local_a + local_b) * 0.5;
+        if view.direction_to_light.w > 0.0 {
+            let normal = rotate(q, vec3(0.0, 0.0, 1.0));
+            let unit = normalize(view.normal_from_local * normal);
+            let world = (view.world_from_local * vec4(local_mid, 1.0)).xyz;
+            color = segment_light(instance, color, world, unit, local_b - local_a);
         }
+        if view.fog.mode != 0u {
+            color = apply_distance_fog(color, local_mid);
+        }
+        var packed_leaf = 0.0;
+        if profile.x > 0.0 && profile.y < 1.0 && cross_r >= 1.0 {
+            let seed_frac = fract(profile.x * (127.0 / 6.28318530718));
+            let visible_detail = smoothstep(1.0, 3.0, cross_r);
+            packed_leaf = round(seed_frac * 4095.0) * 4096.0
+                + (1.0 + round(visible_detail * 4094.0));
+        }
+        out.color_leaf = vec4(color, packed_leaf);
     }
     return out;
 }

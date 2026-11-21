@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use bevy::{
     prelude::*,
     render::{
         render_resource::{binding_types::*, *},
-        renderer::RenderDevice,
+        renderer::{RenderDevice, RenderQueue},
     },
 };
 use bevy_pbr::{ExtractedDirectionalLight, LightEntity, ViewLightEntities, ViewShadowBindings};
@@ -22,6 +24,12 @@ struct ShadowUniform {
     depth_bias: [f32; 4],
     // Base array layer and number of cascades.
     layers: [u32; 4],
+}
+
+pub(super) struct CachedShadowBinding {
+    buffer: Buffer,
+    texture_view_id: TextureViewId,
+    bind_group: BindGroup,
 }
 
 pub(super) struct ShadowBindings {
@@ -67,13 +75,15 @@ impl ShadowBindings {
             dimension: Some(TextureViewDimension::D2Array),
             ..default()
         });
-        let fallback = bind(
-            device,
-            cache,
-            &layout,
-            &sampler,
-            &view,
-            &ShadowUniform::zeroed(),
+        let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("spaghetti fallback shadow cascades"),
+            contents: bytemuck::bytes_of(&ShadowUniform::zeroed()),
+            usage: BufferUsages::UNIFORM,
+        });
+        let fallback = device.create_bind_group(
+            "spaghetti fallback shadows",
+            &cache.get_bind_group_layout(&layout),
+            &BindGroupEntries::sequential((buffer.as_entire_binding(), &view, &sampler)),
         );
         Self {
             layout,
@@ -86,7 +96,9 @@ impl ShadowBindings {
     pub fn for_view(
         &self,
         device: &RenderDevice,
+        queue: &RenderQueue,
         cache: &PipelineCache,
+        cached: &mut HashMap<(Entity, u32), CachedShadowBinding>,
         entity: Entity,
         (textures, entities): (&ViewShadowBindings, &ViewLightEntities),
         view_depth: Vec4,
@@ -95,6 +107,8 @@ impl ShadowBindings {
     ) -> Vec<(Vec3, BindGroup)> {
         let mut bindings = Vec::new();
         let mut directional_layer = 0;
+        let texture_view = &textures.directional_light_depth_texture_view;
+        let texture_view_id = texture_view.id();
         // Bevy emits directional cascades in texture layer order. Point and
         // spot shadow views in this list don't advance the directional index.
         let mut directional_views = entities
@@ -144,38 +158,43 @@ impl ShadowBindings {
                 uniform.normal_bias[index] = light.shadow_normal_bias * cascade.texel_size;
                 uniform.layers[1] += 1;
             }
-            bindings.push((
-                direction,
-                bind(
-                    device,
-                    cache,
-                    &self.layout,
-                    &self.sampler,
-                    &textures.directional_light_depth_texture_view,
-                    &uniform,
-                ),
-            ));
+            let entry = cached.entry((entity, base)).or_insert_with(|| {
+                let buffer = device.create_buffer(&BufferDescriptor {
+                    label: Some("spaghetti view shadow cascades"),
+                    size: size_of::<ShadowUniform>() as u64,
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = device.create_bind_group(
+                    "spaghetti view shadows",
+                    &cache.get_bind_group_layout(&self.layout),
+                    &BindGroupEntries::sequential((
+                        buffer.as_entire_binding(),
+                        texture_view,
+                        &self.sampler,
+                    )),
+                );
+                CachedShadowBinding {
+                    buffer,
+                    texture_view_id,
+                    bind_group,
+                }
+            });
+            queue.write_buffer(&entry.buffer, 0, bytemuck::bytes_of(&uniform));
+            if entry.texture_view_id != texture_view_id {
+                entry.texture_view_id = texture_view_id;
+                entry.bind_group = device.create_bind_group(
+                    "spaghetti view shadows",
+                    &cache.get_bind_group_layout(&self.layout),
+                    &BindGroupEntries::sequential((
+                        entry.buffer.as_entire_binding(),
+                        texture_view,
+                        &self.sampler,
+                    )),
+                );
+            }
+            bindings.push((direction, entry.bind_group.clone()));
         }
         bindings
     }
-}
-
-fn bind(
-    device: &RenderDevice,
-    cache: &PipelineCache,
-    layout: &BindGroupLayoutDescriptor,
-    sampler: &Sampler,
-    view: &TextureView,
-    uniform: &ShadowUniform,
-) -> BindGroup {
-    let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("spaghetti view shadow cascades"),
-        contents: bytemuck::bytes_of(uniform),
-        usage: BufferUsages::UNIFORM,
-    });
-    device.create_bind_group(
-        "spaghetti view shadows",
-        &cache.get_bind_group_layout(layout),
-        &BindGroupEntries::sequential((buffer.as_entire_binding(), view, sampler)),
-    )
 }
