@@ -348,10 +348,13 @@ fn benchmark_scene_offscreen() {
         .world_mut()
         .query_filtered::<&Camera, With<lake::ReflectedView>>();
     let mut reflected_frames = 0;
+    let mut update_time = Duration::ZERO;
     for sample in &mut frame_times {
         let start = Instant::now();
         for _ in 0..FRAMES_PER_SAMPLE {
+            let update = Instant::now();
             app.update();
+            update_time += update.elapsed();
             reflected_frames += usize::from(reflected.single(app.world()).unwrap().is_active);
         }
         device.poll(PollType::wait_indefinitely()).unwrap();
@@ -361,7 +364,7 @@ fn benchmark_scene_offscreen() {
     frame_times.sort_by(f64::total_cmp);
     let mean = frame_times.iter().sum::<f64>() / SAMPLES as f64;
     println!(
-        "{} × {} offscreen walk ({}), {} frames: {:.2} ms/frame mean ({:.1} FPS), {:.2} ms median block, {:.2} ms slowest block, {reflected_frames} reflection frames",
+        "{} × {} offscreen walk ({}), {} frames: {:.2} ms/frame mean ({:.1} FPS), {:.2} ms median block, {:.2} ms slowest block, {:.2} ms/frame in app.update(), {reflected_frames} reflection frames",
         size.x,
         size.y,
         if away { "away from lake" } else { "trailhead" },
@@ -369,7 +372,8 @@ fn benchmark_scene_offscreen() {
         mean,
         1000.0 / mean,
         (frame_times[4] + frame_times[5]) * 0.5,
-        frame_times[9]
+        frame_times[9],
+        update_time.as_secs_f64() * 1000.0 / (SAMPLES * FRAMES_PER_SAMPLE) as f64,
     );
 }
 

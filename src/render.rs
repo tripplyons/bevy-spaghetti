@@ -550,7 +550,7 @@ fn init_pipeline(
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::VERTEX,
                 (
-                    uniform_buffer_sized(false, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
+                    uniform_buffer_sized(true, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
@@ -854,10 +854,12 @@ struct CloudDraw {
     main_entity: MainEntity,
     cutout_pipeline: Option<CachedRenderPipelineId>,
     source: Buffer,
-    occlusion: Option<BufferId>,
-    uniform: Buffer,
+    occlusion: Option<Buffer>,
     order: Option<Buffer>,
-    bindings: BindGroup,
+    // Built after queueing, once the frame's uniform buffer is large enough.
+    bindings: Option<(BufferId, BindGroup)>,
+    // Byte offset of this frame's `DrawUniform` in the shared uniform buffer.
+    uniform_offset: u32,
     shadows: BindGroup,
     direction: Vec4,
     revision: u64,
@@ -866,7 +868,13 @@ struct CloudDraw {
 }
 
 #[derive(Resource, Default)]
-struct ViewDraws(HashMap<(RetainedViewEntity, Entity), CloudDraw>);
+struct ViewDraws {
+    draws: HashMap<(RetainedViewEntity, Entity), CloudDraw>,
+    // Every draw's uniform for this frame, at a dynamic offset. One upload
+    // replaces a staging buffer and a copy for each draw.
+    uniforms: Option<Buffer>,
+    staging: Vec<u8>,
+}
 
 type SplatView = (
     Entity,
@@ -898,9 +906,13 @@ fn queue_clouds(
     (mut depths, mut order): (Local<Vec<(f32, u32)>>, Local<Vec<u32>>),
     (cascade_views, sun_lights): (Query<&LightEntity>, Query<&ExtractedDirectionalLight>),
 ) {
-    for draw in draws.0.values_mut() {
+    let draws = draws.as_mut();
+    for draw in draws.draws.values_mut() {
         draw.idle_frames += 1;
     }
+    let alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
+    let stride = size_of::<DrawUniform>().next_multiple_of(alignment);
+    draws.staging.clear();
 
     let draw_function = draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let cutout_draw_function = cutout_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
@@ -1114,13 +1126,11 @@ fn queue_clouds(
                 bounds,
                 &mut uniform,
             );
-            let new_draw = || {
-                make_draw(&device, &bind_group_layout, source, gpu, *main_entity, cloud.cutout, shadows)
-            };
-            let draw = draws.0.entry(key).or_insert_with(new_draw);
+            let new_draw = || make_draw(&device, source, gpu, *main_entity, cloud.cutout, shadows);
+            let draw = draws.draws.entry(key).or_insert_with(new_draw);
             if draw.source.id() != source.id()
                 || draw.order.is_none() != cloud.cutout
-                || draw.occlusion != gpu.occlusion.as_ref().map(Buffer::id)
+                || draw.occlusion.as_ref().map(Buffer::id) != gpu.occlusion.as_ref().map(Buffer::id)
             {
                 if draw.cutout_pipeline.is_some() && let Some(phase) = cutout_phase.as_deref_mut() {
                     phase.remove(draw.main_entity);
@@ -1158,7 +1168,9 @@ fn queue_clouds(
                 }
             }
             draw.segments = segments;
-            queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&uniform));
+            draw.uniform_offset = draws.staging.len() as u32;
+            draws.staging.extend_from_slice(bytemuck::bytes_of(&uniform));
+            draws.staging.resize(draw.uniform_offset as usize + stride, 0);
             draw.idle_frames = 0;
             let baked_occlusion = gpu.occlusion.is_some() && cloud.lighting.is_some();
             let variant = usize::from(cloud.cutout)
@@ -1216,9 +1228,43 @@ fn queue_clouds(
             });
         }
     }
+    if !draws.staging.is_empty() {
+        let size = draws.staging.len() as u64;
+        if draws.uniforms.as_ref().is_none_or(|buffer| buffer.size() < size) {
+            draws.uniforms = Some(device.create_buffer(&BufferDescriptor {
+                label: Some("spaghetti draw uniforms"),
+                size: size.next_power_of_two(),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let uniforms = draws.uniforms.as_ref().unwrap();
+        queue.write_buffer(uniforms, 0, &draws.staging);
+        let uniform = BufferBinding {
+            buffer: uniforms,
+            offset: 0,
+            size: NonZeroU64::new(size_of::<DrawUniform>() as u64),
+        };
+        for draw in draws.draws.values_mut().filter(|draw| draw.idle_frames == 0) {
+            if draw.bindings.as_ref().is_some_and(|(id, _)| *id == uniforms.id()) {
+                continue;
+            }
+            let bindings = device.create_bind_group(
+                "spaghetti draw bindings",
+                &bind_group_layout,
+                &BindGroupEntries::sequential((
+                    uniform.clone(),
+                    draw.source.as_entire_binding(),
+                    draw.order.as_ref().unwrap_or(&draw.source).as_entire_binding(),
+                    draw.occlusion.as_ref().unwrap_or(&draw.source).as_entire_binding(),
+                )),
+            );
+            draw.bindings = Some((uniforms.id(), bindings));
+        }
+    }
     // Binned phases retain draws across frames. Remove entries that fell out
     // of range while keeping their buffers briefly for throttled views.
-    draws.0.retain(|&(view, _), draw| {
+    draws.draws.retain(|&(view, _), draw| {
         if draw.idle_frames > 0
             && draw.cutout_pipeline.take().is_some()
             && let Some(phase) = cutout_phases.get_mut(&view)
@@ -1231,7 +1277,6 @@ fn queue_clouds(
 
 fn make_draw(
     device: &RenderDevice,
-    layout: &BindGroupLayout,
     source: &Buffer,
     cloud: &GpuCloud,
     main_entity: MainEntity,
@@ -1239,42 +1284,22 @@ fn make_draw(
     shadows: &BindGroup,
 ) -> CloudDraw {
     let count = cloud.centers.len();
-    let make_buffer = |label, size: usize, usage| {
+    let order = (!cutout).then(|| {
         device.create_buffer(&BufferDescriptor {
-            label: Some(label),
-            size: size as u64,
-            usage: usage | BufferUsages::COPY_DST,
+            label: Some("spaghetti depth order"),
+            size: (count * size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
-    };
-    let uniform = make_buffer(
-        "spaghetti draw uniform",
-        size_of::<DrawUniform>(),
-        BufferUsages::UNIFORM,
-    );
-    let order = (!cutout).then(|| make_buffer(
-        "spaghetti depth order",
-        count * size_of::<u32>(),
-        BufferUsages::STORAGE,
-    ));
-    let bindings = device.create_bind_group(
-        "spaghetti draw bindings",
-        layout,
-        &BindGroupEntries::sequential((
-            uniform.as_entire_binding(),
-            source.as_entire_binding(),
-            order.as_ref().unwrap_or(source).as_entire_binding(),
-            cloud.occlusion.as_ref().unwrap_or(source).as_entire_binding(),
-        )),
-    );
+    });
     CloudDraw {
         main_entity,
         cutout_pipeline: None,
         source: source.clone(),
-        occlusion: cloud.occlusion.as_ref().map(Buffer::id),
-        uniform,
+        occlusion: cloud.occlusion.clone(),
         order,
-        bindings,
+        bindings: None,
+        uniform_offset: 0,
         shadows: shadows.clone(),
         direction: Vec4::NAN,
         revision: 0,
@@ -1298,10 +1323,13 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         let key = (view.retained_view_entity, item.entity());
-        let Some(draw) = draws.into_inner().0.get(&key) else {
+        let Some(draw) = draws.into_inner().draws.get(&key) else {
             return RenderCommandResult::Skip;
         };
-        pass.set_bind_group(0, &draw.bindings, &[]);
+        let Some((_, bindings)) = &draw.bindings else {
+            return RenderCommandResult::Skip;
+        };
+        pass.set_bind_group(0, bindings, &[draw.uniform_offset]);
         pass.set_bind_group(1, &draw.shadows, &[]);
         let instances = if draw.order.is_some() {
             0..draw.segments.len() as u32
