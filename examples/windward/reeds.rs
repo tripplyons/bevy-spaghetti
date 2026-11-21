@@ -242,17 +242,29 @@ struct LinkShape {
     bend_weight: f32,
 }
 
+const LINK_SHAPES: [[LinkShape; PIECES]; PIECES] = [
+    [
+        LinkShape { t: 0.5, bend_weight: 0.307_786_1 },
+        LinkShape { t: 0.0, bend_weight: 0.0 },
+        LinkShape { t: 0.0, bend_weight: 0.0 },
+    ],
+    [
+        LinkShape { t: 0.25, bend_weight: 0.094_732_28 },
+        LinkShape { t: 0.75, bend_weight: 0.613_225_9 },
+        LinkShape { t: 0.0, bend_weight: 0.0 },
+    ],
+    [
+        LinkShape { t: 1.0 / 6.0, bend_weight: 0.047_547_642 },
+        LinkShape { t: 0.5, bend_weight: 0.307_786_1 },
+        LinkShape { t: 5.0 / 6.0, bend_weight: 0.733_547_45 },
+    ],
+];
+
 fn build_cloud(blades: &[Blade], pieces: usize) -> SpaghettiAsset {
-    let links: [LinkShape; PIECES] = std::array::from_fn(|i| {
-        let t = (i as f32 + 0.5) / pieces as f32;
-        LinkShape {
-            t,
-            bend_weight: t.powf(1.7),
-        }
-    });
+    let links = &LINK_SHAPES[pieces - 1][..pieces];
     let mut splats = Vec::with_capacity(blades.len() * pieces);
     for blade in blades {
-        blade.append_splats(&links[..pieces], &mut splats);
+        blade.append_splats(links, &mut splats);
     }
     SpaghettiAsset::new(splats).expect("finite, nonempty reed patch")
 }

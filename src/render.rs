@@ -1,4 +1,8 @@
-use std::{collections::HashMap, num::NonZeroU64, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU64,
+    ops::Range,
+};
 
 use bevy::{
     asset::{AssetLoader, LoadContext, embedded_asset, io::Reader, load_embedded_asset},
@@ -272,7 +276,9 @@ impl Plugin for SpaghettiPlugin {
                 RenderAssetPlugin::<GpuCloud>::default(),
                 ExtractComponentPlugin::<Spaghetti3d>::default(),
                 ExtractComponentPlugin::<NoSpaghettiShadows>::default(),
-            ));
+            ))
+            .add_observer(reprepare_on_flag::<SpaghettiCutout>)
+            .add_observer(reprepare_on_flag::<SpaghettiCastShadows>);
         embedded_asset!(app, "spaghetti.wgsl");
         embedded_asset!(app, "shadow.wgsl");
 
@@ -285,7 +291,11 @@ impl Plugin for SpaghettiPlugin {
                 .init_resource::<ViewDraws>()
                 .init_resource::<ViewFog>()
                 .init_resource::<PointLights>()
-                .add_systems(ExtractSchedule, (extract_view_fog, extract_point_lights))
+                .init_resource::<CloudAssetUsage>()
+                .add_systems(
+                    ExtractSchedule,
+                    (extract_view_fog, extract_point_lights, extract_cloud_asset_usage),
+                )
                 .add_systems(RenderStartup, init_pipeline)
                 .add_systems(Render, queue_clouds.in_set(RenderSystems::QueueMeshes));
         }
@@ -322,10 +332,45 @@ impl AssetLoader for SpaghettiLoader {
     }
 }
 
+#[derive(Resource, Default)]
+struct CloudAssetUsage {
+    clustered: HashSet<AssetId<SpaghettiAsset>>,
+    shadowed: HashSet<AssetId<SpaghettiAsset>>,
+}
+
+fn extract_cloud_asset_usage(
+    mut usage: ResMut<CloudAssetUsage>,
+    clouds: Extract<Query<(&Spaghetti3d, Has<SpaghettiCutout>, Has<SpaghettiCastShadows>)>>,
+) {
+    usage.clustered.clear();
+    usage.shadowed.clear();
+    for (cloud, cutout, cast_shadows) in &clouds {
+        let id = cloud.0.id();
+        if cutout || cast_shadows {
+            usage.clustered.insert(id);
+        }
+        if cast_shadows {
+            usage.shadowed.insert(id);
+        }
+    }
+}
+
+fn reprepare_on_flag<C: Component>(
+    trigger: On<Add<C>>,
+    clouds: Query<&Spaghetti3d>,
+    mut assets: ResMut<Assets<SpaghettiAsset>>,
+) {
+    if let Ok(cloud) = clouds.get(trigger.entity) {
+        let _ = assets.get_mut(&cloud.0);
+    }
+}
+
 #[derive(Component)]
 pub struct ExtractedCloud {
     asset: AssetId<SpaghettiAsset>,
     world_from_local: Mat4,
+    inverse_basis: Option<Mat3>,
+    local_sway: Option<Vec3>,
     layers: RenderLayers,
     disable_culling: bool,
     lighting: Option<SpaghettiLighting>,
@@ -334,7 +379,6 @@ pub struct ExtractedCloud {
     transmission: f32,
     cutout: bool,
     wind: Option<SpaghettiWind>,
-    sway: Option<Vec3>,
     range: Option<VisibilityRange>,
     near_fade: Option<SpaghettiNearFade>,
     detail_scale: f32,
@@ -393,36 +437,50 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             (near_fade, detail_scale, specular, additive, flow, cast_shadows),
         ): QueryItem<'_, '_, Self::QueryData>,
     ) -> Option<Self::Out> {
-        visibility.get().then(|| ExtractedCloud {
-            asset: cloud.0.id(),
-            world_from_local: transform.to_matrix(),
-            layers: layers.cloned().unwrap_or_default(),
-            disable_culling,
-            lighting: lighting.copied(),
-            ground_ambient: ground_ambient.copied(),
-            receive_shadows,
-            transmission: transmission.map_or(0.0, |t| t.0.max(0.0)),
-            cutout,
-            wind: wind.copied(),
-            sway: sway.map(|sway| sway.0).filter(|sway| sway.is_finite()),
-            range: range.cloned(),
-            near_fade: near_fade.copied(),
-            detail_scale: detail_scale
-                .map(|scale| scale.0)
-                .filter(|scale| scale.is_finite() && *scale > 0.0)
-                .unwrap_or(1.0),
-            specular: specular
-                .copied()
-                .filter(|specular| specular.strength > 0.0 && specular.shininess.is_finite()),
-            additive: additive && !cutout,
-            flow: flow.copied().filter(|flow| {
+        visibility.get().then(|| {
+            let world_from_local = transform.to_matrix();
+            let wind = wind.copied();
+            let sway = sway.map(|sway| sway.0).filter(|sway| sway.is_finite());
+            let flow = flow.copied().filter(|flow| {
                 !cutout
                     && flow.period > 0.0
                     && flow.period.is_finite()
                     && flow.time.is_finite()
                     && flow.velocity.is_finite()
-            }),
-            cast_shadows,
+            });
+            let inverse_basis = (sway.is_some() || wind.is_some() || flow.is_some())
+                .then(|| Mat3::from_mat4(world_from_local).inverse())
+                .filter(|inverse| inverse.is_finite());
+            let local_sway = sway
+                .zip(inverse_basis)
+                .map(|(slope, inverse)| inverse * slope)
+                .filter(|sway| sway.is_finite());
+            ExtractedCloud {
+                asset: cloud.0.id(),
+                world_from_local,
+                inverse_basis,
+                local_sway,
+                layers: layers.cloned().unwrap_or_default(),
+                disable_culling,
+                lighting: lighting.copied(),
+                ground_ambient: ground_ambient.copied(),
+                receive_shadows,
+                transmission: transmission.map_or(0.0, |t| t.0.max(0.0)),
+                cutout,
+                wind,
+                range: range.cloned(),
+                near_fade: near_fade.copied(),
+                detail_scale: detail_scale
+                    .map(|scale| scale.0)
+                    .filter(|scale| scale.is_finite() && *scale > 0.0)
+                    .unwrap_or(1.0),
+                specular: specular
+                    .copied()
+                    .filter(|specular| specular.strength > 0.0 && specular.shininess.is_finite()),
+                additive: additive && !cutout,
+                flow,
+                cast_shadows,
+            }
         })
     }
 }
@@ -596,7 +654,7 @@ struct GpuCloud {
 
 impl RenderAsset for GpuCloud {
     type SourceAsset = SpaghettiAsset;
-    type Param = (SRes<RenderDevice>, SRes<RenderQueue>);
+    type Param = (SRes<RenderDevice>, SRes<RenderQueue>, SRes<CloudAssetUsage>);
 
     fn byte_len(asset: &Self::SourceAsset) -> Option<usize> {
         Some(
@@ -608,19 +666,17 @@ impl RenderAsset for GpuCloud {
 
     fn prepare_asset(
         asset: Self::SourceAsset,
-        _: AssetId<Self::SourceAsset>,
-        (device, queue): &mut SystemParamItem<Self::Param>,
+        id: AssetId<Self::SourceAsset>,
+        (device, queue, usage): &mut SystemParamItem<Self::Param>,
         previous: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
-        let (order, clusters) = cluster_segments(&asset);
-        let sorted: Vec<GaussianSegment> =
-            order.iter().map(|&index| asset.segments()[index as usize]).collect();
-        let data: &[u8] = bytemuck::cast_slice(&sorted);
+        let need_clusters = usage.clustered.contains(&id);
+        let need_shadow = usage.shadowed.contains(&id);
         let revision = previous.map_or(0, |cloud| cloud.revision.wrapping_add(1));
-        if data.len() > device.limits().max_storage_buffer_binding_size as usize {
+        let byte_len = std::mem::size_of_val(asset.segments());
+        if byte_len > device.limits().max_storage_buffer_binding_size as usize {
             error!(
-                "Spaghetti asset requires {} storage bytes, exceeding this GPU's limit",
-                data.len()
+                "Spaghetti asset requires {byte_len} storage bytes, exceeding this GPU's limit"
             );
             return Ok(Self {
                 segments: None,
@@ -634,6 +690,23 @@ impl RenderAsset for GpuCloud {
                 revision,
             });
         }
+        let (order, clusters) = if need_clusters {
+            let (order, clusters) = cluster_segments(&asset);
+            (Some(order), clusters)
+        } else {
+            (None, Box::new([]) as Box<[Cluster]>)
+        };
+        let sorted_storage: Vec<GaussianSegment>;
+        let sorted: &[GaussianSegment] = if let Some(order) = &order {
+            sorted_storage = order
+                .iter()
+                .map(|&index| asset.segments()[index as usize])
+                .collect();
+            &sorted_storage
+        } else {
+            asset.segments()
+        };
+        let data: &[u8] = bytemuck::cast_slice(sorted);
         let (min, max) = asset.bounds();
         let centers = sorted
             .iter()
@@ -654,30 +727,36 @@ impl RenderAsset for GpuCloud {
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             })
         };
-        let shadow_sorted = build_shadow_segments(&sorted, &clusters, min, max);
-        let shadow_data: &[u8] = bytemuck::cast_slice(&shadow_sorted);
-        let existing_shadow = previous
-            .and_then(|cloud| cloud.shadow_segments.as_ref())
-            .filter(|buffer| buffer.size() == shadow_data.len() as u64);
-        let shadow_segments = if let Some(buffer) = existing_shadow {
-            queue.write_buffer(buffer, 0, shadow_data);
-            buffer.clone()
-        } else {
-            device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("spaghetti shadow segment data"),
-                contents: shadow_data,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            })
-        };
-        let occlusion = (!asset.occlusion().is_empty()).then(|| {
-            let packed: Vec<_> = order
-                .iter()
-                .map(|&index| {
-                    let [ambient, directional] = asset.occlusion()[index as usize];
-                    let pack = |factor: f32| (factor * 65535.0).round() as u32;
-                    pack(ambient) | (pack(directional) << 16)
+        let shadow_segments = need_shadow.then(|| {
+            let shadow_sorted = build_shadow_segments(sorted, &clusters, min, max);
+            let shadow_data: &[u8] = bytemuck::cast_slice(&shadow_sorted);
+            let existing_shadow = previous
+                .and_then(|cloud| cloud.shadow_segments.as_ref())
+                .filter(|buffer| buffer.size() == shadow_data.len() as u64);
+            if let Some(buffer) = existing_shadow {
+                queue.write_buffer(buffer, 0, shadow_data);
+                buffer.clone()
+            } else {
+                device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("spaghetti shadow segment data"),
+                    contents: shadow_data,
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
                 })
-                .collect();
+            }
+        });
+        let occlusion = (!asset.occlusion().is_empty()).then(|| {
+            let pack = |[ambient, directional]: [f32; 2]| {
+                let quantize = |factor: f32| (factor * 65535.0).round() as u32;
+                quantize(ambient) | (quantize(directional) << 16)
+            };
+            let packed: Vec<u32> = if let Some(order) = &order {
+                order
+                    .iter()
+                    .map(|&index| pack(asset.occlusion()[index as usize]))
+                    .collect()
+            } else {
+                asset.occlusion().iter().copied().map(pack).collect()
+            };
             device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("spaghetti occlusion attributes"),
                 contents: bytemuck::cast_slice(&packed),
@@ -686,17 +765,33 @@ impl RenderAsset for GpuCloud {
         });
         Ok(Self {
             segments: Some(segments),
-            shadow_segments: Some(shadow_segments),
+            shadow_segments,
             occlusion,
             centers,
             clusters,
             bounds: Aabb::from_min_max(min, max),
-            max_bend_height: asset.segments().iter().map(|segment| segment.max_bend_height()).fold(0.0, f32::max),
+            max_bend_height: asset
+                .segments()
+                .iter()
+                .map(|segment| segment.max_bend_height())
+                .fold(0.0, f32::max),
             detail: asset.detail_transitions().into(),
             revision,
         })
     }
 }
+
+// 7-bit bit-reversed permutation for CLUSTER_SIZE == 128, so any prefix of a
+// cluster is an evenly spread subset without per-cluster sorting or allocation.
+const BIT_REVERSE_128: [u8; CLUSTER_SIZE as usize] = {
+    let mut table = [0u8; CLUSTER_SIZE as usize];
+    let mut i = 0;
+    while i < CLUSTER_SIZE as usize {
+        table[i] = (i as u8).reverse_bits() >> 1;
+        i += 1;
+    }
+    table
+};
 
 /// Orders each detail level along a Morton curve and splits it into clusters.
 /// Returns the source index of each sorted segment and the clusters.
@@ -761,10 +856,11 @@ fn cluster_segments(asset: &SpaghettiAsset) -> (Vec<u32>, Box<[Cluster]>) {
             });
             // Store each cluster in bit-reversed curve order, so that any
             // prefix of it is an evenly spread subset for thinned shadows.
-            let bits = (chunk.len() as u32).next_power_of_two().trailing_zeros();
-            let mut spread_order: Vec<u32> = (0..chunk.len() as u32).collect();
-            spread_order.sort_by_key(|&slot| slot.reverse_bits() >> (32 - bits.max(1)));
-            order.extend(spread_order.iter().map(|&slot| chunk[slot as usize].1));
+            for &slot in &BIT_REVERSE_128 {
+                if let Some(&(_, index)) = chunk.get(slot as usize) {
+                    order.push(index);
+                }
+            }
         }
     }
     (order, clusters.into())
@@ -1539,14 +1635,8 @@ fn queue_clouds(
             if coverage <= 0.0 || (cutout && cutout_phase.is_none()) {
                 continue;
             }
-            let inverse_basis = (cloud.sway.is_some() || cloud.wind.is_some() || cloud.flow.is_some())
-                .then(|| Mat3::from_mat4(cloud.world_from_local).inverse())
-                .filter(|inverse| inverse.is_finite());
-            let sway = cloud
-                .sway
-                .zip(inverse_basis)
-                .map(|(slope, inverse)| inverse * slope)
-                .filter(|sway| sway.is_finite());
+            let inverse_basis = cloud.inverse_basis;
+            let sway = cloud.local_sway;
             let mut bounds = gpu.bounds;
             if let Some(sway) = sway {
                 bounds.half_extents += Vec3A::from(sway.abs() * gpu.max_bend_height);
