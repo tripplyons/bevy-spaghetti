@@ -29,7 +29,7 @@ mod tests;
 use bevy::{
     anti_alias::smaa::{Smaa, SmaaPreset},
     camera::{Hdr, visibility::RenderLayers},
-    light::{GeneratedEnvironmentMapLight, Skybox},
+    light::{EnvironmentMapLight, Skybox, cluster::GlobalClusterSettings},
     prelude::*,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
@@ -80,6 +80,11 @@ fn add_scene(app: &mut App) {
         color: Color::srgb(0.69, 0.76, 0.94),
         brightness: 160.0,
         ..default()
+    })
+    .add_systems(Startup, |mut clusters: ResMut<GlobalClusterSettings>| {
+        // Windward has one local light. The CPU can assign it to clusters
+        // without the GPU passes that build light lists for each view.
+        clusters.gpu_clustering = None;
     })
     .add_systems(
         Startup,
@@ -170,14 +175,17 @@ fn spawn_camera(
             preset: SmaaPreset::Ultra,
         },
         Skybox {
-            image: Some(sky.clone()),
+            image: Some(sky),
             brightness: 3750.0,
             // The HDRI's sun sits toward +z; turn it to match `SUN`.
             rotation: SKY_ROTATION,
             ..default()
         },
-        GeneratedEnvironmentMapLight {
-            environment_map: sky,
+        // Prefiltered from sky.dds with Bevy's diffuse and specular filters.
+        // Both views share these maps, so the static sky needs no per-frame bake.
+        EnvironmentMapLight {
+            diffuse_map: server.load("windward/sky-diffuse.ktx2"),
+            specular_map: server.load("windward/sky-specular.ktx2"),
             intensity: 1450.0,
             rotation: SKY_ROTATION,
             ..default()
