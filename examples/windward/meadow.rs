@@ -1,8 +1,8 @@
 //! Chunked Gaussian grass blades with GPU wind and two detail levels.
 use bevy::{camera::visibility::VisibilityRange, prelude::*};
 use bevy_spaghetti::{
-    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting,
-    SpaghettiSpecular, SpaghettiTransmission, SpaghettiWind,
+    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
+    SpaghettiLighting, SpaghettiSpecular, SpaghettiTransmission, SpaghettiWind,
 };
 
 use crate::{
@@ -14,7 +14,9 @@ use crate::{
 const CHUNK: f32 = 8.0;
 const NEAR_REGION: (Vec2, Vec2) = (Vec2::new(-44.0, -70.0), Vec2::new(46.0, 32.0));
 const FAR_REGION: (Vec2, Vec2) = (Vec2::new(-64.0, -92.0), Vec2::new(64.0, 40.0));
-const NEAR_END: std::ops::Range<f32> = 10.0..15.0;
+/// Projected pixels per meter where dense near grass hands over to widened far
+/// grass (~10–15 m at 800p, and half that distance in the half-res lake reflection).
+const NEAR_HANDOVER: [f32; 2] = [52.0, 78.0];
 const FAR_END: std::ops::Range<f32> = 74.0..92.0;
 /// Clumps per square meter before the density mask removes some of them.
 const CLUMPS: f32 = 9.0;
@@ -261,62 +263,59 @@ pub fn spawn_meadow(
                 continue;
             }
             let origin = Vec3::new(center.x, ground(center), center.y);
-            for (dense, name, levels, stride, range) in [
-                (
-                    false,
-                    "Meadow grass, far",
-                    FAR_LEVELS.as_slice(),
-                    FAR_STRIDE,
-                    VisibilityRange {
-                        start_margin: if near { NEAR_END } else { 0.0..0.0 },
-                        end_margin: FAR_END,
-                        use_aabb: false,
-                    },
-                ),
-                (
-                    true,
-                    "Meadow grass",
-                    NEAR_LEVELS.as_slice(),
-                    1,
-                    VisibilityRange {
-                        start_margin: 0.0..0.0,
-                        end_margin: NEAR_END,
-                        use_aabb: false,
-                    },
-                ),
-            ] {
-                if dense && !near {
-                    continue;
+            let far_count = blades.len().div_ceil(FAR_STRIDE) * (FAR_LEVELS.len() - 1);
+            let near_count = if near {
+                blades.len() * (NEAR_LEVELS.len() - 1)
+            } else {
+                0
+            };
+            let mut segments = Vec::with_capacity(near_count + far_count);
+            if near {
+                for &blade in &blades {
+                    blade.append(&mut segments, origin, &NEAR_LEVELS);
                 }
-                let mut segments =
-                    Vec::with_capacity(blades.len().div_ceil(stride) * (levels.len() - 1));
-                for blade in blades.iter().step_by(stride) {
-                    let blade = if dense {
-                        *blade
-                    } else {
-                        Blade {
-                            width: blade.width * 2.8,
-                            flower: None,
-                            ..*blade
-                        }
-                    };
-                    blade.append(&mut segments, origin, levels);
-                }
-                commands.spawn((
-                    Name::new(name),
-                    Meadow,
-                    Spaghetti3d(
-                        clouds.add(SpaghettiAsset::new(segments).expect("valid grass splats")),
-                    ),
-                    SpaghettiCutout,
-                    lighting,
-                    SpaghettiTransmission(0.45),
-                    BLADE_SHEEN,
-                    wind,
-                    Transform::from_translation(origin),
-                    range,
-                ));
             }
+            let finer_end = segments.len() as u32;
+            for blade in blades.iter().step_by(FAR_STRIDE) {
+                let blade = Blade {
+                    width: blade.width * 2.8,
+                    flower: None,
+                    ..*blade
+                };
+                blade.append(&mut segments, origin, &FAR_LEVELS);
+            }
+            let asset = if near && finer_end > 0 && (finer_end as usize) < segments.len() {
+                SpaghettiAsset::with_detail(
+                    segments,
+                    &[DetailTransition {
+                        finer_end,
+                        pixels_per_unit: NEAR_HANDOVER,
+                    }],
+                )
+            } else {
+                SpaghettiAsset::new(segments)
+            }
+            .expect("valid grass splats");
+            commands.spawn((
+                Name::new(if near {
+                    "Meadow grass"
+                } else {
+                    "Meadow grass, far"
+                }),
+                Meadow,
+                Spaghetti3d(clouds.add(asset)),
+                SpaghettiCutout,
+                lighting,
+                SpaghettiTransmission(0.45),
+                BLADE_SHEEN,
+                wind,
+                Transform::from_translation(origin),
+                VisibilityRange {
+                    start_margin: 0.0..0.0,
+                    end_margin: FAR_END,
+                    use_aabb: false,
+                },
+            ));
         }
     }
 }
