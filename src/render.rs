@@ -45,7 +45,9 @@ use bevy_pbr::{
 };
 use bytemuck::{Pod, Zeroable};
 
-use crate::{AssetError, DetailTransition, SpaghettiAsset, asset::MAX_DETAIL_TRANSITIONS};
+use crate::{
+    AssetError, DetailTransition, GaussianSegment, SpaghettiAsset, asset::MAX_DETAIL_TRANSITIONS,
+};
 
 mod shadow;
 use shadow::{ShadowBindings, ShadowViewData};
@@ -412,11 +414,26 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
     }
 }
 
+/// Segments in one culling cluster. The shader packs `count - 1` into the
+/// low seven bits of a cluster entry.
+const CLUSTER_SIZE: u32 = 128;
+
+/// Spatially close segments of one detail level, culled together.
+struct Cluster {
+    first: u32,
+    count: u32,
+    /// Local box around every kernel's faint shadow edge, before bending.
+    center: Vec3,
+    half_extents: Vec3,
+}
+
 struct GpuCloud {
     segments: Option<Buffer>,
     occlusion: Option<Buffer>,
     // XYZ is the segment midpoint. W is its average endpoint bend height.
     centers: Box<[Vec4]>,
+    // In segment order. The upload sorts each level along a Morton curve.
+    clusters: Box<[Cluster]>,
     bounds: Aabb,
     max_bend_height: f32,
     detail: Box<[DetailTransition]>,
@@ -437,7 +454,10 @@ impl RenderAsset for GpuCloud {
         (device, queue): &mut SystemParamItem<Self::Param>,
         previous: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
-        let data = bytemuck::cast_slice(asset.segments());
+        let (order, clusters) = cluster_segments(&asset);
+        let sorted: Vec<GaussianSegment> =
+            order.iter().map(|&index| asset.segments()[index as usize]).collect();
+        let data: &[u8] = bytemuck::cast_slice(&sorted);
         let revision = previous.map_or(0, |cloud| cloud.revision.wrapping_add(1));
         if data.len() > device.limits().max_storage_buffer_binding_size as usize {
             error!(
@@ -448,6 +468,7 @@ impl RenderAsset for GpuCloud {
                 segments: None,
                 occlusion: None,
                 centers: Box::new([]),
+                clusters: Box::new([]),
                 bounds: Aabb::from_min_max(Vec3::ZERO, Vec3::ZERO),
                 max_bend_height: 0.0,
                 detail: Box::new([]),
@@ -455,8 +476,7 @@ impl RenderAsset for GpuCloud {
             });
         }
         let (min, max) = asset.bounds();
-        let centers = asset
-            .segments()
+        let centers = sorted
             .iter()
             .map(|segment| {
                 (segment.start() * 0.5 + segment.end() * 0.5).extend(segment.mean_bend_height())
@@ -476,12 +496,12 @@ impl RenderAsset for GpuCloud {
             })
         };
         let occlusion = (!asset.occlusion().is_empty()).then(|| {
-            let packed: Vec<_> = asset
-                .occlusion()
+            let packed: Vec<_> = order
                 .iter()
-                .map(|[ambient, directional]| {
+                .map(|&index| {
+                    let [ambient, directional] = asset.occlusion()[index as usize];
                     let pack = |factor: f32| (factor * 65535.0).round() as u32;
-                    pack(*ambient) | (pack(*directional) << 16)
+                    pack(ambient) | (pack(directional) << 16)
                 })
                 .collect();
             device.create_buffer_with_data(&BufferInitDescriptor {
@@ -494,6 +514,7 @@ impl RenderAsset for GpuCloud {
             segments: Some(segments),
             occlusion,
             centers,
+            clusters,
             bounds: Aabb::from_min_max(min, max),
             max_bend_height: asset.segments().iter().map(|segment| segment.max_bend_height()).fold(0.0, f32::max),
             detail: asset.detail_transitions().into(),
@@ -502,7 +523,150 @@ impl RenderAsset for GpuCloud {
     }
 }
 
+/// Orders each detail level along a Morton curve and splits it into clusters.
+/// Returns the source index of each sorted segment and the clusters.
+fn cluster_segments(asset: &SpaghettiAsset) -> (Vec<u32>, Box<[Cluster]>) {
+    let segments = asset.segments();
+    let ends = asset
+        .detail_transitions()
+        .iter()
+        .map(|transition| transition.finer_end)
+        .chain([segments.len() as u32]);
+    let midpoint = |segment: &GaussianSegment| (segment.start() + segment.end()) * 0.5;
+    // Spreads ten bits so that three of them interleave.
+    let spread = |value: u32| {
+        let mut x = value & 0x3ff;
+        x = (x | (x << 16)) & 0x0300_00ff;
+        x = (x | (x << 8)) & 0x0300_f00f;
+        x = (x | (x << 4)) & 0x030c_30c3;
+        (x | (x << 2)) & 0x0924_9249
+    };
+    let mut order = Vec::with_capacity(segments.len());
+    let mut clusters = Vec::new();
+    let mut keyed = Vec::new();
+    let mut start = 0;
+    for end in ends {
+        let level = start..end;
+        start = end;
+        let (low, high) = segments[level.start as usize..level.end as usize].iter().fold(
+            (Vec3::INFINITY, Vec3::NEG_INFINITY),
+            |(low, high), segment| (low.min(midpoint(segment)), high.max(midpoint(segment))),
+        );
+        let scale = 1023.0 / (high - low).max(Vec3::splat(1e-6));
+        keyed.clear();
+        keyed.extend(level.map(|index| {
+            let cell = ((midpoint(&segments[index as usize]) - low) * scale).as_uvec3();
+            (spread(cell.x) | (spread(cell.y) << 1) | (spread(cell.z) << 2), index)
+        }));
+        radsort::sort_by_key(&mut keyed, |entry| entry.0);
+        for chunk in keyed.chunks(CLUSTER_SIZE as usize) {
+            let (low, high) = chunk.iter().fold(
+                (Vec3::INFINITY, Vec3::NEG_INFINITY),
+                |(low, high), &(_, index)| {
+                    let segment = &segments[index as usize];
+                    let sigma = segment.sigma();
+                    let length = segment.start().distance(segment.end());
+                    let area = 2.506628 * sigma.x * length.max(2.506628 * sigma.y);
+                    // The shadow footprint ends where optical depth is 0.03,
+                    // the widest edge that any pass draws.
+                    let peak = segment.mass() / area.max(1e-12);
+                    let radius = (2.0 * (peak / 0.03).max(1.0).ln()).sqrt().max(4.0);
+                    let reach = Vec3::splat(radius * sigma.max_element());
+                    (
+                        low.min(segment.start().min(segment.end()) - reach),
+                        high.max(segment.start().max(segment.end()) + reach),
+                    )
+                },
+            );
+            clusters.push(Cluster {
+                first: order.len() as u32,
+                count: chunk.len() as u32,
+                center: (low + high) * 0.5,
+                half_extents: (high - low) * 0.5,
+            });
+            order.extend(chunk.iter().map(|&(_, index)| index));
+        }
+    }
+    (order, clusters.into())
+}
+
 impl GpuCloud {
+    /// Appends the clusters of `segments` that can draw and returns their
+    /// count. A cluster is dropped when it lies outside a frustum plane or
+    /// outside the depth band where its detail level shows.
+    #[expect(clippy::too_many_arguments, reason = "one draw's culling inputs")]
+    fn cull_clusters(
+        &self,
+        segments: Range<u32>,
+        frustum: Option<&Frustum>,
+        cull_bands: bool,
+        (world_from_local, clip_from_local): (Mat4, Mat4),
+        bending: Vec3,
+        uniform: &DrawUniform,
+        visible: &mut Vec<u32>,
+    ) -> u32 {
+        let first = self.clusters.partition_point(|cluster| cluster.first < segments.start);
+        let last = self.clusters.partition_point(|cluster| cluster.first < segments.end);
+        let clusters = &self.clusters[first..last];
+        let pack = |cluster: &Cluster| (cluster.first << 7) | (cluster.count - 1);
+        // Local planes that the whole cloud does not already satisfy. An
+        // infinite plane, such as a cascade's pushed-out near plane, never culls.
+        let object = Aabb {
+            center: self.bounds.center,
+            half_extents: self.bounds.half_extents + Vec3A::from(bending),
+        };
+        let mut planes = [Vec4::ZERO; 6];
+        let mut plane_count = 0;
+        for half_space in frustum.map_or(&[][..], |frustum| &frustum.half_spaces[..]) {
+            let world = half_space.normal_d();
+            if !world.is_finite() {
+                continue;
+            }
+            let local = world_from_local.transpose() * world;
+            let normal = local.truncate();
+            let center = Vec3::from(object.center);
+            if normal.dot(center) + local.w - normal.abs().dot(object.half_extents.into()) < 0.0 {
+                planes[plane_count] = local;
+                plane_count += 1;
+            }
+        }
+        let planes = &planes[..plane_count];
+        let bands = if cull_bands { uniform.detail_ends[3] as usize } else { 0 };
+        if planes.is_empty() && bands == 0 {
+            visible.extend(clusters.iter().map(pack));
+            return clusters.len() as u32;
+        }
+        let depth = clip_from_local.row(3);
+        let start = visible.len();
+        for cluster in clusters {
+            let half = cluster.half_extents + bending;
+            if planes.iter().any(|plane| {
+                let normal = plane.truncate();
+                normal.dot(cluster.center) + plane.w + normal.abs().dot(half) < 0.0
+            }) {
+                continue;
+            }
+            if bands > 0 {
+                let center = depth.truncate().dot(cluster.center) + depth.w;
+                let radius = depth.truncate().abs().dot(half);
+                // Transitions before this cluster set its level within the draw.
+                let level = uniform.detail_ends[..bands]
+                    .iter()
+                    .filter(|&&end| end <= cluster.first)
+                    .count();
+                // A level shows nearer than its own transition's far edge and
+                // farther than the previous transition's near edge.
+                if (level < bands && center - radius >= uniform.detail_depths[level][1])
+                    || (level > 0 && center + radius <= uniform.detail_depths[level - 1][0])
+                {
+                    continue;
+                }
+            }
+            visible.push(pack(cluster));
+        }
+        (visible.len() - start) as u32
+    }
+
     // Drop complete levels whose bands are outside the depth interval of the
     // cloud. This also keeps distant draws at the cost of a single coarse level.
     fn select_segments(
@@ -888,6 +1052,8 @@ struct DrawUniform {
     lamp: [f32; 4],
     // Color at one unit of distance, then the squared source radius.
     lamp_color: [f32; 4],
+    // Offset of this draw's visible clusters in the frame's cluster list.
+    clusters: [u32; 4],
 }
 
 impl DrawUniform {
@@ -917,13 +1083,16 @@ struct CloudDraw {
     occlusion: Option<Buffer>,
     order: Option<Buffer>,
     // Built after queueing, once the frame's uniform buffer is large enough.
-    bindings: Option<(BufferId, BindGroup)>,
+    // The IDs are the uniform buffer and the buffer at binding 2.
+    bindings: Option<(BufferId, BufferId, BindGroup)>,
     // Byte offset of this frame's `DrawUniform` in the shared uniform buffer.
     uniform_offset: u32,
     shadows: BindGroup,
     direction: Vec4,
     revision: u64,
     segments: Range<u32>,
+    // Instances to draw. A cutout draws `CLUSTER_SIZE` per visible cluster.
+    instances: Range<u32>,
     idle_frames: u8,
 }
 
@@ -934,6 +1103,11 @@ struct ViewDraws {
     // replaces a staging buffer and a copy for each draw.
     uniforms: Option<Buffer>,
     staging: Vec<u8>,
+    // Packed visible clusters of every cutout draw in this frame. Each entry
+    // is the cluster's first segment shifted left by seven bits, plus its
+    // count minus one.
+    clusters: Vec<u32>,
+    cluster_buffer: Option<Buffer>,
 }
 
 type SplatView = (
@@ -1027,6 +1201,7 @@ fn queue_clouds(
     let alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
     let stride = size_of::<DrawUniform>().next_multiple_of(alignment);
     draws.staging.clear();
+    draws.clusters.clear();
 
     let draw_function = draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let cutout_draw_function = cutout_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
@@ -1262,6 +1437,22 @@ fn queue_clouds(
                 bounds,
                 &mut uniform,
             );
+            let mut instances = 0..segments.len() as u32;
+            if cutout {
+                // Flow moves segments out of their clusters' boxes.
+                let cull = !cloud.disable_culling && cloud.flow.is_none();
+                uniform.clusters[0] = draws.clusters.len() as u32;
+                let visible = gpu.cull_clusters(
+                    segments.clone(),
+                    cull.then_some(()).and(frustum),
+                    cull,
+                    (cloud.world_from_local, clip_from_local),
+                    Vec3::from(bounds.half_extents - gpu.bounds.half_extents),
+                    &uniform,
+                    &mut draws.clusters,
+                );
+                instances = 0..visible * CLUSTER_SIZE;
+            }
             let new_draw = || make_draw(&device, source, gpu, *main_entity, cutout, shadow_view, shadows);
             let draw = draws.draws.entry(key).or_insert_with(new_draw);
             if draw.source.id() != source.id()
@@ -1304,6 +1495,7 @@ fn queue_clouds(
                 }
             }
             draw.segments = segments;
+            draw.instances = instances;
             draw.uniform_offset = draws.staging.len() as u32;
             draws.staging.extend_from_slice(bytemuck::bytes_of(&uniform));
             draws.staging.resize(draw.uniform_offset as usize + stride, 0);
@@ -1378,8 +1570,25 @@ fn queue_clouds(
             offset: 0,
             size: NonZeroU64::new(size_of::<DrawUniform>() as u64),
         };
+        let cluster_size = (draws.clusters.len() * size_of::<u32>()).max(256) as u64;
+        if draws.cluster_buffer.as_ref().is_none_or(|buffer| buffer.size() < cluster_size) {
+            draws.cluster_buffer = Some(device.create_buffer(&BufferDescriptor {
+                label: Some("spaghetti visible clusters"),
+                size: cluster_size.next_power_of_two(),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let clusters = draws.cluster_buffer.as_ref().unwrap();
+        if !draws.clusters.is_empty() {
+            queue.write_buffer(clusters, 0, bytemuck::cast_slice(&draws.clusters));
+        }
         for draw in draws.draws.values_mut().filter(|draw| draw.idle_frames == 0) {
-            if draw.bindings.as_ref().is_some_and(|(id, _)| *id == uniforms.id()) {
+            // Cutouts read their cluster list where sorted draws read the order.
+            let listed = draw.order.as_ref().unwrap_or(clusters);
+            if draw.bindings.as_ref().is_some_and(|(uniform_id, listed_id, _)| {
+                *uniform_id == uniforms.id() && *listed_id == listed.id()
+            }) {
                 continue;
             }
             let bindings = device.create_bind_group(
@@ -1388,11 +1597,11 @@ fn queue_clouds(
                 &BindGroupEntries::sequential((
                     uniform.clone(),
                     draw.source.as_entire_binding(),
-                    draw.order.as_ref().unwrap_or(&draw.source).as_entire_binding(),
+                    listed.as_entire_binding(),
                     draw.occlusion.as_ref().unwrap_or(&draw.source).as_entire_binding(),
                 )),
             );
-            draw.bindings = Some((uniforms.id(), bindings));
+            draw.bindings = Some((uniforms.id(), listed.id(), bindings));
         }
     }
     // Binned phases retain draws across frames. Remove entries that fell out
@@ -1442,6 +1651,7 @@ fn make_draw(
         direction: Vec4::NAN,
         revision: 0,
         segments: 0..count as u32,
+        instances: 0..0,
         idle_frames: 0,
     }
 }
@@ -1464,21 +1674,58 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
         let Some(draw) = draws.into_inner().draws.get(&key) else {
             return RenderCommandResult::Skip;
         };
-        let Some((_, bindings)) = &draw.bindings else {
+        let Some((_, _, bindings)) = &draw.bindings else {
             return RenderCommandResult::Skip;
         };
+        if draw.instances.is_empty() {
+            return RenderCommandResult::Success;
+        }
         pass.set_bind_group(0, bindings, &[draw.uniform_offset]);
         pass.set_bind_group(1, &draw.shadows, &[]);
-        let instances = if draw.order.is_some() {
-            0..draw.segments.len() as u32
-        } else {
-            draw.segments.clone()
-        };
+        let instances = draw.instances.clone();
         pass.set_index_buffer(
             pipeline.into_inner().quad_indices.slice(..),
             IndexFormat::Uint16,
         );
         pass.draw_indexed(0..6, 0, instances);
         RenderCommandResult::Success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clusters_permute_each_level_and_bound_their_segments() {
+        let segment = |i: u32| {
+            let at = Vec3::new((i * 37 % 101) as f32, (i * 11 % 53) as f32, (i % 7) as f32) * 0.1;
+            GaussianSegment::new(at, at + Vec3::X * 0.05, Vec3::splat(0.01), Quat::IDENTITY, 0.5, Vec3::ONE)
+        };
+        let detail = [DetailTransition { finer_end: 300, pixels_per_unit: [10.0, 20.0] }];
+        let asset = SpaghettiAsset::with_detail((0..420).map(segment).collect(), &detail).unwrap();
+        let (order, clusters) = cluster_segments(&asset);
+
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..420).collect::<Vec<_>>());
+        assert!(order[..300].iter().all(|&index| index < 300));
+
+        let mut next = 0;
+        for cluster in &clusters {
+            assert_eq!(cluster.first, next);
+            assert!((1..=CLUSTER_SIZE).contains(&cluster.count));
+            let range = cluster.first..cluster.first + cluster.count;
+            assert!(range.end <= 300 || range.start >= 300, "a cluster spans two levels");
+            for &index in &order[range.start as usize..range.end as usize] {
+                let segment = &asset.segments()[index as usize];
+                for point in [segment.start(), segment.end()] {
+                    let offset = (point - cluster.center).abs();
+                    assert!(offset.cmple(cluster.half_extents).all());
+                }
+            }
+            next = range.end;
+        }
+        assert_eq!(next, 420);
     }
 }

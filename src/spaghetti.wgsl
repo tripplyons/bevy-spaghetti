@@ -53,10 +53,14 @@ struct View {
     lamp: vec4<f32>,
     // Color at one unit of distance, then the squared source radius.
     lamp_color: vec4<f32>,
+    // Offset of this draw's visible clusters in `order`.
+    clusters: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(1) var<storage, read> splats: array<Splat>;
+// Sorted draws read segment indices back to front. Cutouts read packed
+// visible clusters: the first segment above seven bits of count minus one.
 @group(0) @binding(2) var<storage, read> order: array<u32>;
 @group(0) @binding(3) var<storage, read> occlusion: array<u32>;
 
@@ -68,6 +72,8 @@ override SHADOW_CASTER: bool = false;
 const SHADOW_EDGE_DEPTH: f32 = 0.03;
 // The narrowest shadow strip in texels before optical depth is spread.
 const SHADOW_MIN_WIDTH: f32 = 1.0;
+// Segments per culling cluster, matching the renderer.
+const CLUSTER_SIZE: u32 = 128u;
 
 struct SunShadows {
     matrices: array<mat4x4<f32>, 4>,
@@ -595,8 +601,18 @@ struct CutoutRaster {
 @vertex
 fn cutout_vertex(
     @builtin(vertex_index) vertex_index: u32,
-    @builtin(instance_index) instance: u32,
+    @builtin(instance_index) slot: u32,
 ) -> CutoutRaster {
+    var out: CutoutRaster;
+    // Each visible cluster owns CLUSTER_SIZE instances, and a short cluster
+    // leaves the rest empty.
+    let cluster = order[view.clusters.x + slot / CLUSTER_SIZE];
+    let offset = slot % CLUSTER_SIZE;
+    if offset > (cluster & (CLUSTER_SIZE - 1u)) {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
+    let instance = (cluster >> 7u) + offset;
     let splat = splats[instance];
     let profile = blade_profile(splat.color.w);
     let local_a = bend_endpoint(splat.start_mass.xyz, splat.end.w, profile.x);
@@ -612,7 +628,6 @@ fn cutout_vertex(
     let a = mix(start, end, span.x);
     let b = mix(start, end, span.y);
 
-    var out: CutoutRaster;
     if span.x >= span.y || min(a.w, b.w) <= 0.0 || splat.start_mass.w == 0.0 {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
