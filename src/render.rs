@@ -868,30 +868,36 @@ fn cluster_segments(asset: &SpaghettiAsset) -> (Vec<u32>, Box<[Cluster]>) {
     (order, clusters.into())
 }
 
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 impl GpuCloud {
-    /// Appends the clusters of `segments` that can draw and returns the
-    /// instance count. A cluster is dropped when it lies outside a frustum
-    /// plane or outside the depth band where its detail level shows.
+    /// Appends the clusters of `segments` that can draw and returns
+    /// `(instance_count, cluster_stride)`. A cluster is dropped when it lies
+    /// outside a frustum plane or outside the depth band where its detail level
+    /// shows. When `shadow_keep` is `None`, per-cluster `coverage` and detail
+    /// transitions thin each bit-reversed cluster prefix on the CPU and shrink
+    /// the power-of-two instance stride to match `max_count`.
     #[expect(clippy::too_many_arguments, reason = "one draw's culling inputs")]
     fn cull_clusters(
         &self,
         segments: Range<u32>,
         frustum: Option<&Frustum>,
-        cull_bands: bool,
+        detail: Option<(&[[f32; 4]; MAX_DETAIL_TRANSITIONS], &[u32; 4])>,
         (world_from_local, clip_from_local): (Mat4, Mat4),
         bending: Vec3,
-        uniform: &DrawUniform,
-        keep: u32,
+        coverage: f32,
+        shadow_keep: Option<u32>,
         visible: &mut Vec<u32>,
-    ) -> u32 {
+    ) -> (u32, u32) {
         let first = self.clusters.partition_point(|cluster| cluster.first < segments.start);
         let last = self.clusters.partition_point(|cluster| cluster.first < segments.end);
         let clusters = &self.clusters[first..last];
-        // A thinned draw keeps the leading `keep` of every CLUSTER_SIZE.
-        let pack = |cluster: &Cluster| {
-            let count = (cluster.count * keep).div_ceil(CLUSTER_SIZE).max(1);
-            (cluster.first << 7) | (count - 1)
-        };
+        if clusters.is_empty() {
+            return (0, 1);
+        }
         let start = visible.len();
         // Local planes that the whole cloud does not already satisfy. An
         // infinite plane, such as a cascade's pushed-out near plane, never culls.
@@ -916,10 +922,42 @@ impl GpuCloud {
             }
         }
         let planes = &planes[..plane_count];
-        let bands = if cull_bands { uniform.detail_ends[3] as usize } else { 0 };
+        let bands = detail.map_or(0, |(_, ends)| ends[3] as usize);
         visible.reserve(clusters.len());
-        if planes.is_empty() && bands == 0 {
-            visible.extend(clusters.iter().map(pack));
+        let mut max_count = 0u32;
+        if let Some(keep) = shadow_keep {
+            // A thinned shadow draw keeps the leading `keep` of every CLUSTER_SIZE.
+            let pack = |cluster: &Cluster| {
+                let count = (cluster.count * keep).div_ceil(CLUSTER_SIZE).max(1);
+                (cluster.first << 7) | (count - 1)
+            };
+            if planes.is_empty() {
+                visible.extend(clusters.iter().map(pack));
+            } else {
+                for cluster in clusters {
+                    let half = cluster.half_extents + bending;
+                    if planes.iter().any(|&(normal, abs_normal, d)| {
+                        normal.dot(cluster.center) + d + abs_normal.dot(half) < 0.0
+                    }) {
+                        continue;
+                    }
+                    visible.push(pack(cluster));
+                }
+            }
+            let Some((&last, full_stride)) = visible[start..].split_last() else {
+                return (0, keep);
+            };
+            return (
+                full_stride.len() as u32 * keep + (last & (CLUSTER_SIZE - 1)) + 1,
+                keep,
+            );
+        }
+
+        if planes.is_empty() && bands == 0 && coverage >= 1.0 {
+            for cluster in clusters {
+                max_count = max_count.max(cluster.count);
+                visible.push((cluster.first << 7) | (cluster.count - 1));
+            }
         } else {
             let depth = clip_from_local.row(3);
             let depth_xyz = depth.truncate();
@@ -927,47 +965,75 @@ impl GpuCloud {
             let mut level = 0;
             for cluster in clusters {
                 let half = cluster.half_extents + bending;
-                if planes
-                    .iter()
-                    .any(|&(normal, abs_normal, d)| normal.dot(cluster.center) + d + abs_normal.dot(half) < 0.0)
-                {
+                if planes.iter().any(|&(normal, abs_normal, d)| {
+                    normal.dot(cluster.center) + d + abs_normal.dot(half) < 0.0
+                }) {
                     continue;
                 }
-                if bands > 0 {
-                    while level < bands && uniform.detail_ends[level] <= cluster.first {
+                let mut fraction = coverage;
+                if let Some((detail_depths, detail_ends)) = detail
+                    && bands > 0
+                {
+                    while level < bands && detail_ends[level] <= cluster.first {
                         level += 1;
                     }
                     let center = depth_xyz.dot(cluster.center) + depth.w;
                     let radius = depth_abs.dot(half);
                     // A level shows nearer than its own transition's far edge and
                     // farther than the previous transition's near edge.
-                    if (level < bands && center - radius >= uniform.detail_depths[level][1])
-                        || (level > 0 && center + radius <= uniform.detail_depths[level - 1][0])
+                    if (level < bands && center - radius >= detail_depths[level][1])
+                        || (level > 0 && center + radius <= detail_depths[level - 1][0])
                     {
                         continue;
                     }
+                    let upper = if level < bands {
+                        let [near, far, _, _] = detail_depths[level];
+                        1.0 - smoothstep(near, far, center)
+                    } else {
+                        1.0
+                    };
+                    let lower = if level > 0 {
+                        let [near, far, _, _] = detail_depths[level - 1];
+                        1.0 - smoothstep(near, far, center)
+                    } else {
+                        0.0
+                    };
+                    fraction *= (upper - lower).max(0.0);
                 }
-                visible.push(pack(cluster));
+                let count = if fraction >= 1.0 {
+                    cluster.count
+                } else {
+                    (cluster.count as f32 * fraction).round() as u32
+                };
+                if count == 0 {
+                    continue;
+                }
+                max_count = max_count.max(count);
+                visible.push((cluster.first << 7) | (count - 1));
             }
         }
-        // Earlier clusters still need a fixed stride, but no vertex needs
-        // to run for empty slots after the last cluster.
+        // Earlier clusters still need a fixed power-of-two stride, but no vertex
+        // needs to run for empty slots after the last cluster.
         let Some((&last, full_stride)) = visible[start..].split_last() else {
-            return 0;
+            return (0, 1);
         };
-        full_stride.len() as u32 * keep + (last & (CLUSTER_SIZE - 1)) + 1
+        let stride = max_count.next_power_of_two().clamp(1, CLUSTER_SIZE);
+        (
+            full_stride.len() as u32 * stride + (last & (CLUSTER_SIZE - 1)) + 1,
+            stride,
+        )
     }
 
     // Drop complete levels whose bands are outside the depth interval of the
     // cloud. This also keeps distant draws at the cost of a single coarse level.
+    // Pass `None` for `uniform` to snap to the finer level instead of cross-fading.
     fn select_segments(
         &self,
         clip_from_local: Mat4,
         viewport_height: f32,
         detail_scale: f32,
         bounds: Aabb,
-        snap: bool,
-        uniform: &mut DrawUniform,
+        mut uniform: Option<&mut DrawUniform>,
     ) -> Range<u32> {
         let count = self.centers.len() as u32;
         if self.detail.is_empty() {
@@ -992,12 +1058,12 @@ impl GpuCloud {
             let far = scale / low;
             if closest >= far {
                 segments.start = transition.finer_end;
-            } else if farthest <= near || snap {
+            } else if farthest <= near || uniform.is_none() {
                 // A snapped draw takes the finer level instead of fading
                 // between two, which would draw both.
                 segments.end = transition.finer_end;
                 break;
-            } else {
+            } else if let Some(uniform) = uniform.as_deref_mut() {
                 let slot = uniform.detail_ends[3] as usize;
                 uniform.detail_depths[slot] = [near, far, 0.0, 0.0];
                 uniform.detail_ends[slot] = transition.finer_end;
@@ -1672,7 +1738,6 @@ fn queue_clouds(
                     },
                 )
             });
-            let empty_uniform = DrawUniform::zeroed();
             for &cloud_index in shadow_clouds.iter() {
                 let (entity, main_entity, cloud, gpu) = active_clouds[cloud_index];
                 if !layers.intersects(&cloud.layers) {
@@ -1722,14 +1787,12 @@ fn queue_clouds(
                     continue;
                 }
                 let clip_from_local = clip_from_world * cloud.world_from_local;
-                let mut scratch_detail = empty_uniform;
                 let segments = gpu.select_segments(
                     clip_from_local,
                     size.y as f32,
                     cloud.detail_scale * SHADOW_DETAIL,
                     bounds,
-                    true,
-                    &mut scratch_detail,
+                    None,
                 );
                 let keep = shadow_keep(
                     cascade_index,
@@ -1740,14 +1803,14 @@ fn queue_clouds(
                 );
                 let cluster_offset = draws.clusters.len() as u32;
                 let cull = !cloud.disable_culling && cloud.flow.is_none();
-                let count = gpu.cull_clusters(
+                let (count, _) = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
-                    false,
+                    None,
                     (cloud.world_from_local, clip_from_local),
                     Vec3::from(bounds.half_extents - gpu.bounds.half_extents),
-                    &empty_uniform,
-                    keep,
+                    1.0,
+                    Some(keep),
                     &mut draws.clusters,
                 );
                 if count == 0 {
@@ -2045,28 +2108,26 @@ fn queue_clouds(
                 size.y as f32,
                 cloud.detail_scale,
                 bounds,
-                false,
-                &mut uniform,
+                Some(&mut uniform),
             );
             let mut instances = 0..segments.len() as u32;
             if cutout {
-                // Flow moves segments out of their clusters' boxes.
-                let cull = !cloud.disable_culling && cloud.flow.is_none();
+                let cull = !cloud.disable_culling;
                 uniform.clusters[0] = draws.clusters.len() as u32;
-                uniform.clusters[1] = CLUSTER_SIZE;
-                let count = gpu.cull_clusters(
+                let (count, stride) = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
-                    cull,
+                    Some((&uniform.detail_depths, &uniform.detail_ends)),
                     (cloud.world_from_local, clip_from_local),
                     Vec3::from(bounds.half_extents - gpu.bounds.half_extents),
-                    &uniform,
-                    CLUSTER_SIZE,
+                    coverage,
+                    None,
                     &mut draws.clusters,
                 );
                 if count == 0 {
                     continue;
                 }
+                uniform.clusters[1] = stride.trailing_zeros();
                 instances = 0..count;
             }
             let new_draw = || make_draw(&device, source, gpu, main_entity, cutout, false, shadows);
@@ -2445,21 +2506,53 @@ mod tests {
             revision: 0,
         };
         let mut visible = vec![0];
-        let mut cull = |segments, keep| {
+        let mut cull_shadow = |segments, keep| {
+            cloud
+                .cull_clusters(
+                    segments,
+                    None,
+                    None,
+                    (Mat4::IDENTITY, Mat4::IDENTITY),
+                    Vec3::ZERO,
+                    1.0,
+                    Some(keep),
+                    &mut visible,
+                )
+                .0
+        };
+        assert_eq!(cull_shadow(0..47, CLUSTER_SIZE), CLUSTER_SIZE + 15);
+        assert_eq!(cull_shadow(0..47, 48), 48 + 6);
+        assert_eq!(cull_shadow(47..47, 48), 0);
+
+        // Cutout mode shrinks the power-of-two stride to max_count and thins by coverage.
+        visible.clear();
+        assert_eq!(
             cloud.cull_clusters(
-                segments,
+                0..47,
                 None,
-                false,
+                None,
                 (Mat4::IDENTITY, Mat4::IDENTITY),
                 Vec3::ZERO,
-                &DrawUniform::zeroed(),
-                keep,
+                1.0,
+                None,
                 &mut visible,
-            )
-        };
-        assert_eq!(cull(0..47, CLUSTER_SIZE), CLUSTER_SIZE + 15);
-        assert_eq!(cull(0..47, 48), 48 + 6);
-        assert_eq!(cull(47..47, 48), 0);
+            ),
+            (32 + 15, 32)
+        );
+        visible.clear();
+        assert_eq!(
+            cloud.cull_clusters(
+                0..47,
+                None,
+                None,
+                (Mat4::IDENTITY, Mat4::IDENTITY),
+                Vec3::ZERO,
+                0.25,
+                None,
+                &mut visible,
+            ),
+            (8 + 4, 8)
+        );
     }
 
     fn f16_bits_to_f32(bits: u16) -> f32 {

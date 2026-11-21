@@ -641,23 +641,17 @@ fn cutout_vertex(
     @builtin(instance_index) slot: u32,
 ) -> CutoutRaster {
     var out: CutoutRaster;
-    // Each visible cluster owns CLUSTER_SIZE instances, and a short cluster
-    // leaves the rest empty.
-    let cluster_slot = slot >> 7u;
-    let offset = slot & (CLUSTER_SIZE - 1u);
+    // Each visible cluster owns `1 << shift` instances, and a short or thinned
+    // cluster leaves the rest empty.
+    let shift = view.clusters.y;
+    let cluster_slot = slot >> shift;
+    let offset = slot & ((1u << shift) - 1u);
     let cluster = order[view.clusters.x + cluster_slot];
     if offset > (cluster & (CLUSTER_SIZE - 1u)) {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
     }
     let instance = (cluster >> 7u) + offset;
-    if view.motion.z < 1.0 && view.viewport.w <= view.viewport.z {
-        let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x9e3779b9u);
-        if select(threshold >= view.motion.z, (threshold < 1.0 - view.motion.z), view.motion.w > 0.0) {
-            out.position = vec4(2.0, 2.0, 0.0, 1.0);
-            return out;
-        }
-    }
     let splat = splats[instance];
     let profile = blade_profile(splat.color.w);
     var local_a = splat.start_mass.xyz;
@@ -679,22 +673,8 @@ fn cutout_vertex(
         return out;
     }
     let midpoint = (a + b) * 0.5;
-    if view.detail_ends.w > 0u {
-        let detail = detail_interval(instance, midpoint.w);
-        if detail.x >= detail.y {
-            out.position = vec4(2.0, 2.0, 0.0, 1.0);
-            return out;
-        }
-        if detail.x > 0.0 || detail.y < 1.0 {
-            let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x517cc1b7u);
-            if threshold < detail.x || threshold >= detail.y {
-                out.position = vec4(2.0, 2.0, 0.0, 1.0);
-                return out;
-            }
-        }
-    }
     if view.viewport.w > view.viewport.z {
-        let coverage = view.motion.z * near_fade(midpoint.w);
+        let coverage = near_fade(midpoint.w);
         if coverage <= 0.0 {
             out.position = vec4(2.0, 2.0, 0.0, 1.0);
             return out;
