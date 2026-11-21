@@ -1223,7 +1223,7 @@ fn queue_clouds(
     mut pipelines: ResMut<SpecializedRenderPipelines<SplatPipeline>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    (mut depths, mut order): (Local<Vec<(f32, u32)>>, Local<Vec<u32>>),
+    (mut depths, mut order): (Local<Vec<(u16, u32)>>, Local<Vec<u32>>),
     (cascade_views, sun_lights, shadowless): (
         Query<&LightEntity>,
         Query<&ExtractedDirectionalLight>,
@@ -1509,7 +1509,7 @@ fn queue_clouds(
                 };
                 uniform.clusters[0] = draws.clusters.len() as u32;
                 uniform.clusters[1] = keep;
-                uniform.clusters[2] = (keep as f32 / CLUSTER_SIZE as f32).to_bits();
+                uniform.clusters[2] = (CLUSTER_SIZE as f32 / keep as f32).to_bits();
                 let visible = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
@@ -1540,19 +1540,28 @@ fn queue_clouds(
                     .truncate()
                     .normalize_or_zero();
                 let direction = direction.extend(sway.map_or(0.0, |sway| sway.dot(direction)));
-                if draw.direction != direction
+                if !(draw.direction.distance_squared(direction) <= 1e-4)
                     || draw.revision != gpu.revision
                     || draw.segments != segments
                 {
                     // Translation preserves relative depths. Re-sort only if the
                     // view direction, sway depth, asset data, or submitted levels changed.
+                    let dir_xyz = direction.truncate();
+                    let center_d = dir_xyz.dot(gpu.bounds.center.into());
+                    let radius_d = dir_xyz.abs().dot(gpu.bounds.half_extents.into());
+                    let sway_d = gpu.max_bend_height * direction.w;
+                    let min_d = center_d - radius_d + sway_d.min(0.0);
+                    let max_d = center_d + radius_d + sway_d.max(0.0);
+                    let scale = if max_d > min_d { 65535.0 / (max_d - min_d) } else { 0.0 };
                     depths.clear();
                     depths.extend(
                         gpu.centers[segments.start as usize..segments.end as usize]
                             .iter()
                             .enumerate()
                             .map(|(index, &center)| {
-                                (center.dot(direction), segments.start + index as u32)
+                                let key = ((center.dot(direction) - min_d) * scale)
+                                    .clamp(0.0, 65535.0) as u16;
+                                (key, segments.start + index as u32)
                             }),
                     );
                     radsort::sort_by_key(&mut depths, |entry| entry.0);

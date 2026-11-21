@@ -262,11 +262,9 @@ fn segment_flow(index: u32, center: vec3<f32>) -> Flow {
 struct Raster {
     @builtin(position) position: vec4<f32>,
     @location(0) offset: vec2<f32>,
-    @location(1) @interpolate(flat) segment: vec2<f32>,
-    @location(2) @interpolate(flat) depth: vec2<f32>,
-    @location(3) @interpolate(flat, first) color_mass: vec4<f32>,
-    @location(4) @interpolate(flat) coverage: f32,
-    @location(5) @interpolate(flat) detail: vec2<f32>,
+    @location(1) @interpolate(flat, first) color_mass: vec4<f32>,
+    // Detail fade interval, whitened segment length, and sqrt(pi/2) / length.
+    @location(2) @interpolate(flat) detail_len: vec4<f32>,
 }
 
 // At each transition, the finer level keeps the thresholds below its
@@ -476,8 +474,8 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     }
 
     let midpoint = (a + b) * 0.5;
-    out.detail = detail_interval(index, midpoint.w);
-    if out.detail.x >= out.detail.y {
+    let detail = detail_interval(index, midpoint.w);
+    if detail.x >= detail.y {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
     }
@@ -490,11 +488,9 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
 
     // Each projected principal axis contributes an outer product to J Σ Jᵀ.
     let q = splat.rotation;
-    let axis_x = rotate(q, vec3(s.x, 0.0, 0.0));
-    let axis_y = rotate(q, vec3(0.0, s.y, 0.0));
-    let axis_z = rotate(q, vec3(0.0, 0.0, s.z));
-    let row_x = vec3(dot(j0, axis_x), dot(j0, axis_y), dot(j0, axis_z));
-    let row_y = vec3(dot(j1, axis_x), dot(j1, axis_y), dot(j1, axis_z));
+    let local_to_kernel = vec4(-q.xyz, q.w);
+    let row_x = rotate(local_to_kernel, j0) * s;
+    let row_y = rotate(local_to_kernel, j1) * s;
     let xx = dot(row_x, row_x);
     let xy = dot(row_x, row_y);
     let yy = dot(row_y, row_y);
@@ -505,6 +501,14 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     let cyy = yy + pixel_variance;
     let cross_row = cross(row_x, row_y);
     let determinant = dot(cross_row, cross_row) + pixel_variance * (xx + yy + pixel_variance);
+    let area_scale = length(cross(j0, j1));
+    let peak = (mass * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
+    let eff_peak = peak * near_fade(midpoint.w);
+    let bound_sigma = min(4.0, sqrt(max(0.0, 2.0 * log(eff_peak * view.motion.z * 2000.0))));
+    if bound_sigma <= 0.0 {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
     let sigma_x = sqrt(cxx);
     let sigma_y_given_x = sqrt(determinant / cxx);
 
@@ -518,7 +522,14 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     let cov_t = cxx * tangent.x * tangent.x + 2.0 * xy * tangent.x * tangent.y + cyy * tangent.y * tangent.y;
     let cov_p = cxx * perpendicular.x * perpendicular.x + 2.0 * xy * perpendicular.x * perpendicular.y
         + cyy * perpendicular.y * perpendicular.y;
-    let extent = 4.0 * sqrt(max(vec2(cov_t, cov_p), vec2(pixel_variance)));
+    let extent = bound_sigma * sqrt(max(vec2(cov_t, cov_p), vec2(pixel_variance)));
+    let pad = (abs(tangent) * extent.x + abs(perpendicular) * extent.y) / half_viewport;
+    if max(a_ndc.x, b_ndc.x) + pad.x < -1.0 || min(a_ndc.x, b_ndc.x) - pad.x > 1.0
+        || max(a_ndc.y, b_ndc.y) + pad.y < -1.0 || min(a_ndc.y, b_ndc.y) - pad.y > 1.0
+    {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
 
     let corners = array<vec2<f32>, 4>(
         vec2(-1.0, -1.0), vec2(1.0, -1.0),
@@ -529,15 +540,21 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
           + perpendicular * (corner.y * extent.y);
 
     // Cholesky whitening lets the fragment shader integrate an isotropic
-    // unit Gaussian along the whitened centerline.
+    // unit Gaussian along the whitened centerline. Pre-rotate into segment
+    // coordinates so the fragment stage reads (projected, normal) directly.
     let shear = xy / cxx;
-    out.offset = vec2(v.x / sigma_x, (v.y - shear * v.x) / sigma_y_given_x);
-    out.segment = vec2(segment.x / sigma_x, (segment.y - shear * segment.x) / sigma_y_given_x);
-    out.depth = vec2(a_ndc.z, b_ndc.z);
+    let w_off = vec2(v.x / sigma_x, (v.y - shear * v.x) / sigma_y_given_x);
+    let w_seg = vec2(segment.x / sigma_x, (segment.y - shear * segment.x) / sigma_y_given_x);
+    let length_sigma = length(w_seg);
+    if length_sigma < 0.01 {
+        out.offset = w_off - 0.5 * w_seg;
+    } else {
+        let axis = w_seg / length_sigma;
+        out.offset = vec2(dot(w_off, axis), dot(w_off, vec2(-axis.y, axis.x)));
+    }
+    out.detail_len = vec4(detail, length_sigma, 1.25331413732 / max(length_sigma, 0.01));
     out.color_mass = vec4(0.0);
     if vertex_index == 1u {
-        let area_scale = length(cross(j0, j1));
-        let peak = (mass * (span.y - span.x) * area_scale) / (6.28318530718 * sqrt(determinant));
         var color = splat.color.rgb * tint;
         if view.direction_to_light.w > 0.0 {
             let normal = view.normal_from_local * rotate(q, vec3(0.0, 0.0, 1.0));
@@ -556,10 +573,10 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
             }
         }
         // The fragment stage premultiplies the fogged color by optical alpha.
-        out.color_mass = vec4(color, peak * near_fade(midpoint.w));
+        out.color_mass = vec4(color, eff_peak);
     }
-    out.coverage = view.motion.z;
-    out.position = vec4((a_px + v) / half_viewport, 0.5, 1.0);
+    let z = clamp(select(a_ndc.z, b_ndc.z, corner.x > 0.0), 0.0, 1.0);
+    out.position = vec4((a_px + v) / half_viewport, z, 1.0);
     return out;
 }
 
@@ -582,47 +599,47 @@ fn erf_difference(lo: f32, hi: f32) -> f32 {
     return 2.0 - erfc_positive(-lo) - erfc_positive(hi);
 }
 
-struct Fragment {
-    @location(0) color: vec4<f32>,
-    @builtin(frag_depth) depth: f32,
-}
-
 @fragment
-fn fragment(in: Raster) -> Fragment {
-    if !detail_visible(in.position.xy, in.detail) {
+fn fragment(in: Raster) -> @location(0) vec4<f32> {
+    if !detail_visible(in.position.xy, in.detail_len.xy) {
         discard;
     }
-    let length_sigma = length(in.segment);
-    var along = 0.5;
+    let length_sigma = in.detail_len.z;
     var average: f32;
     if length_sigma < 0.01 {
         // Point limit of equation 19, also avoids cancellation for short segments.
-        let displacement = in.offset - 0.5 * in.segment;
-        average = exp(-0.5 * dot(displacement, displacement));
+        average = exp(-0.5 * dot(in.offset, in.offset));
     } else {
-        let axis = in.segment / length_sigma;
-        let projected = dot(in.offset, axis);
-        let normal = dot(in.offset, vec2(-axis.y, axis.x));
-        along = clamp(projected / length_sigma, 0.0, 1.0);
+        let projected = in.offset.x;
+        let normal = in.offset.y;
         let lo = -projected * 0.70710678118;
         let hi = (length_sigma - projected) * 0.70710678118;
-        average = exp(-0.5 * normal * normal) * (1.25331413732 / length_sigma) * erf_difference(lo, hi);
+        average = exp(-0.5 * normal * normal) * in.detail_len.w * erf_difference(lo, hi);
     }
     let optical_depth = in.color_mass.a * max(average, 0.0);
-    let alpha = (1.0 - exp(-optical_depth)) * in.coverage;
+    let alpha = (1.0 - exp(-optical_depth)) * view.motion.z;
     if alpha < 0.0005 {
         discard;
     }
-    return Fragment(vec4(in.color_mass.rgb * alpha, alpha), clamp(mix(in.depth.x, in.depth.y, along), 0.0, 1.0));
+    return vec4(in.color_mass.rgb * alpha, alpha);
 }
 
 struct CutoutRaster {
     @builtin(position) position: vec4<f32>,
-    @location(0) coordinate: vec2<f32>,
-    @location(1) @interpolate(flat) shape: vec4<f32>,
-    @location(2) @interpolate(flat, first) color: vec3<f32>,
-    @location(3) @interpolate(flat) profile: vec4<f32>,
-    @location(4) @interpolate(flat) detail: vec2<f32>,
+    // Along-segment coordinate in end-cap units, across coordinate, and leaf streak phase.
+    @location(0) coordinate: vec3<f32>,
+    // Length in end-cap units, fade coverage, and packed detail interval.
+    @location(1) @interpolate(flat) shape: vec3<f32>,
+    // Shaded color, plus packed (leaf seed phase, vein visibility) when close.
+    @location(2) @interpolate(flat, first) color_leaf: vec4<f32>,
+}
+
+struct CutoutCorner {
+    position: vec4<f32>,
+    coordinate: vec3<f32>,
+    shape: vec3<f32>,
+    color_leaf: vec4<f32>,
+    shadow: vec3<f32>,
 }
 
 // Evaluate a Gaussian cutout in projected segment coordinates. Fixed-function
@@ -632,16 +649,25 @@ fn cutout_vertex(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) slot: u32,
 ) -> CutoutRaster {
-    return cutout_corner(vertex_index, slot);
+    let full = cutout_corner(vertex_index, slot);
+    return CutoutRaster(full.position, full.coordinate, full.shape, full.color_leaf);
 }
 
-fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutRaster {
-    var out: CutoutRaster;
+fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
+    var out: CutoutCorner;
     // Each visible cluster owns CLUSTER_SIZE instances, and a short cluster
     // leaves the rest empty.
     // clusters.y holds the slots per cluster, fewer in thinned cascades.
-    let cluster = order[view.clusters.x + slot / view.clusters.y];
-    let offset = slot % view.clusters.y;
+    var cluster_slot: u32;
+    var offset: u32;
+    if !SHADOW_CASTER {
+        cluster_slot = slot >> 7u;
+        offset = slot & (CLUSTER_SIZE - 1u);
+    } else {
+        cluster_slot = slot / view.clusters.y;
+        offset = slot % view.clusters.y;
+    }
+    let cluster = order[view.clusters.x + cluster_slot];
     if offset > (cluster & (CLUSTER_SIZE - 1u)) {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
@@ -662,18 +688,23 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutRaster {
     let a = mix(start, end, span.x);
     let b = mix(start, end, span.y);
 
-    if span.x >= span.y || min(a.w, b.w) <= 0.0 || splat.start_mass.w == 0.0 {
+    if span.x >= span.y || (!SHADOW_CASTER && min(a.w, b.w) <= 0.0) || splat.start_mass.w == 0.0 {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
     }
     let midpoint = (a + b) * 0.5;
-    out.detail = detail_interval(instance, midpoint.w);
-    if out.detail.x >= out.detail.y {
-        out.position = vec4(2.0, 2.0, 0.0, 1.0);
-        return out;
+    var detail = vec2(0.0, 1.0);
+    var coverage = view.motion.z;
+    if !SHADOW_CASTER {
+        detail = detail_interval(instance, midpoint.w);
+        coverage *= near_fade(midpoint.w);
+        if detail.x >= detail.y || coverage <= 0.0 {
+            out.position = vec4(2.0, 2.0, 0.0, 1.0);
+            return out;
+        }
     }
-    let a_ndc = a.xyz / a.w;
-    let b_ndc = b.xyz / b.w;
+    let a_ndc = select(a.xyz / a.w, a.xyz, SHADOW_CASTER);
+    let b_ndc = select(b.xyz / b.w, b.xyz, SHADOW_CASTER);
     let half_viewport = view.viewport.xy * 0.5;
     let line = (b_ndc.xy - a_ndc.xy) * half_viewport;
     let length_px = length(line);
@@ -682,9 +713,18 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutRaster {
     let across = vec2(-tangent.y, tangent.x);
     let q = splat.rotation;
     let local_to_kernel = vec4(-q.xyz, q.w);
-    let jx = project_axis(transform[0], midpoint, half_viewport);
-    let jy = project_axis(transform[1], midpoint, half_viewport);
-    let jz = project_axis(transform[2], midpoint, half_viewport);
+    var jx: vec2<f32>;
+    var jy: vec2<f32>;
+    var jz: vec2<f32>;
+    if SHADOW_CASTER {
+        jx = transform[0].xy * half_viewport;
+        jy = transform[1].xy * half_viewport;
+        jz = transform[2].xy * half_viewport;
+    } else {
+        jx = project_axis(transform[0], midpoint, half_viewport);
+        jy = project_axis(transform[1], midpoint, half_viewport);
+        jz = project_axis(transform[2], midpoint, half_viewport);
+    }
     let cross_axis = vec3(dot(across, jx), dot(across, jy), dot(across, jz));
     let along_axis = vec3(dot(tangent, jx), dot(tangent, jy), dot(tangent, jz));
     let cross_sigma = length(rotate(local_to_kernel, cross_axis) * splat.sigma.xyz);
@@ -706,13 +746,15 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutRaster {
     let edge = select(-1.0, 1.0, (vertex_index & 2u) != 0u);
     let width_scale = mix(1.0, profile.y, select(span.x, span.y, tip));
     let clip_w = select(a.w, b.w, tip);
-    var width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
+    var width: f32;
     if SHADOW_CASTER {
         // Spread a needle thinner than a texel over a wider, fainter strip so
         // that its integrated optical depth is kept.
-        let exact = cross_sigma * radius * width_scale * midpoint.w / clip_w;
+        let exact = cross_sigma * radius * width_scale;
         width = max(exact, SHADOW_MIN_WIDTH);
         peak *= exact / width;
+    } else {
+        width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
     }
     let cap = clamp(along_sigma * radius, 0.45, max(cross_sigma * radius, 0.45) * 1.4);
     let along = select(-cap, cap, tip);
@@ -728,63 +770,72 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutRaster {
         depth,
         1.0,
     );
-    out.coordinate = vec2(select(0.0, length_px, tip) + along, edge);
+    let length_cap = length_px / cap;
+    let t_vertex = mix(splat.end.w, splat.sigma.w, select(span.x, span.y, tip));
+    let streak_phase = select(0.0, t_vertex * 3.8 / max(profile.x, 1e-5) + profile.x * 127.0, !SHADOW_CASTER && profile.x > 0.0);
+    out.coordinate = vec3(select(-1.0, length_cap + 1.0, tip), edge, streak_phase);
     // Close segments dissolve through the same dither as the LOD fades.
-    let coverage = view.motion.z * near_fade(midpoint.w);
-    if coverage <= 0.0 {
-        out.position = vec4(2.0, 2.0, 0.0, 1.0);
-        return out;
-    }
-    out.shape = vec4(
-        length_px, cap, cross_sigma * radius,
+    let packed_detail = round(clamp(detail.x, 0.0, 1.0) * 4095.0) * 4096.0
+        + round(clamp(detail.y, 0.0, 1.0) * 4095.0);
+    out.shape = vec3(
+        length_cap,
         select(coverage, -coverage, view.motion.w > 0.0),
+        packed_detail,
     );
-    out.profile = vec4(profile, mix(splat.end.w, splat.sigma.w, span.x), mix(splat.end.w, splat.sigma.w, span.y));
     if SHADOW_CASTER {
         // The shadow fragment needs no color profile. It needs the optical
         // depth falloff and a per-segment seed for its random test. A float
         // holds the index exactly, where a bitcast could flush to zero.
-        out.profile = vec4(f32(instance), peak, radius * radius, 0.0);
+        out.shadow = vec3(f32(instance), peak, -0.5 * radius * radius);
     }
 
-    out.color = vec3(0.0);
+    out.color_leaf = vec4(0.0);
     if vertex_index == 1u && !SHADOW_CASTER {
-        var color = splat.color.rgb;
-        if view.direction_to_light.w > 0.0 {
-            let normal = rotate(q, vec3(0.0, 0.0, 1.0));
-            let unit = normalize(view.normal_from_local * normal);
-            color = segment_light(instance, color, (local_a + local_b) * 0.5, unit, local_b - local_a);
+        let max_width = max(cross_sigma * radius * midpoint.w / min(a.w, b.w), 0.42);
+        let pad = (abs(across) * max_width + abs(tangent) * cap) / half_viewport;
+        if max(a_ndc.x, b_ndc.x) + pad.x >= -1.0 && min(a_ndc.x, b_ndc.x) - pad.x <= 1.0
+            && max(a_ndc.y, b_ndc.y) + pad.y >= -1.0 && min(a_ndc.y, b_ndc.y) - pad.y <= 1.0
+        {
+            var color = splat.color.rgb;
+            if view.direction_to_light.w > 0.0 {
+                let normal = rotate(q, vec3(0.0, 0.0, 1.0));
+                let unit = normalize(view.normal_from_local * normal);
+                color = segment_light(instance, color, (local_a + local_b) * 0.5, unit, local_b - local_a);
+            }
+            if view.fog.mode != 0u {
+                color = apply_distance_fog(color, (local_a + local_b) * 0.5);
+            }
+            var packed_leaf = 0.0;
+            let blade_px = cross_sigma * radius;
+            if profile.x > 0.0 && profile.y < 1.0 && blade_px >= 1.0 {
+                let seed_frac = fract(profile.x * (127.0 / 6.28318530718));
+                let visible_detail = smoothstep(1.0, 3.0, blade_px);
+                packed_leaf = round(seed_frac * 4095.0) * 4096.0
+                    + (1.0 + round(visible_detail * 4094.0));
+            }
+            out.color_leaf = vec4(color, packed_leaf);
         }
-        if view.fog.mode != 0u {
-            color = apply_distance_fog(color, (local_a + local_b) * 0.5);
-        }
-        out.color = color;
     }
     return out;
 }
 
 // Whether a fragment lies inside the cutout and survives the fade dithers.
 fn cutout_covers(in: CutoutRaster) -> bool {
-    return cutout_inside(in.position.xy, in.coordinate, in.shape.xy, in.shape.w, in.detail);
-}
-
-fn cutout_inside(
-    position: vec2<f32>,
-    coordinate: vec2<f32>,
-    extent: vec2<f32>,
-    coverage: f32,
-    detail: vec2<f32>,
-) -> bool {
-    let pixel = position - view.pixel_origin.xy;
-    if !detail_visible(pixel, detail) {
+    let pixel = in.position.xy - view.pixel_origin.xy;
+    if in.shape.z != 4095.0 {
+        let bits = u32(in.shape.z);
+        let detail = vec2(f32(bits >> 12u), f32(bits & 4095u)) * (1.0 / 4095.0);
+        if !detail_visible(pixel, detail) {
+            return false;
+        }
+    }
+    let along = in.coordinate.x;
+    let across = in.coordinate.y;
+    let beyond = max(0.0, max(-along, along - in.shape.x));
+    if beyond * beyond + across * across > 1.0 {
         return false;
     }
-    let along = coordinate.x;
-    let across = coordinate.y;
-    let beyond = max(0.0, max(-along, along - extent.x)) / extent.y;
-    if dot(vec2(beyond, across), vec2(beyond, across)) > 1.0 {
-        return false;
-    }
+    let coverage = in.shape.y;
     if abs(coverage) < 1.0 {
         // A shared screen-space threshold makes paired LOD fades complementary.
         let threshold = screen_threshold(pixel);
@@ -795,16 +846,15 @@ fn cutout_inside(
     return true;
 }
 
-// A shadow caster passes only what its random test reads, in three
-// varyings instead of five, because the shadow vertex stage is bound by
-// fixed-function work that grows with the vertex output size.
+// A shadow caster passes only what its random test reads, in two compact
+// varyings, because shadow cascades snap detail levels and the vertex stage
+// is bound by fixed-function work that grows with the vertex output size.
 struct ShadowRaster {
     @builtin(position) position: vec4<f32>,
-    // Segment coordinates, then length and end cap.
-    @location(0) cutout: vec4<f32>,
-    // Seed, peak optical depth, squared radius, and fade coverage.
+    // Along-segment coordinate in end-cap units and across coordinate.
+    @location(0) @interpolate(linear) coordinate: vec2<f32>,
+    // Seed, peak optical depth, -0.5 * squared radius, and length in end-cap units.
     @location(1) @interpolate(flat) blocking: vec4<f32>,
-    @location(2) @interpolate(flat) detail: vec2<f32>,
 }
 
 @vertex
@@ -815,9 +865,8 @@ fn cutout_shadow_vertex(
     let full = cutout_corner(vertex_index, slot);
     var out: ShadowRaster;
     out.position = full.position;
-    out.cutout = vec4(full.coordinate, full.shape.xy);
-    out.blocking = vec4(full.profile.xyz, full.shape.w);
-    out.detail = full.detail;
+    out.coordinate = full.coordinate.xy;
+    out.blocking = vec4(full.shadow, full.shape.x);
     return out;
 }
 
@@ -826,19 +875,26 @@ fn cutout_shadow_vertex(
 // transmittance, and shadow filtering averages the texels into partial shade.
 @fragment
 fn cutout_shadow_fragment(in: ShadowRaster) {
-    if !cutout_inside(in.position.xy, in.cutout.xy, in.cutout.zw, in.blocking.w, in.detail) {
+    let beyond = max(0.0, max(-in.coordinate.x, in.coordinate.x - in.blocking.w));
+    let distance_squared = beyond * beyond + in.coordinate.y * in.coordinate.y;
+    if distance_squared > 1.0 {
         discard;
     }
-    let beyond = max(0.0, max(-in.cutout.x, in.cutout.x - in.cutout.z)) / in.cutout.w;
-    let distance_squared = beyond * beyond + in.cutout.y * in.cutout.y;
-    let depth = in.blocking.y * exp(-0.5 * in.blocking.z * distance_squared);
-    let pixel = bitcast<vec2<u32>>(vec2<i32>(floor(in.position.xy - view.pixel_origin.xy)));
+    let pixel_f = in.position.xy - view.pixel_origin.xy;
+    if view.motion.z < 1.0 {
+        let threshold = screen_threshold(pixel_f);
+        if select(threshold >= view.motion.z, (threshold < 1.0 - view.motion.z), view.motion.w > 0.0) {
+            discard;
+        }
+    }
+    let depth = in.blocking.y * exp(in.blocking.z * distance_squared);
+    let pixel = bitcast<vec2<u32>>(vec2<i32>(floor(pixel_f)));
     let seed = u32(in.blocking.x);
     // A thinned cascade keeps a fraction of the segments, and each one
     // blocks that much more often, so the expected transmittance holds
     // wherever no single segment is nearly opaque.
-    let kept = bitcast<f32>(view.clusters.z);
-    let block = min(1.0, (1.0 - exp(-depth)) / kept);
+    let inv_kept = bitcast<f32>(view.clusters.z);
+    let block = min(1.0, (1.0 - exp(-depth)) * inv_kept);
     if hash_unit(pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u ^ seed * 0xcb1ab31fu) >= block {
         discard;
     }
@@ -860,19 +916,17 @@ fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
     if !cutout_covers(in) {
         discard;
     }
-    let along = in.coordinate.x;
     let across = in.coordinate.y;
     // Tapered leaf kernels have a pale midrib and thinner, warmer edges.
-    var color = in.color;
-    if in.profile.x > 0.0 && in.profile.y < 1.0 && in.shape.z >= 1.0 {
+    var color = in.color_leaf.rgb;
+    if in.color_leaf.w > 0.0 {
+        let bits = u32(in.color_leaf.w);
+        let seed = f32(bits >> 12u) * (6.28318530718 / 4095.0);
+        let visible_detail = f32((bits & 4095u) - 1u) * (1.0 / 4094.0);
         let rib = max(1.0 - abs(across) * 3.0, 0.0);
         let edge = across * across;
-        // Suppress vein contrast as the blade shrinks below three pixels.
-        let visible_detail = smoothstep(1.0, 3.0, in.shape.z);
-        let t = mix(in.profile.z, in.profile.w, clamp(along / max(in.shape.x, 1e-4), 0.0, 1.0));
-        let seed = in.profile.x * 127.0;
         let vein = 0.93 + 0.07 * sin(across * 23.0 + seed);
-        let streak = 0.95 + 0.06 * sin(across * 9.0 + sin(t * 3.8 / in.profile.x + seed));
+        let streak = 0.95 + 0.06 * sin(across * 9.0 + sin(in.coordinate.z));
         let fold = 0.90 + 0.10 * smoothstep(-0.10, 0.10, across);
         color *= (vec3(fold) + 0.23 * rib + vec3(0.05, 0.01, -0.12) * edge)
             * mix(1.0, vein * streak, visible_detail);
