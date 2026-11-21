@@ -39,8 +39,8 @@ const SILK: Vec3 = Vec3::new(0.30, 0.32, 0.35);
 /// Standard deviation of a thread's cross section, in meters.
 const THREAD: f32 = 0.0004;
 /// Optical mass per meter of a thread in a web of radius `FULL`. It makes a
-/// thread one pixel wide about a sixth opaque from six meters.
-const WEIGHT: f32 = 0.0023;
+/// thread one pixel wide about a tenth opaque from six meters.
+const WEIGHT: f32 = 0.0015;
 /// A smaller web has closer threads. Its threads are lighter in proportion,
 /// so every web is the same faint veil from a distance.
 const FULL: f32 = 0.3;
@@ -122,7 +122,7 @@ pub fn spawn_webs(
             // Silk is clear, so the sun lights the sheet from either side.
             SpaghettiTransmission(1.0),
             SpaghettiSpecular {
-                strength: 1.5,
+                strength: 1.1,
                 shininess: 70.0,
                 strand: 1.0,
             },
@@ -183,7 +183,7 @@ fn orb_web(radius: f32, normal: Vec3, rng: &mut Rng) -> Vec<GaussianSegment> {
         let end = point(spoke, spoke.1 * 1.08)
             + out * (radius * rng.range(0.7, 1.9))
             + normal * (radius * rng.range(-0.5, 0.5));
-        thread(&mut web, point(spoke, spoke.1 * 1.08), end, 1.6, 1.0);
+        thread(&mut web, point(spoke, spoke.1 * 1.08), end, 1.3, 1.0);
     }
 
     // The sticky spiral, as straight chords between neighboring spokes.
