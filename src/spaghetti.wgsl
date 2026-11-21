@@ -62,6 +62,12 @@ struct View {
 
 override SCENE_SHADOWS: bool = false;
 override BAKED_OCCLUSION: bool = false;
+// Draws depth-only cutouts into an orthographic directional shadow cascade.
+override SHADOW_CASTER: bool = false;
+// The optical depth at the edge of a shadow caster's footprint.
+const SHADOW_EDGE_DEPTH: f32 = 0.03;
+// The narrowest shadow strip in texels before optical depth is spread.
+const SHADOW_MIN_WIDTH: f32 = 1.0;
 
 struct SunShadows {
     matrices: array<mat4x4<f32>, 4>,
@@ -598,7 +604,10 @@ fn cutout_vertex(
     let transform = view.clip_from_local;
     let start = transform * vec4(local_a, 1.0);
     let end = transform * vec4(local_b, 1.0);
-    let near = clip_interval(vec2(0.0, 1.0), start.w - start.z, end.w - end.z);
+    var near = vec2(0.0, 1.0);
+    if !SHADOW_CASTER {
+        near = clip_interval(near, start.w - start.z, end.w - end.z);
+    }
     let span = clip_interval(near, start.z, end.z);
     let a = mix(start, end, span.x);
     let b = mix(start, end, span.y);
@@ -634,7 +643,11 @@ fn cutout_vertex(
     // The cross section's isocontour is where optical depth falls below one.
     let area = 2.506628 * splat.sigma.x
         * max(distance(splat.start_mass.xyz, splat.end.xyz), 2.506628 * splat.sigma.y);
-    let radius = sqrt(max(0.0, 2.0 * log(splat.start_mass.w / area)));
+    var peak = splat.start_mass.w / area;
+    // A shadow caster draws out to a faint optical depth, because sparse
+    // coarse levels never reach one but still dim the light.
+    let edge_depth = select(1.0, SHADOW_EDGE_DEPTH, SHADOW_CASTER);
+    let radius = sqrt(max(0.0, 2.0 * log(peak / edge_depth)));
     if radius <= 0.0 {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
@@ -644,13 +657,26 @@ fn cutout_vertex(
     let edge = select(-1.0, 1.0, (vertex_index & 2u) != 0u);
     let width_scale = mix(1.0, profile.y, select(span.x, span.y, tip));
     let clip_w = select(a.w, b.w, tip);
-    let width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
+    var width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
+    if SHADOW_CASTER {
+        // Spread a needle thinner than a texel over a wider, fainter strip so
+        // that its integrated optical depth is kept.
+        let exact = cross_sigma * radius * width_scale * midpoint.w / clip_w;
+        width = max(exact, SHADOW_MIN_WIDTH);
+        peak *= exact / width;
+    }
     let cap = clamp(along_sigma * radius, 0.45, max(cross_sigma * radius, 0.45) * 1.4);
     let along = select(-cap, cap, tip);
     let endpoint = select(a_ndc, b_ndc, tip);
+    var depth = endpoint.z;
+    if SHADOW_CASTER {
+        // A caster between the sun and the cascade still shades it, so it
+        // flattens onto the near plane instead of clipping.
+        depth = min(depth, 1.0);
+    }
     out.position = vec4(
         endpoint.xy + (across * edge * width + tangent * along) / half_viewport,
-        endpoint.z,
+        depth,
         1.0,
     );
     out.coordinate = vec2(select(0.0, length_px, tip) + along, edge);
@@ -665,9 +691,15 @@ fn cutout_vertex(
         select(coverage, -coverage, view.motion.w > 0.0),
     );
     out.profile = vec4(profile, mix(splat.end.w, splat.sigma.w, span.x), mix(splat.end.w, splat.sigma.w, span.y));
+    if SHADOW_CASTER {
+        // The shadow fragment needs no color profile. It needs the optical
+        // depth falloff and a per-segment seed for its random test. A float
+        // holds the index exactly, where a bitcast could flush to zero.
+        out.profile = vec4(f32(instance), peak, radius * radius, 0.0);
+    }
 
     out.color = vec3(0.0);
-    if vertex_index == 1u {
+    if vertex_index == 1u && !SHADOW_CASTER {
         var color = splat.color.rgb;
         if view.direction_to_light.w > 0.0 {
             let normal = rotate(q, vec3(0.0, 0.0, 1.0));
@@ -682,24 +714,63 @@ fn cutout_vertex(
     return out;
 }
 
-@fragment
-fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
+// Whether a fragment lies inside the cutout and survives the fade dithers.
+fn cutout_covers(in: CutoutRaster) -> bool {
     if !detail_visible(in.position.xy, in.detail) {
-        discard;
+        return false;
     }
     let along = in.coordinate.x;
     let across = in.coordinate.y;
     let beyond = max(0.0, max(-along, along - in.shape.x)) / in.shape.y;
     if dot(vec2(beyond, across), vec2(beyond, across)) > 1.0 {
-        discard;
+        return false;
     }
     if abs(in.shape.w) < 1.0 {
         // A shared screen-space threshold makes paired LOD fades complementary.
         let threshold = screen_threshold(in.position.xy);
         if select(threshold >= in.shape.w, threshold < 1.0 + in.shape.w, in.shape.w < 0.0) {
-            discard;
+            return false;
         }
     }
+    return true;
+}
+
+// Each segment blocks a texel with probability 1 - exp(-optical depth).
+// Independent seeds per segment make overlapping segments multiply their
+// transmittance, and shadow filtering averages the texels into partial shade.
+@fragment
+fn cutout_shadow_fragment(in: CutoutRaster) {
+    if !cutout_covers(in) {
+        discard;
+    }
+    let beyond = max(0.0, max(-in.coordinate.x, in.coordinate.x - in.shape.x)) / in.shape.y;
+    let distance_squared = beyond * beyond + in.coordinate.y * in.coordinate.y;
+    let depth = in.profile.y * exp(-0.5 * in.profile.z * distance_squared);
+    let pixel = vec2<u32>(in.position.xy);
+    let seed = u32(in.profile.x);
+    if hash_unit(pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u ^ seed * 0xcb1ab31fu) >= 1.0 - exp(-depth) {
+        discard;
+    }
+}
+
+// A uniform value in [0, 1) from a well-mixed 32-bit hash.
+fn hash_unit(value: u32) -> f32 {
+    var h = value;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return f32(h >> 8u) * (1.0 / 16777216.0);
+}
+
+@fragment
+fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
+    if !cutout_covers(in) {
+        discard;
+    }
+    let along = in.coordinate.x;
+    let across = in.coordinate.y;
     // Tapered leaf kernels have a pale midrib and thinner, warmer edges.
     var color = in.color;
     if in.profile.x > 0.0 && in.profile.y < 1.0 && in.shape.z >= 1.0 {

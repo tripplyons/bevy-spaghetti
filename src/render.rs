@@ -25,7 +25,8 @@ use bevy::{
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
         render_phase::{
-            AddRenderCommand, BinnedRenderPhaseType, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
+            AddRenderCommand, BinnedRenderPhase, BinnedRenderPhaseType, DrawFunctionId,
+            DrawFunctions, PhaseItem, PhaseItemExtraIndex,
             RenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass,
             ViewBinnedRenderPhases, ViewSortedRenderPhases,
         },
@@ -39,7 +40,8 @@ use bevy::{
 use bevy_light::{DirectionalLight, VolumetricLight};
 use bevy_math::{Affine3A, Vec3A};
 use bevy_pbr::{
-    DistanceFog, ExtractedDirectionalLight, FogFalloff, LightEntity, MAX_DIRECTIONAL_LIGHTS,
+    CORE_3D_SHADOW_MAP_FORMAT, DistanceFog, ExtractedDirectionalLight, FogFalloff, LightEntity,
+    MAX_DIRECTIONAL_LIGHTS, Shadow, ShadowBatchSetKey, ShadowBinKey,
 };
 use bytemuck::{Pod, Zeroable};
 
@@ -104,6 +106,21 @@ pub struct SpaghettiNearFade {
 /// draw directly from the asset's segment buffer without sorting the segments.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct SpaghettiCutout;
+
+/// Casts the cloud's shadow into Bevy's directional shadow maps.
+///
+/// Each segment blocks a shadow texel with probability 1 - exp(-τ), where τ
+/// is the segment's optical depth across that texel. Every segment draws its
+/// own random pattern, so overlapping segments multiply their transmittance,
+/// and shadow filtering averages the texels into partial shade. Thin or sparse
+/// clouds cast light shadows and dense ones cast dark shadows.
+///
+/// Shadows bend with wind and sway and ignore [`SpaghettiFlow`]. They use a
+/// finer detail level than the shadow map's texel size alone selects, because
+/// coarse segments are wide and cover more texels. A [`VisibilityRange`] is
+/// measured from the camera that owns the cascade.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct SpaghettiCastShadows;
 
 /// Multiplies an asset's projected detail thresholds for this entity.
 ///
@@ -248,6 +265,7 @@ impl Plugin for SpaghettiPlugin {
             render_app
                 .add_render_command::<Transparent3d, (SetItemPipeline, DrawCloud)>()
                 .add_render_command::<AlphaMask3d, (SetItemPipeline, DrawCloud)>()
+                .add_render_command::<Shadow, (SetItemPipeline, DrawCloud)>()
                 .init_resource::<SpecializedRenderPipelines<SplatPipeline>>()
                 .init_resource::<ViewDraws>()
                 .init_resource::<ViewFog>()
@@ -308,6 +326,7 @@ pub struct ExtractedCloud {
     specular: Option<SpaghettiSpecular>,
     additive: bool,
     flow: Option<SpaghettiFlow>,
+    cast_shadows: bool,
 }
 
 impl SyncComponent<RenderApp> for Spaghetti3d {
@@ -335,6 +354,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             Option<&'static SpaghettiSpecular>,
             Has<SpaghettiAdditive>,
             Option<&'static SpaghettiFlow>,
+            Has<SpaghettiCastShadows>,
         ),
     );
     type QueryFilter = ();
@@ -355,7 +375,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
             wind,
             sway,
             range,
-            (near_fade, detail_scale, specular, additive, flow),
+            (near_fade, detail_scale, specular, additive, flow, cast_shadows),
         ): QueryItem<'_, '_, Self::QueryData>,
     ) -> Option<Self::Out> {
         visibility.get().then(|| ExtractedCloud {
@@ -387,6 +407,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
                     && flow.time.is_finite()
                     && flow.velocity.is_finite()
             }),
+            cast_shadows,
         })
     }
 }
@@ -576,6 +597,8 @@ struct PipelineKey {
     shadowed: bool,
     baked_occlusion: bool,
     additive: bool,
+    // Depth-only cutouts for a directional shadow cascade.
+    shadow: bool,
 }
 
 // Adds premultiplied color and leaves the target's alpha unchanged.
@@ -596,6 +619,36 @@ impl SpecializedRenderPipeline for SplatPipeline {
     type Key = PipelineKey;
 
     fn specialize(&self, key: PipelineKey) -> RenderPipelineDescriptor {
+        if key.shadow {
+            return RenderPipelineDescriptor {
+                label: Some("spaghetti shadow cutouts".into()),
+                layout: vec![self.bindings.clone(), self.shadows.layout.clone()],
+                vertex: VertexState {
+                    shader: self.shader.clone(),
+                    entry_point: Some("cutout_vertex".into()),
+                    constants: vec![("SHADOW_CASTER".into(), 1.0)],
+                    ..default()
+                },
+                fragment: Some(FragmentState {
+                    shader: self.shader.clone(),
+                    entry_point: Some("cutout_shadow_fragment".into()),
+                    targets: vec![],
+                    ..default()
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..default()
+                },
+                depth_stencil: Some(DepthStencilState {
+                    format: CORE_3D_SHADOW_MAP_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(CompareFunction::GreaterEqual),
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                ..default()
+            };
+        }
         RenderPipelineDescriptor {
             label: Some("spaghetti volume compositing".into()),
             layout: vec![self.bindings.clone(), self.shadows.layout.clone()],
@@ -644,6 +697,10 @@ impl SpecializedRenderPipeline for SplatPipeline {
 
 // Keep this capacity in sync with the array in spaghetti.wgsl.
 const FOG_LIGHT_CAPACITY: usize = 10;
+
+/// Detail scale of shadow casters relative to the main view. Shadow filtering
+/// blurs needles over several texels, so a coarser level casts the same shade.
+const SHADOW_DETAIL: f32 = 2.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -852,7 +909,10 @@ impl DrawUniform {
 
 struct CloudDraw {
     main_entity: MainEntity,
+    // The pipeline of this draw's entry in a retained binned phase.
     cutout_pipeline: Option<CachedRenderPipelineId>,
+    // The entry is in a shadow phase rather than the view's cutout phase.
+    shadow: bool,
     source: Buffer,
     occlusion: Option<Buffer>,
     order: Option<Buffer>,
@@ -879,13 +939,63 @@ struct ViewDraws {
 type SplatView = (
     Entity,
     &'static ExtractedView,
-    &'static Msaa,
+    Option<&'static Msaa>,
     Option<&'static Frustum>,
     Option<&'static RenderLayers>,
     Option<&'static TemporalJitter>,
     Option<&'static MainPassResolutionOverride>,
     Option<ShadowViewData>,
+    Option<&'static LightEntity>,
 );
+
+/// The retained binned phase that holds a view's depth-writing cutouts.
+enum CutoutPhase<'a> {
+    Main(&'a mut BinnedRenderPhase<AlphaMask3d>, DrawFunctionId),
+    Shadow(&'a mut BinnedRenderPhase<Shadow>, DrawFunctionId),
+}
+
+impl CutoutPhase<'_> {
+    fn add(
+        &mut self,
+        pipeline: CachedRenderPipelineId,
+        asset: AssetId<SpaghettiAsset>,
+        entity: (Entity, MainEntity),
+    ) {
+        match self {
+            Self::Main(phase, draw_function) => phase.add(
+                OpaqueNoLightmap3dBatchSetKey {
+                    pipeline,
+                    draw_function: *draw_function,
+                    material_bind_group_index: None,
+                    slabs: default(),
+                },
+                OpaqueNoLightmap3dBinKey { asset_id: asset.untyped() },
+                entity,
+                default(),
+                BinnedRenderPhaseType::NonMesh,
+            ),
+            Self::Shadow(phase, draw_function) => phase.add(
+                ShadowBatchSetKey {
+                    pipeline,
+                    draw_function: *draw_function,
+                    material_bind_group_index: None,
+                    slabs: default(),
+                },
+                ShadowBinKey { asset_id: asset.untyped() },
+                entity,
+                default(),
+                BinnedRenderPhaseType::NonMesh,
+            ),
+        }
+    }
+
+    fn remove(&mut self, entity: MainEntity) {
+        match self {
+            Self::Main(phase, _) => phase.remove(entity),
+            Self::Shadow(phase, _) => phase.remove(entity),
+        }
+    }
+}
 
 #[expect(clippy::too_many_arguments, reason = "Bevy system parameters")]
 fn queue_clouds(
@@ -896,8 +1006,12 @@ fn queue_clouds(
     (view_fog, point_lights): (Res<ViewFog>, Res<PointLights>),
     mut phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     draw_functions: Res<DrawFunctions<Transparent3d>>,
-    mut cutout_phases: ResMut<ViewBinnedRenderPhases<AlphaMask3d>>,
-    cutout_draw_functions: Res<DrawFunctions<AlphaMask3d>>,
+    (mut cutout_phases, cutout_draw_functions, mut shadow_phases, shadow_draw_functions): (
+        ResMut<ViewBinnedRenderPhases<AlphaMask3d>>,
+        Res<DrawFunctions<AlphaMask3d>>,
+        ResMut<ViewBinnedRenderPhases<Shadow>>,
+        Res<DrawFunctions<Shadow>>,
+    ),
     pipeline: Res<SplatPipeline>,
     cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SplatPipeline>>,
@@ -916,15 +1030,36 @@ fn queue_clouds(
 
     let draw_function = draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let cutout_draw_function = cutout_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
+    let shadow_draw_function = shadow_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let bind_group_layout = cache.get_bind_group_layout(&pipeline.bindings);
     let default_layers = RenderLayers::default();
-    for (view_entity, view, msaa, frustum, layers, jitter, resolution, shadow_data) in &views {
-        let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
-            continue;
+    // Each directional cascade measures visibility ranges from its camera.
+    let eyes: HashMap<MainEntity, Vec3> = views
+        .iter()
+        .filter(|view| view.8.is_none())
+        .map(|view| (view.1.retained_view_entity.main_entity, view.1.world_from_view.translation()))
+        .collect();
+    for (view_entity, view, msaa, frustum, layers, jitter, resolution, shadow_data, light) in &views {
+        let shadow_view = matches!(light, Some(LightEntity::Directional { .. }));
+        let (mut phase, mut cutout_phase, eye) = if shadow_view {
+            let Some(phase) = shadow_phases.get_mut(&view.retained_view_entity) else {
+                continue;
+            };
+            let Some(&eye) = view.retained_view_entity.auxiliary_entity.and_then(|camera| eyes.get(&camera)) else {
+                continue;
+            };
+            (None, Some(CutoutPhase::Shadow(phase, shadow_draw_function)), eye)
+        } else {
+            let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
+                continue;
+            };
+            let cutout_phase = cutout_phases
+                .get_mut(&view.retained_view_entity)
+                .map(|phase| CutoutPhase::Main(phase, cutout_draw_function));
+            (Some(phase), cutout_phase, view.world_from_view.translation())
         };
         let layers = layers.unwrap_or(&default_layers);
-        let mut cutout_phase = cutout_phases.get_mut(&view.retained_view_entity);
-        let fog = view_fog.0.get(&view.retained_view_entity.main_entity);
+        let fog = view_fog.0.get(&view.retained_view_entity.main_entity).filter(|_| !shadow_view);
         let size = resolution.map_or(view.viewport.zw(), |resolution| resolution.0);
         if size.min_element() == 0 {
             continue;
@@ -938,14 +1073,15 @@ fn queue_clouds(
         } else {
             view.clip_from_world.unwrap_or(projection * view_from_world)
         };
-        let mut pipeline_ids = [None; 16];
+        let mut pipeline_ids = [None; 17];
         let eye_world = view.world_from_view.translation();
         let mut view_shadows = None;
 
         for (entity, main_entity, cloud) in &clouds {
-            if !layers.intersects(&cloud.layers) {
+            if !layers.intersects(&cloud.layers) || (shadow_view && !cloud.cast_shadows) {
                 continue;
             }
+            let cutout = cloud.cutout || shadow_view;
             let Some(gpu) = gpu_clouds.get(cloud.asset) else {
                 continue;
             };
@@ -958,7 +1094,7 @@ fn queue_clouds(
                 } else {
                     cloud.world_from_local.w_axis.truncate()
                 };
-                let distance = view.world_from_view.translation().distance(center);
+                let distance = eye.distance(center);
                 if range.is_culled(distance) {
                     [0.0, 0.0]
                 } else if distance < range.start_margin.end {
@@ -969,7 +1105,7 @@ fn queue_clouds(
                     [1.0, 0.0]
                 }
             });
-            if coverage <= 0.0 || (cloud.cutout && cutout_phase.is_none()) {
+            if coverage <= 0.0 || (cutout && cutout_phase.is_none()) {
                 continue;
             }
             let inverse_basis = (cloud.sway.is_some() || cloud.wind.is_some() || cloud.flow.is_some())
@@ -1028,7 +1164,7 @@ fn queue_clouds(
                 uniform.flow_fade = [fade_in, fade_out, flow.time, 1.0];
                 uniform.flow_tint = flow.tint.max(Vec3::ZERO).extend(0.0).to_array();
             }
-            if let Some(fade) = cloud.near_fade.filter(|fade| fade.end > fade.start) {
+            if let Some(fade) = cloud.near_fade.filter(|fade| fade.end > fade.start && !shadow_view) {
                 uniform.viewport[2] = fade.start;
                 uniform.viewport[3] = fade.end;
             }
@@ -1055,7 +1191,7 @@ fn queue_clouds(
             }
             let mut shadows = &pipeline.shadows.fallback;
             let mut shadowed = false;
-            if let Some(lighting) = cloud.lighting {
+            if let Some(lighting) = cloud.lighting.filter(|_| !shadow_view) {
                 uniform.set_lighting(lighting, cloud.world_from_local);
                 uniform.ambient[3] = cloud.transmission;
                 if let Some(specular) = cloud.specular {
@@ -1122,17 +1258,17 @@ fn queue_clouds(
             let segments = gpu.select_segments(
                 clip_from_local,
                 size.y as f32,
-                cloud.detail_scale,
+                cloud.detail_scale * if shadow_view { SHADOW_DETAIL } else { 1.0 },
                 bounds,
                 &mut uniform,
             );
-            let new_draw = || make_draw(&device, source, gpu, *main_entity, cloud.cutout, shadows);
+            let new_draw = || make_draw(&device, source, gpu, *main_entity, cutout, shadow_view, shadows);
             let draw = draws.draws.entry(key).or_insert_with(new_draw);
             if draw.source.id() != source.id()
-                || draw.order.is_none() != cloud.cutout
+                || draw.order.is_none() != cutout
                 || draw.occlusion.as_ref().map(Buffer::id) != gpu.occlusion.as_ref().map(Buffer::id)
             {
-                if draw.cutout_pipeline.is_some() && let Some(phase) = cutout_phase.as_deref_mut() {
+                if draw.cutout_pipeline.is_some() && let Some(phase) = cutout_phase.as_mut() {
                     phase.remove(draw.main_entity);
                 }
                 *draw = new_draw();
@@ -1172,45 +1308,42 @@ fn queue_clouds(
             draws.staging.extend_from_slice(bytemuck::bytes_of(&uniform));
             draws.staging.resize(draw.uniform_offset as usize + stride, 0);
             draw.idle_frames = 0;
-            let baked_occlusion = gpu.occlusion.is_some() && cloud.lighting.is_some();
-            let variant = usize::from(cloud.cutout)
-                + 2 * usize::from(shadowed)
-                + 4 * usize::from(baked_occlusion)
-                + 8 * usize::from(cloud.additive);
+            let baked_occlusion = gpu.occlusion.is_some() && cloud.lighting.is_some() && !shadow_view;
+            let variant = if shadow_view {
+                16
+            } else {
+                usize::from(cloud.cutout)
+                    + 2 * usize::from(shadowed)
+                    + 4 * usize::from(baked_occlusion)
+                    + 8 * usize::from(cloud.additive)
+            };
             let pipeline_id = *pipeline_ids[variant].get_or_insert_with(|| {
                 pipelines.specialize(
                     &cache,
                     &pipeline,
                     PipelineKey {
                         target: view.target_format,
-                        samples: msaa.samples(),
-                        cutout: cloud.cutout,
+                        samples: msaa.map_or(1, Msaa::samples),
+                        cutout,
                         shadowed,
                         baked_occlusion,
-                        additive: cloud.additive,
+                        additive: cloud.additive && !shadow_view,
+                        shadow: shadow_view,
                     },
                 )
             });
-            if let Some(phase) = cutout_phase.as_deref_mut().filter(|_| cloud.cutout) {
+            if let Some(phase) = cutout_phase.as_mut().filter(|_| cutout) {
                 if draw.cutout_pipeline != Some(pipeline_id) {
                     if draw.cutout_pipeline.replace(pipeline_id).is_some() {
                         phase.remove(*main_entity);
                     }
-                    phase.add(
-                        OpaqueNoLightmap3dBatchSetKey {
-                            pipeline: pipeline_id,
-                            draw_function: cutout_draw_function,
-                            material_bind_group_index: None,
-                            slabs: default(),
-                        },
-                        OpaqueNoLightmap3dBinKey { asset_id: cloud.asset.untyped() },
-                        (entity, *main_entity),
-                        default(),
-                        BinnedRenderPhaseType::NonMesh,
-                    );
+                    phase.add(pipeline_id, cloud.asset, (entity, *main_entity));
                 }
                 continue;
             }
+            let Some(phase) = phase.as_deref_mut() else {
+                continue;
+            };
             phase.add_transient(Transparent3d {
                 sorting_info: TransparentSortingInfo3d::Sorted {
                     mesh_center: cloud
@@ -1265,11 +1398,14 @@ fn queue_clouds(
     // Binned phases retain draws across frames. Remove entries that fell out
     // of range while keeping their buffers briefly for throttled views.
     draws.draws.retain(|&(view, _), draw| {
-        if draw.idle_frames > 0
-            && draw.cutout_pipeline.take().is_some()
-            && let Some(phase) = cutout_phases.get_mut(&view)
-        {
-            phase.remove(draw.main_entity);
+        if draw.idle_frames > 0 && draw.cutout_pipeline.take().is_some() {
+            if draw.shadow {
+                if let Some(phase) = shadow_phases.get_mut(&view) {
+                    phase.remove(draw.main_entity);
+                }
+            } else if let Some(phase) = cutout_phases.get_mut(&view) {
+                phase.remove(draw.main_entity);
+            }
         }
         draw.idle_frames <= 1
     });
@@ -1281,6 +1417,7 @@ fn make_draw(
     cloud: &GpuCloud,
     main_entity: MainEntity,
     cutout: bool,
+    shadow: bool,
     shadows: &BindGroup,
 ) -> CloudDraw {
     let count = cloud.centers.len();
@@ -1295,6 +1432,7 @@ fn make_draw(
     CloudDraw {
         main_entity,
         cutout_pipeline: None,
+        shadow,
         source: source.clone(),
         occlusion: cloud.occlusion.clone(),
         order,

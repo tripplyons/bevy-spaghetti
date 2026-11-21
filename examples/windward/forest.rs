@@ -5,22 +5,23 @@ use bevy::{
     light::NotShadowCaster,
 };
 use bevy_spaghetti::{
-    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout,
-    SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting, SpaghettiNearFade,
-    SpaghettiReceiveShadows, SpaghettiSpecular, SpaghettiSway, SpaghettiTransmission,
+    DetailTransition, GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows,
+    SpaghettiCutout, SpaghettiDetailScale, SpaghettiGroundAmbient, SpaghettiLighting,
+    SpaghettiNearFade, SpaghettiReceiveShadows, SpaghettiSpecular, SpaghettiSway,
+    SpaghettiTransmission,
 };
 
 use crate::{
     bark, conifer,
     lake::REFLECTED_LAYER,
     landscape::{
-        Obstacles, SHADOW_ONLY, SUN, ground, hash01, mark_rock_shadow, noise, reflected_layers,
-        shore_distance, smoothstep, trail_x,
+        Obstacles, SUN, ground, hash01, noise, reflected_layers, shore_distance, smoothstep,
+        trail_x,
     },
 };
 
 const HEIGHTS: [f32; 3] = [8.93, 7.94, 5.76];
-/// Crown widths of the three fir.glb scenes, which still cast the shadows.
+/// Crown widths of the three fir.glb scenes that first set the crown sizes.
 const ATLAS_WIDTHS: [f32; 3] = [6.90, 5.82, 5.64];
 
 /// Minimum on-screen tree height in pixels for each finer level.
@@ -55,8 +56,6 @@ struct Variant {
     form: conifer::Form,
     height: f32,
     radius: f32,
-    /// The fir.glb scene that casts the shadow and its crown radius.
-    shadow: Option<(usize, f32)>,
 }
 
 impl Variant {
@@ -66,7 +65,6 @@ impl Variant {
         form: conifer::Form,
         height: f32,
         radius: f32,
-        shadow: Option<(usize, f32)>,
     ) -> Self {
         Self {
             kind,
@@ -74,7 +72,6 @@ impl Variant {
             form,
             height,
             radius,
-            shadow,
         }
     }
 
@@ -122,66 +119,31 @@ use conifer::{FIR, HEMLOCK, SUBALPINE};
 
 const VARIANTS: [Variant; 20] = [
     // Grand fir and western hemlock in three sizes, then subalpine fir.
-    Variant::new(Living, &FIR, OK, HEIGHTS[0], R[0], Some((0, R[0]))),
-    Variant::new(Living, &FIR, OK, HEIGHTS[1], R[1], Some((1, R[1]))),
-    Variant::new(Living, &FIR, OK, HEIGHTS[2], R[2], Some((2, R[2]))),
-    Variant::new(Living, &HEMLOCK, OK, HEIGHTS[0], R[0], Some((0, R[0]))),
-    Variant::new(Living, &HEMLOCK, OK, HEIGHTS[1], R[1], Some((1, R[1]))),
-    Variant::new(Living, &HEMLOCK, OK, HEIGHTS[2], R[2], Some((2, R[2]))),
-    Variant::new(Living, &SUBALPINE, OK, 8.6, 1.35, Some((1, 1.35))),
-    Variant::new(Living, &SUBALPINE, OK, 6.2, 1.1, Some((2, 1.1))),
+    Variant::new(Living, &FIR, OK, HEIGHTS[0], R[0]),
+    Variant::new(Living, &FIR, OK, HEIGHTS[1], R[1]),
+    Variant::new(Living, &FIR, OK, HEIGHTS[2], R[2]),
+    Variant::new(Living, &HEMLOCK, OK, HEIGHTS[0], R[0]),
+    Variant::new(Living, &HEMLOCK, OK, HEIGHTS[1], R[1]),
+    Variant::new(Living, &HEMLOCK, OK, HEIGHTS[2], R[2]),
+    Variant::new(Living, &SUBALPINE, OK, 8.6, 1.35),
+    Variant::new(Living, &SUBALPINE, OK, 6.2, 1.1),
     // A wind-flagged fir, a hemlock with a dead top, a fir whose top broke
     // off, and a dying subalpine fir.
-    Variant::new(
-        Damaged,
-        &FIR,
-        form(0.12, 2.0, 1.0, 0.95),
-        7.9,
-        2.3,
-        Some((1, 1.6)),
-    ),
-    Variant::new(
-        Damaged,
-        &HEMLOCK,
-        form(0.05, 0.74, 1.0, 0.0),
-        8.2,
-        2.5,
-        Some((1, 2.3)),
-    ),
-    Variant::new(
-        Damaged,
-        &FIR,
-        form(0.08, 2.0, 0.7, 0.0),
-        9.0,
-        2.8,
-        Some((0, 2.7)),
-    ),
-    Variant::new(
-        Damaged,
-        &SUBALPINE,
-        form(0.38, 0.0, 1.0, 0.0),
-        6.6,
-        1.15,
-        Some((2, 0.9)),
-    ),
+    Variant::new(Damaged, &FIR, form(0.12, 2.0, 1.0, 0.95), 7.9, 2.3),
+    Variant::new(Damaged, &HEMLOCK, form(0.05, 0.74, 1.0, 0.0), 8.2, 2.5),
+    Variant::new(Damaged, &FIR, form(0.08, 2.0, 0.7, 0.0), 9.0, 2.8),
+    Variant::new(Damaged, &SUBALPINE, form(0.38, 0.0, 1.0, 0.0), 6.6, 1.15),
     // Snags: a tall broken fir, an intact grey spire, and an old stub.
-    Variant::new(Snag, &FIR, snag(0.68, 1.45), 9.6, 1.8, None),
-    Variant::new(Snag, &SUBALPINE, snag(1.0, 1.15), 7.2, 0.9, None),
-    Variant::new(Snag, &HEMLOCK, snag(0.48, 1.7), 8.0, 1.6, None),
+    Variant::new(Snag, &FIR, snag(0.68, 1.45), 9.6, 1.8),
+    Variant::new(Snag, &SUBALPINE, snag(1.0, 1.15), 7.2, 0.9),
+    Variant::new(Snag, &HEMLOCK, snag(0.48, 1.7), 8.0, 1.6),
     // Old trees with tall clear boles and ragged crowns.
-    Variant::new(Old, &FIR, old(0.3, 1.6, 0.14), 12.2, 3.3, Some((0, 3.3))),
-    Variant::new(
-        Old,
-        &HEMLOCK,
-        old(0.26, 1.5, 0.1),
-        11.2,
-        3.1,
-        Some((0, 3.1)),
-    ),
+    Variant::new(Old, &FIR, old(0.3, 1.6, 0.14), 12.2, 3.3),
+    Variant::new(Old, &HEMLOCK, old(0.26, 1.5, 0.1), 11.2, 3.1),
     // Saplings in the sunny gaps and meadow edge.
-    Variant::new(Sapling, &FIR, OK, 2.5, 1.0, Some((2, 1.0))),
-    Variant::new(Sapling, &SUBALPINE, OK, 3.0, 0.62, Some((2, 0.62))),
-    Variant::new(Sapling, &HEMLOCK, OK, 1.6, 0.78, None),
+    Variant::new(Sapling, &FIR, OK, 2.5, 1.0),
+    Variant::new(Sapling, &SUBALPINE, OK, 3.0, 0.62),
+    Variant::new(Sapling, &HEMLOCK, OK, 1.6, 0.78),
 ];
 
 #[derive(Component)]
@@ -621,11 +583,6 @@ pub fn spawn_trees(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let whorls = meshes.add(whorl_cones());
-    let shadow_material = materials.add(StandardMaterial {
-        cull_mode: None,
-        ..default()
-    });
     let bark_material = bark::bark_material(&server);
     let living_bark = materials.add(StandardMaterial {
         base_color: Color::linear_rgb(0.52, 0.39, 0.29),
@@ -664,8 +621,6 @@ pub fn spawn_trees(
             )
         })
         .collect();
-    let firs: [Handle<WorldAsset>; 3] =
-        [0, 1, 2].map(|i| server.load(GltfAssetLabel::Scene(i).from_asset("windward/fir.glb")));
     for tree in &forest().trees {
         let &Tree {
             at,
@@ -750,41 +705,21 @@ pub fn spawn_trees(
             // Depth-writing cutouts skip the per-view sort and let the
             // depth test reject hidden needles.
             SpaghettiCutout,
+            // The needles cast their own shadow, so it sways with them. With
+            // the low sun, distant crowns shade the meadows in front of them.
+            SpaghettiCastShadows,
         ));
         tree.add_child(reflection).with_children(|children| {
-            children.spawn((
+            let mut bark = children.spawn((
                 Name::new("Living bark"),
                 stem.coarse_mesh(),
                 stem.clone(),
                 stem.bounds,
                 NoAutoAabb,
                 MeshMaterial3d(living_bark.clone()),
-                // The crown's proxy already supplies its shadow.
-                NotShadowCaster,
             ));
-            if core && let Some((_, radius)) = variant.shadow {
-                // Core trees stand behind the stand edges, where a few
-                // stacked cones cast a close enough shadow for a
-                // fraction of the glTF crown's cost.
-                children.spawn((
-                    Mesh3d(whorls.clone()),
-                    MeshMaterial3d(shadow_material.clone()),
-                    Transform::from_scale(Vec3::new(radius, variant.top(), radius)),
-                    RenderLayers::layer(SHADOW_ONLY),
-                ));
-            } else if !distant && let Some((scene, radius)) = variant.shadow {
-                // The glTF crown only casts the shadow.
-                let across = radius / (ATLAS_WIDTHS[scene] * CROWN);
-                children
-                    .spawn((
-                        WorldAssetRoot(firs[scene].clone()),
-                        Transform::from_scale(Vec3::new(
-                            across,
-                            variant.top() / HEIGHTS[scene],
-                            across,
-                        )),
-                    ))
-                    .observe(mark_rock_shadow);
+            if distant {
+                bark.insert(NotShadowCaster);
             }
         });
         if !distant {
@@ -800,32 +735,6 @@ pub fn spawn_trees(
             ));
         }
     }
-}
-
-/// A unit-high, unit-radius crown of three stacked open cones, used only as
-/// a shadow caster.
-fn whorl_cones() -> Mesh {
-    const SIDES: u32 = 7;
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    for (base, apex, radius) in [(0.1, 0.55, 1.0), (0.36, 0.8, 0.74), (0.6, 1.0, 0.46)] {
-        let tip = positions.len() as u32;
-        positions.push([0.0, apex, 0.0]);
-        for side in 0..SIDES {
-            let around = Vec2::from_angle(side as f32 * std::f32::consts::TAU / SIDES as f32);
-            positions.push([around.x * radius, base, around.y * radius]);
-            let next = (side + 1) % SIDES;
-            indices.extend([tip, tip + 1 + next, tip + 1 + side]);
-        }
-    }
-    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
-    Mesh::new(
-        bevy::mesh::PrimitiveTopology::TriangleList,
-        bevy::asset::RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
 }
 
 /// Registers a trunk and crown, scaled so saplings block less than old trees.
