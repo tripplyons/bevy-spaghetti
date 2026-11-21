@@ -515,6 +515,7 @@ fn spawn_rocks(
             .spawn((
                 Name::new("Moss-covered stone"),
                 Spaghetti3d(clouds[0].clone()),
+                SpaghettiCutout,
                 RockDetail {
                     clouds: clouds.clone(),
                     scan,

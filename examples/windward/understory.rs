@@ -5,8 +5,8 @@
 
 use bevy::prelude::*;
 use bevy_spaghetti::{
-    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiLighting, SpaghettiSpecular,
-    SpaghettiTransmission,
+    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout, SpaghettiLighting,
+    SpaghettiSpecular, SpaghettiTransmission,
 };
 
 use crate::{
@@ -191,6 +191,7 @@ fn add_plant(
     let mut plant = commands.spawn((
         Name::new(if fern { "Fern" } else { "Woodland groundcover" }),
         Spaghetti3d(variant.clouds[1].clone()),
+        SpaghettiCutout,
         UnderstoryDetail {
             clouds: variant.clouds.clone(),
             size: variant.size,

@@ -441,6 +441,7 @@ pub fn spawn_prop(
         .spawn((
             Name::new(name),
             Spaghetti3d(clouds[1].clone()),
+            SpaghettiCutout,
             PropDetail {
                 clouds: clouds.clone(),
                 near,

@@ -86,6 +86,7 @@ pub fn spawn_debris(
             .spawn((
                 Name::new("Weathered deadfall"),
                 Spaghetti3d(clouds[1].clone()),
+                SpaghettiCutout,
                 LogDetail {
                     clouds: clouds.clone(),
                     level: 1,
@@ -133,6 +134,7 @@ pub fn spawn_debris(
                     .and_then(|asset| asset.bake_occlusion_with_density(SUN, 0.16))
                     .expect("valid path gravel"),
             )),
+            SpaghettiCutout,
             LIGHTING,
             SpaghettiReceiveShadows,
             Transform::IDENTITY,
