@@ -10,7 +10,8 @@ use bevy::{
     shader::ShaderRef,
 };
 use bevy_spaghetti::{
-    Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting, SpaghettiReceiveShadows,
+    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout, SpaghettiLighting,
+    SpaghettiReceiveShadows,
 };
 
 use crate::{
@@ -24,7 +25,6 @@ pub const LAKE_RADII: Vec2 = Vec2::new(10.4, 16.8);
 pub const SUN: Vec3 = Vec3::new(-0.1618, 0.1435, -0.9763);
 pub const SUN_COLOR: Color = Color::srgb(1.0, 0.86, 0.71);
 pub const SUN_LUX: f32 = 19800.0;
-pub const SHADOW_ONLY: usize = 1;
 const TERRAIN_COLUMNS: u32 = 192;
 const TERRAIN_ROWS: u32 = 196;
 const TERRAIN_STEP: f32 = 0.72;
@@ -245,7 +245,6 @@ pub fn spawn_landscape(
     server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut ground_materials: ResMut<Assets<GroundMaterial>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     commands.spawn((
         Name::new("Sun"),
@@ -265,7 +264,6 @@ pub fn spawn_landscape(
         }
         .build(),
         VolumetricLight,
-        RenderLayers::default().with(SHADOW_ONLY),
     ));
     commands.spawn((
         Name::new("Light from the open sky"),
@@ -304,7 +302,7 @@ pub fn spawn_landscape(
     ));
 
     let mut obstacles = Obstacles::default();
-    spawn_rocks(&mut commands, &server, &mut materials, &mut obstacles);
+    spawn_rocks(&mut commands, &server, &mut obstacles);
     commands.insert_resource(obstacles);
 }
 
@@ -410,76 +408,28 @@ pub const ROCKS: [(f32, f32, f32); 15] = [
     (3.6, 14.2, 0.44),
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RockLevel {
-    Scan,
-    Medium,
-    Far,
-}
-
 #[derive(Component)]
 pub struct RockDetail {
-    clouds: [Handle<SpaghettiAsset>; 2],
-    scan: Entity,
-    level: RockLevel,
+    clouds: [Handle<SpaghettiAsset>; 3],
+    level: usize,
 }
 
-fn spawn_rocks(
-    commands: &mut Commands,
-    server: &AssetServer,
-    materials: &mut Assets<StandardMaterial>,
-    obstacles: &mut Obstacles,
-) {
+fn spawn_rocks(commands: &mut Commands, server: &AssetServer, obstacles: &mut Obstacles) {
     let rocks = [
         [
             // ShareTextures "Rock 4" scan, converted with spaghetti-convert.
+            "windward/basalt.spag",
             "windward/basalt-mid.spag",
             "windward/basalt-far.spag",
         ],
         [
             // Poly Haven "Boulder 01" (CC0), converted with spaghetti-convert.
+            "windward/granite.spag",
             "windward/granite-mid.spag",
             "windward/granite-far.spag",
         ],
     ]
     .map(|paths| paths.map(|path| load_lit_cloud(server, path)));
-    let scans: [Handle<Mesh>; 2] = [
-        "windward/basalt/rock4.gltf",
-        "windward/granite/boulder_01_1k.gltf",
-    ]
-    .map(|path| {
-        server.load(
-            GltfAssetLabel::Primitive {
-                mesh: 0,
-                primitive: 0,
-            }
-            .from_asset(path),
-        )
-    });
-    let granite_surface = load_tile(server, "windward/granite-surface.dds", false);
-    let stone = [
-        materials.add(StandardMaterial {
-            base_color_texture: Some(load_tile(server, "windward/basalt-color.dds", true)),
-            perceptual_roughness: 0.90,
-            reflectance: 0.26,
-            ..default()
-        }),
-        materials.add(StandardMaterial {
-            base_color_texture: Some(load_tile(server, "windward/granite-color.dds", true)),
-            normal_map_texture: Some(load_tile(server, "windward/granite-normal.dds", false)),
-            metallic_roughness_texture: Some(granite_surface.clone()),
-            occlusion_texture: Some(granite_surface),
-            perceptual_roughness: 1.0,
-            reflectance: 0.26,
-            ..default()
-        }),
-    ];
-    // Bake the original scene node transform back into the basalt primitive.
-    let source_transform = [
-        Transform::from_scale(Vec3::splat(500.0))
-            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-        Transform::IDENTITY,
-    ];
     for (index, &(x, z, scale)) in ROCKS.iter().enumerate() {
         let at = Vec2::new(x, z);
         let variant = usize::from(index % 3 != 0);
@@ -501,35 +451,23 @@ fn spawn_rocks(
             ambient: Vec3::new(0.22, 0.245, 0.27),
             directional: Vec3::new(0.49, 0.46, 0.41),
         };
-        // The same mesh stays in the sun's shadow map at every detail level.
-        let scan = commands
-            .spawn((
-                Name::new("Textured boulder scan"),
-                Mesh3d(scans[variant].clone()),
-                MeshMaterial3d(stone[variant].clone()),
-                source_transform[variant],
-                RenderLayers::layer(SHADOW_ONLY),
-            ))
-            .id();
         commands
             .spawn((
                 Name::new("Moss-covered stone"),
-                Spaghetti3d(clouds[0].clone()),
+                Spaghetti3d(clouds[1].clone()),
                 SpaghettiCutout,
                 RockDetail {
                     clouds: clouds.clone(),
-                    scan,
-                    level: RockLevel::Medium,
+                    level: 1,
                 },
                 lighting,
                 SpaghettiReceiveShadows,
+                SpaghettiCastShadows,
                 placement,
-                RenderLayers::default(),
             ))
-            .add_child(scan)
             .with_child((
                 Name::new("Reflected stone"),
-                Spaghetti3d(clouds[1].clone()),
+                Spaghetti3d(clouds[2].clone()),
                 // The rippled lake blurs the reflection, so it skips the sorted path.
                 SpaghettiCutout,
                 lighting,
@@ -549,27 +487,12 @@ fn spawn_rocks(
 pub fn select_rock_detail(
     camera: Single<CameraView, With<crate::player::HikerCamera>>,
     assets: Res<Assets<SpaghettiAsset>>,
-    server: Res<AssetServer>,
-    materials: Res<Assets<StandardMaterial>>,
-    mut rocks: Query<(
-        &Transform,
-        &mut RockDetail,
-        &mut Spaghetti3d,
-        &mut RenderLayers,
-    )>,
-    mut scans: Query<
-        (
-            &Mesh3d,
-            &MeshMaterial3d<StandardMaterial>,
-            &mut RenderLayers,
-        ),
-        Without<RockDetail>,
-    >,
+    mut rocks: Query<(&Transform, &mut RockDetail, &mut Spaghetti3d)>,
 ) {
     let Some(view) = ScreenDetail::new(*camera) else {
         return;
     };
-    for (transform, mut detail, mut cloud, mut layers) in &mut rocks {
+    for (transform, mut detail, mut cloud) in &mut rocks {
         let Some(asset) = assets.get(&detail.clouds[0]) else {
             continue;
         };
@@ -579,58 +502,19 @@ pub fn select_rock_detail(
         let size = dimensions.xz().length() * 0.66;
         let pixels = view.span_pixels(center, size, 0.4 * size);
         // Use hysteresis to keep the density stable as the shoulder camera bobs.
-        let near = if detail.level == RockLevel::Scan {
-            74.0
-        } else {
-            92.0
-        };
-        let middle = if detail.level == RockLevel::Far {
-            65.0
-        } else {
-            54.0
-        };
+        let near = if detail.level == 0 { 74.0 } else { 92.0 };
+        let middle = if detail.level == 2 { 65.0 } else { 54.0 };
         let level = if pixels >= near {
-            RockLevel::Scan
+            0
         } else if pixels >= middle {
-            RockLevel::Medium
+            1
         } else {
-            RockLevel::Far
+            2
         };
-        if level == detail.level {
-            continue;
+        if level != detail.level && assets.contains(&detail.clouds[level]) {
+            cloud.0 = detail.clouds[level].clone();
+            detail.level = level;
         }
-        let Ok((mesh, material, mut scan_layers)) = scans.get_mut(detail.scan) else {
-            continue;
-        };
-        if level == RockLevel::Scan {
-            let Some(material) = materials.get(&material.0) else {
-                continue;
-            };
-            let textures = [
-                &material.base_color_texture,
-                &material.normal_map_texture,
-                &material.metallic_roughness_texture,
-            ];
-            if !server.is_loaded_with_dependencies(mesh.0.id())
-                || !textures
-                    .into_iter()
-                    .flatten()
-                    .all(|map| server.is_loaded_with_dependencies(map.id()))
-            {
-                continue;
-            }
-            *layers = RenderLayers::none();
-            *scan_layers = RenderLayers::default().with(SHADOW_ONLY);
-        } else {
-            let handle = &detail.clouds[usize::from(level == RockLevel::Far)];
-            if !assets.contains(handle) {
-                continue;
-            }
-            cloud.0 = handle.clone();
-            *layers = RenderLayers::default();
-            *scan_layers = RenderLayers::layer(SHADOW_ONLY);
-        }
-        detail.level = level;
     }
 }
 

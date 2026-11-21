@@ -9,7 +9,6 @@ use bevy::{
     light::{NotShadowCaster, NotShadowReceiver},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
-    world_serialization::WorldInstanceReady,
 };
 use bevy_spaghetti::{
     Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout, SpaghettiLighting,
@@ -27,10 +26,12 @@ use crate::{
     player::HikerCamera,
 };
 
-/// Poly Haven "Tree Stump 01" (CC0).
-const STUMP: &str = "windward/stump/tree_stump_01_1k.gltf";
-/// The same scan converted with spaghetti-convert at 2.5k samples.
-const STUMP_REFLECTION: &str = "windward/stump-far.spag";
+/// Poly Haven "Tree Stump 01" (CC0), converted with spaghetti-convert at 30k, 9k, and 2.5k samples.
+const STUMP_CLOUDS: [&str; 3] = [
+    "windward/stump.spag",
+    "windward/stump-mid.spag",
+    "windward/stump-far.spag",
+];
 /// The scan's litter mound reaches 0.19 m below its origin about 0.6 to 0.9 m
 /// from the trunk axis.
 const STUMP_SKIRT: f32 = 0.17;
@@ -62,23 +63,20 @@ const STONES: [(&str, Vec3); 4] = [
     ("e", Vec3::new(0.111, 0.077, 0.112)),
 ];
 
-/// The conifer gains, so props sit in the same light as the stands.
+/// The conifer gains, so stone props sit in the same light as the stands.
 pub const LIGHTING: SpaghettiLighting = SpaghettiLighting {
     direction_to_light: SUN,
     ambient: Vec3::new(0.24, 0.27, 0.29),
     directional: Vec3::new(0.62, 0.52, 0.40),
 };
-
-/// The opaque core is the scan mesh shrunk about its base, so splats overhang
-/// its silhouette by a few centimeters and add only the surface detail.
-pub const CORE_SCALE: f32 = 0.95;
-/// Beyond this range the splats are too small to show the ground through
-/// them, so the core fades out with a dither.
-const CORE_RANGE: VisibilityRange = VisibilityRange {
-    start_margin: 0.0..0.0,
-    end_margin: 24.0..30.0,
-    use_aabb: false,
+/// Stumps have darker bark albedo and denser self-occlusion than the stones,
+/// so they need stronger cool sky ambient to read as weathered grey-brown wood.
+const STUMP_LIGHTING: SpaghettiLighting = SpaghettiLighting {
+    direction_to_light: SUN,
+    ambient: Vec3::new(0.90, 1.04, 1.24),
+    directional: Vec3::new(1.15, 0.98, 0.78),
 };
+
 pub const CONTACT_RANGE: VisibilityRange = VisibilityRange {
     start_margin: 0.0..0.0,
     end_margin: 34.0..42.0,
@@ -261,35 +259,6 @@ pub fn contact_shadow(at: Vec2, inner: f32, outer: f32, darkness: f32, seed: u32
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// Spawns a visible, shrunk copy of a scan under its splat cloud.
-pub fn spawn_core(commands: &mut Commands, scan: Handle<WorldAsset>, scale: Vec3) -> Entity {
-    commands
-        .spawn((
-            Name::new("Prop core"),
-            WorldAssetRoot(scan),
-            Transform::from_scale(scale),
-        ))
-        .observe(mark_prop_core)
-        .id()
-}
-
-/// The splats carry the lighting and cast the shadow, so the core neither
-/// casts nor receives shadows.
-pub fn mark_prop_core(
-    ready: On<WorldInstanceReady>,
-    children: Query<&Children>,
-    meshes: Query<(), With<Mesh3d>>,
-    mut commands: Commands,
-) {
-    for child in children.iter_descendants(ready.entity) {
-        if meshes.contains(child) {
-            commands
-                .entity(child)
-                .insert((NotShadowCaster, NotShadowReceiver, CORE_RANGE));
-        }
-    }
-}
-
 fn spawn_stumps(
     commands: &mut Commands,
     server: &AssetServer,
@@ -297,8 +266,7 @@ fn spawn_stumps(
     clearance: &mut Clearance,
 ) -> Vec<(Vec2, f32)> {
     let mut placed = Vec::new();
-    let scan = server.load(GltfAssetLabel::Scene(0).from_asset(STUMP));
-    let reflection = load_lit_cloud(server, STUMP_REFLECTION);
+    let clouds = STUMP_CLOUDS.map(|path| load_lit_cloud(server, path));
     for (index, anchor) in STUMP_ANCHORS.into_iter().enumerate() {
         let seed = 4100 + index as u32 * 37;
         let scale = 1.1 + 0.5 * hash01(seed);
@@ -323,22 +291,14 @@ fn spawn_stumps(
         let transform = Transform::from_xyz(at.x, floor + STUMP_SKIRT * height, at.y)
             .with_rotation(Quat::from_rotation_y(hash01(seed + 2) * TAU))
             .with_scale(Vec3::new(scale, height, scale));
-        // The opaque scan uses the bark's normal map and supplies the shadow.
-        commands
-            .spawn((
-                Name::new("Old-growth stump"),
-                WorldAssetRoot(scan.clone()),
-                transform,
-            ))
-            .with_child((
-                Name::new("Reflected stump"),
-                Spaghetti3d(reflection.clone()),
-                // The rippled lake blurs the reflection, so it skips the sorted path.
-                SpaghettiCutout,
-                LIGHTING,
-                SpaghettiReceiveShadows,
-                RenderLayers::layer(REFLECTED_LAYER),
-            ));
+        spawn_prop(
+            commands,
+            "Old-growth stump",
+            transform,
+            &clouds,
+            STUMP_LIGHTING,
+            (180.0, 75.0),
+        );
         clearance.props.push((at, reach));
         placed.push((at, scale));
         // The unstretched scan is about 0.32 m in radius and 0.55 m tall.
@@ -347,8 +307,8 @@ fn spawn_stumps(
     placed
 }
 
-/// The splat levels, the scan, and the scan's size for one kind of stone.
-pub type StoneKind = ([Handle<SpaghettiAsset>; 3], Handle<WorldAsset>, Vec3);
+/// The splat levels and the scan's size for one kind of stone.
+pub type StoneKind = ([Handle<SpaghettiAsset>; 3], Vec3);
 
 pub fn stone_kinds(server: &AssetServer) -> [StoneKind; 4] {
     STONES.map(|(name, size)| {
@@ -358,10 +318,7 @@ pub fn stone_kinds(server: &AssetServer) -> [StoneKind; 4] {
             format!("windward/stone-{name}-far.spag"),
         ]
         .map(|path| load_lit_cloud(server, path));
-        let scan = server.load(
-            GltfAssetLabel::Scene(0).from_asset(format!("windward/stones/stone_{name}.gltf")),
-        );
-        (clouds, scan, size)
+        (clouds, size)
     })
 }
 
@@ -396,7 +353,7 @@ fn spawn_stones(
             continue;
         }
         let kind = (hash01(id + 4) * STONES.len() as f32) as usize % STONES.len();
-        let (clouds, scan, size) = &kinds[kind];
+        let (clouds, size) = &kinds[kind];
         let length = 0.2 + 0.38 * hash01(id + 5).powi(2);
         let scale = length / size.x;
         let reach = 0.5 * length;
@@ -416,7 +373,7 @@ fn spawn_stones(
             "Loose stone",
             transform,
             clouds,
-            scan,
+            LIGHTING,
             (80.0, 30.0),
         );
         clearance.props.push((at, reach));
@@ -433,10 +390,9 @@ pub fn spawn_prop(
     name: &'static str,
     transform: Transform,
     clouds: &[Handle<SpaghettiAsset>; 3],
-    scan: &Handle<WorldAsset>,
+    lighting: SpaghettiLighting,
     (near, middle): (f32, f32),
 ) {
-    let core = spawn_core(commands, scan.clone(), Vec3::splat(CORE_SCALE));
     commands
         .spawn((
             Name::new(name),
@@ -448,7 +404,7 @@ pub fn spawn_prop(
                 middle,
                 level: 1,
             },
-            LIGHTING,
+            lighting,
             SpaghettiReceiveShadows,
             SpaghettiCastShadows,
             transform,
@@ -459,12 +415,11 @@ pub fn spawn_prop(
                 Spaghetti3d(clouds[2].clone()),
                 // The rippled lake blurs the reflection, so it skips the sorted path.
                 SpaghettiCutout,
-                LIGHTING,
+                lighting,
                 SpaghettiReceiveShadows,
                 RenderLayers::layer(REFLECTED_LAYER),
             ));
-        })
-        .add_child(core);
+        });
 }
 
 /// Returns the lowest ground under a round footprint, so no edge floats.

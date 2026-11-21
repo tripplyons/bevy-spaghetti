@@ -319,7 +319,7 @@ fn spawn_ring(commands: &mut Commands, server: &AssetServer, site: Vec2, rng: &m
     let end = angle + TAU;
     while angle < end - 0.3 {
         // Stone "d" is a flat, near-black scan that reads as a hole here.
-        let (clouds, shadow, size) = &kinds[[0, 1, 3][(rng.next() * 3.0) as usize % 3]];
+        let (clouds, size) = &kinds[[0, 1, 3][(rng.next() * 3.0) as usize % 3]];
         let length = rng.range(0.27, 0.40).min((end - angle) * RING);
         // The stone spans this much of the ring, with a small gap.
         let arc = (length + rng.range(0.01, 0.05)) / RING;
@@ -339,7 +339,7 @@ fn spawn_ring(commands: &mut Commands, server: &AssetServer, site: Vec2, rng: &m
                 .with_rotation(Quat::from_rotation_y(turn) * tilt)
                 .with_scale(Vec3::splat(scale)),
             clouds,
-            shadow,
+            props::LIGHTING,
             (80.0, 30.0),
         );
     }

@@ -19,9 +19,7 @@ use crate::{
     props,
 };
 
-/// Poly Haven "Dead Tree Trunk" (CC0), kept as the opaque core under the splats.
-const TRUNK: &str = "windward/deadfall/dead_tree_trunk_1k.gltf";
-/// The same scan converted with spaghetti-convert at 30k, 9k, and 2.5k samples.
+/// Poly Haven "Dead Tree Trunk" (CC0), converted with spaghetti-convert at 30k, 9k, and 2.5k samples.
 const TRUNK_CLOUDS: [&str; 3] = [
     "windward/deadfall.spag",
     "windward/deadfall-mid.spag",
@@ -66,7 +64,6 @@ pub fn spawn_debris(
     ];
     fallen.extend(stand_logs(&fallen));
     // The scan is 3.05 m long and about 0.28 m thick, lying along +X.
-    let scan = server.load(GltfAssetLabel::Scene(0).from_asset(TRUNK));
     let clouds = TRUNK_CLOUDS.map(|path| load_lit_cloud(&server, path));
     for (index, (at, angle, length, radius)) in fallen.into_iter().enumerate() {
         let girth = radius / 0.14;
@@ -76,12 +73,6 @@ pub fn spawn_debris(
             at + Vec2::from_angle(angle) * length * 0.5,
         ];
         let lowest = ground(ends[0]).min(ground(ends[1])).min(ground(at));
-        // Keep the length so the core's sawn ends stay under the splats.
-        let core = props::spawn_core(
-            &mut commands,
-            scan.clone(),
-            Vec3::new(0.985, props::CORE_SCALE, props::CORE_SCALE),
-        );
         commands
             .spawn((
                 Name::new("Weathered deadfall"),
@@ -110,8 +101,7 @@ pub fn spawn_debris(
                     SpaghettiReceiveShadows,
                     RenderLayers::layer(REFLECTED_LAYER),
                 ));
-            })
-            .add_child(core);
+            });
     }
 
     let mut patches: BTreeMap<(i32, i32), Vec<GaussianSegment>> = BTreeMap::new();
