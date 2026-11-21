@@ -1,4 +1,5 @@
 //! Explore a windswept wetland. Run with `cargo run --example windward`.
+//! To render a scripted 1080p60 clip instead, see `record.rs`.
 mod air;
 mod atmosphere;
 mod backdrop;
@@ -20,6 +21,7 @@ mod nurse;
 mod player;
 mod props;
 mod reeds;
+mod record;
 mod stone_grade;
 mod understory;
 mod webs;
@@ -41,6 +43,10 @@ use player::{HikerCamera, animate_hiker, follow_hiker, move_hiker, read_controls
 use reeds::{spawn_reeds, step_reeds};
 
 fn main() {
+    if record::requested() {
+        record::run();
+        return;
+    }
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(asset_plugin()).set(WindowPlugin {
         primary_window: Some(Window {

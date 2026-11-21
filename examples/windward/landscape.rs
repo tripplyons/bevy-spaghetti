@@ -83,18 +83,22 @@ impl Obstacles {
         position
     }
 
+    /// Returns true if a camera at this point would sit inside a crown,
+    /// trunk, or stone.
+    pub fn obscures(&self, at: Vec3) -> bool {
+        self.0.iter().any(|obstacle| {
+            at.y >= obstacle.bottom
+                && at.y <= obstacle.top
+                && at.xz().distance_squared(obstacle.center) < obstacle.canopy_radius.powi(2)
+        })
+    }
+
     pub fn camera_eye(&self, pivot: Vec3, desired: Vec3) -> Vec3 {
         let mut safe = pivot;
         for step in 1..=12 {
             let fraction = step as f32 / 12.0;
             let sample = pivot.lerp(desired, fraction);
-            let at = sample.xz();
-            let obscured = self.0.iter().any(|obstacle| {
-                sample.y >= obstacle.bottom
-                    && sample.y <= obstacle.top
-                    && at.distance_squared(obstacle.center) < obstacle.canopy_radius.powi(2)
-            });
-            if sample.y < ground(at) + 0.30 || obscured {
+            if sample.y < ground(sample.xz()) + 0.30 || self.obscures(sample) {
                 break;
             }
             safe = sample;

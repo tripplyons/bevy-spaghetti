@@ -4,15 +4,11 @@ use std::{
 };
 
 use bevy::{
-    animation::transition::AnimationTransitions,
-    app::PluginsState,
     asset::RenderAssetUsages,
     camera::RenderTarget,
-    light::{EnvironmentMapLight, Skybox},
     render::{
         RenderApp,
         gpu_readback::{Readback, ReadbackComplete},
-        pipelined_rendering::PipelinedRenderingPlugin,
         render_resource::{
             CachedPipelineState, Extent3d, PipelineCache, PollType, TextureDimension,
             TextureFormat, TextureUsages,
@@ -20,13 +16,16 @@ use bevy::{
         renderer::RenderDevice,
     },
     time::TimeUpdateStrategy,
-    window::ExitCondition,
-    winit::WinitPlugin,
 };
 use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiCutout};
 
 use super::*;
-use crate::{landscape::ground, player::Hiker, reeds::ReedPatch};
+use crate::{
+    landscape::ground,
+    player::Hiker,
+    record::{headless_app, warm_up},
+    reeds::ReedPatch,
+};
 
 const WIDTH: usize = 320;
 const HEIGHT: usize = 192;
@@ -463,49 +462,6 @@ fn benchmark_scene_offscreen() {
     );
 }
 
-fn headless_app() -> App {
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(asset_plugin())
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .disable::<WinitPlugin>()
-            .disable::<PipelinedRenderingPlugin>(),
-    );
-    add_scene(&mut app);
-    app.insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
-    app
-}
-
-fn warm_up(app: &mut App, ready: impl Fn(&World) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while app.plugins_state() == PluginsState::Adding {
-        assert!(Instant::now() < deadline, "GPU initialization timed out");
-        std::thread::yield_now();
-    }
-    app.finish();
-    app.cleanup();
-    let mut stable_frames = 0;
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "the full scene never became ready offscreen"
-        );
-        app.update();
-        if assets_ready(app.world_mut()) && ready(app.world()) {
-            stable_frames += 1;
-            if stable_frames >= 24 {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-}
-
 fn benchmark_target(
     mut commands: Commands,
     camera: Single<Entity, With<HikerCamera>>,
@@ -521,42 +477,6 @@ fn benchmark_target(
     commands
         .entity(*camera)
         .insert(RenderTarget::Image(image.into()));
-}
-
-fn assets_ready(world: &mut World) -> bool {
-    let skinned = world
-        .query::<(&AnimationPlayer, &AnimationTransitions)>()
-        .iter(world)
-        .count();
-    let mesh_count = world.query::<&Mesh3d>().iter(world).count();
-    let ibl = world
-        .query::<&EnvironmentMapLight>()
-        .iter(world)
-        .any(|probe| {
-            let images = world.resource::<Assets<Image>>();
-            images.contains(&probe.diffuse_map) && images.contains(&probe.specular_map)
-        });
-    let sky = world.query::<&Skybox>().iter(world).any(|sky| {
-        let images = world.resource::<Assets<Image>>();
-        sky.image
-            .as_ref()
-            .and_then(|handle| images.get(handle))
-            .is_some_and(|image| image.texture_descriptor.size.depth_or_array_layers == 6)
-    });
-    let assets = world.query::<&Spaghetti3d>().iter(world).all(|cloud| {
-        world
-            .resource::<Assets<SpaghettiAsset>>()
-            .contains(&cloud.0)
-    });
-    let understory = world
-        .query_filtered::<&WorldAssetRoot, With<understory::Understory>>()
-        .iter(world)
-        .all(|root| {
-            world
-                .resource::<AssetServer>()
-                .is_loaded_with_dependencies(&root.0)
-        });
-    skinned > 0 && mesh_count >= 85 && ibl && sky && assets && understory
 }
 
 fn assert_shaders_loaded(app: &App) {
