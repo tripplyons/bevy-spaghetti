@@ -124,6 +124,16 @@ pub struct SpaghettiCutout;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct SpaghettiCastShadows;
 
+/// Keeps every spaghetti cloud out of this directional light's shadow maps.
+///
+/// Use it on a light whose shadow map exists for another reason, such as a
+/// tiny cascade that only lets volumetric fog see the light. Such a cascade
+/// looks along the light through the whole scene, so the few clouds that
+/// cross its narrow frustum cover the entire map with fragments.
+#[derive(Component, Clone, Copy, Debug, Default, ExtractComponent)]
+#[extract_app(RenderApp)]
+pub struct NoSpaghettiShadows;
+
 /// Multiplies an asset's projected detail thresholds for this entity.
 ///
 /// Values above one switch to coarser levels sooner. One keeps the asset's
@@ -260,6 +270,7 @@ impl Plugin for SpaghettiPlugin {
             .add_plugins((
                 RenderAssetPlugin::<GpuCloud>::default(),
                 ExtractComponentPlugin::<Spaghetti3d>::default(),
+                ExtractComponentPlugin::<NoSpaghettiShadows>::default(),
             ));
         embedded_asset!(app, "spaghetti.wgsl");
 
@@ -1192,7 +1203,11 @@ fn queue_clouds(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     (mut depths, mut order): (Local<Vec<(f32, u32)>>, Local<Vec<u32>>),
-    (cascade_views, sun_lights): (Query<&LightEntity>, Query<&ExtractedDirectionalLight>),
+    (cascade_views, sun_lights, shadowless): (
+        Query<&LightEntity>,
+        Query<&ExtractedDirectionalLight>,
+        Query<(), With<NoSpaghettiShadows>>,
+    ),
 ) {
     let draws = draws.as_mut();
     for draw in draws.draws.values_mut() {
@@ -1215,7 +1230,15 @@ fn queue_clouds(
         .map(|view| (view.1.retained_view_entity.main_entity, view.1.world_from_view.translation()))
         .collect();
     for (view_entity, view, msaa, frustum, layers, jitter, resolution, shadow_data, light) in &views {
-        let shadow_view = matches!(light, Some(LightEntity::Directional { .. }));
+        let shadow_view = match light {
+            Some(&LightEntity::Directional { light_entity, .. }) => {
+                if shadowless.contains(light_entity) {
+                    continue;
+                }
+                true
+            }
+            _ => false,
+        };
         let (mut phase, mut cutout_phase, eye) = if shadow_view {
             let Some(phase) = shadow_phases.get_mut(&view.retained_view_entity) else {
                 continue;

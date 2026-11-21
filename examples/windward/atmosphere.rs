@@ -15,6 +15,8 @@ use bevy::{
     },
 };
 
+use bevy_spaghetti::NoSpaghettiShadows;
+
 use crate::{
     landscape::{WATER_LEVEL, ground, noise, shore_distance, smoothstep},
     player::HikerCamera,
@@ -101,7 +103,9 @@ pub fn camera_grade() -> impl Bundle {
 /// other directional lights as volumetric, with shadow maps on and a single
 /// cascade 0.1 m long. All of them then sort with the sun, and the sun sorts
 /// first because it was spawned first. Fog samples beyond a light's cascade
-/// get no light from it, so these lights add no visible fog.
+/// get no light from it, so these lights add no visible fog. Splats stay out
+/// of these shadow maps, because a cascade this narrow still looks through the
+/// whole scene and every cloud on its line covers the full map.
 pub fn unblock_sun_shafts(
     mut commands: Commands,
     camera: Single<&RenderLayers, With<HikerCamera>>,
@@ -117,6 +121,7 @@ pub fn unblock_sun_shafts(
         light.shadow_maps_enabled = true;
         commands.entity(entity).insert((
             VolumetricLight,
+            NoSpaghettiShadows,
             CascadeShadowConfigBuilder {
                 num_cascades: 1,
                 minimum_distance: 0.05,
