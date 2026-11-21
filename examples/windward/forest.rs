@@ -671,6 +671,8 @@ pub fn spawn_trees(
         let mut reflected = commands.spawn((
             Name::new("Reflected conifer"),
             Spaghetti3d(detail.reflection.clone()),
+            // The rippled lake blurs the reflection, so it skips the sorted path.
+            SpaghettiCutout,
             lighting,
             ground_ambient,
             NEEDLE_TRANSMISSION,

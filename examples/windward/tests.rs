@@ -23,7 +23,7 @@ use bevy::{
     window::ExitCondition,
     winit::WinitPlugin,
 };
-use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset};
+use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiCutout};
 
 use super::*;
 use crate::{landscape::ground, player::Hiker, reeds::ReedPatch};
@@ -71,6 +71,8 @@ fn full_scene_renders_in_background() {
     warm_up(&mut app, |world| {
         world.resource::<FrameCapture>().0.is_some()
     });
+    apply_bench_overrides(&mut app);
+    step_scene(&mut app, 4);
 
     let samples = if app.world().contains_resource::<ReviewFrames>() {
         app.insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
@@ -176,7 +178,11 @@ fn full_scene_renders_in_background() {
             if std::env::var_os("WINDWARD_REVIEW_STILL").is_some() {
                 // Frozen time stops the camera's follow smoothing.
                 let world = app.world_mut();
-                let feet = world.query_filtered::<&Transform, With<Hiker>>().single(world).unwrap().translation;
+                let feet = world
+                    .query_filtered::<&Transform, With<Hiker>>()
+                    .single(world)
+                    .unwrap()
+                    .translation;
                 world.resource_scope(|world, obstacles: Mut<crate::landscape::Obstacles>| {
                     let mut rig = world.query::<(&mut Transform, &HikerCamera)>();
                     let (mut transform, rig) = rig.single_mut(world).unwrap();
@@ -328,6 +334,71 @@ fn save_review_frame(world: &World, name: &str) {
     println!("Offscreen render: {}", path.display());
 }
 
+/// Applies the benchmark-only listing and entity overrides from the environment.
+fn apply_bench_overrides(app: &mut App) {
+    // Lists the sorted transparent splat drawers so a trace can attribute time.
+    if std::env::var_os("WINDWARD_BENCH_LIST").is_some() {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<
+            (Option<&Name>, &Spaghetti3d),
+            (With<Spaghetti3d>, Without<SpaghettiCutout>),
+        >();
+        let mut rows: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for (name, splat) in query.iter(world) {
+            let segments = world
+                .resource::<Assets<SpaghettiAsset>>()
+                .get(&splat.0)
+                .map_or(0, |asset| asset.segments().len());
+            let row = rows
+                .entry(name.map_or("<unnamed>", |name| name.as_str()).to_string())
+                .or_default();
+            row.0 += 1;
+            row.1 += segments;
+        }
+        for (name, (entities, segments)) in &rows {
+            println!("WINDWARD_BENCH_LIST {name}: {entities} entities, {segments} segments");
+        }
+        println!("WINDWARD_BENCH_LIST {} names", rows.len());
+    }
+    // Hides named entities so a GPU trace can attribute pass time to them.
+    if let Ok(hidden) = std::env::var("WINDWARD_BENCH_HIDE") {
+        let names: Vec<&str> = hidden.split(',').filter(|name| !name.is_empty()).collect();
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &Name)>();
+        let mut matched: Vec<Entity> = query
+            .iter(world)
+            .filter(|(_, name)| names.contains(&name.as_str()))
+            .map(|(entity, _)| entity)
+            .collect();
+        if names.contains(&"<unnamed-splats>") {
+            let mut unnamed = world.query_filtered::<
+                Entity,
+                (With<Spaghetti3d>, Without<Name>, Without<SpaghettiCutout>),
+            >();
+            matched.extend(unnamed.iter(world));
+        }
+        println!("WINDWARD_BENCH_HIDE matched {} entities", matched.len());
+        for entity in matched {
+            world.entity_mut(entity).insert(Visibility::Hidden);
+        }
+    }
+    // Moves named clouds onto the depth-writing cutout path.
+    if let Ok(cutout) = std::env::var("WINDWARD_CUTOUT") {
+        let names: Vec<&str> = cutout.split(',').filter(|name| !name.is_empty()).collect();
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &Name, &Spaghetti3d)>();
+        let matched: Vec<Entity> = query
+            .iter(world)
+            .filter(|(_, name, _)| names.contains(&name.as_str()))
+            .map(|(entity, _, _)| entity)
+            .collect();
+        println!("WINDWARD_CUTOUT matched {} entities", matched.len());
+        for entity in matched {
+            world.entity_mut(entity).insert(SpaghettiCutout);
+        }
+    }
+}
+
 #[test]
 #[ignore = "release-mode throughput benchmark on a native GPU"]
 fn benchmark_scene_offscreen() {
@@ -341,6 +412,7 @@ fn benchmark_scene_offscreen() {
     app.insert_resource(BenchmarkSize(size))
         .add_systems(Startup, benchmark_target.after(spawn_camera));
     warm_up(&mut app, |_| true);
+    apply_bench_overrides(&mut app);
     if away {
         pose_review_camera(
             &mut app,

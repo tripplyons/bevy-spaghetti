@@ -9,7 +9,9 @@ use bevy::{
     render::render_resource::AsBindGroup,
     shader::ShaderRef,
 };
-use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows};
+use bevy_spaghetti::{
+    Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting, SpaghettiReceiveShadows,
+};
 
 use crate::{
     detail::{CameraView, ScreenDetail, load_lit_cloud},
@@ -523,6 +525,8 @@ fn spawn_rocks(
             .with_child((
                 Name::new("Reflected stone"),
                 Spaghetti3d(clouds[1].clone()),
+                // The rippled lake blurs the reflection, so it skips the sorted path.
+                SpaghettiCutout,
                 lighting,
                 SpaghettiReceiveShadows,
                 RenderLayers::layer(REFLECTED_LAYER),

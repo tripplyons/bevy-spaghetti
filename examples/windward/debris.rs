@@ -103,6 +103,8 @@ pub fn spawn_debris(
                 parent.spawn((
                     Name::new("Reflected deadfall"),
                     Spaghetti3d(clouds[2].clone()),
+                    // The rippled lake blurs the reflection, so it skips the sorted path.
+                    SpaghettiCutout,
                     LOG_LIGHTING,
                     SpaghettiReceiveShadows,
                     RenderLayers::layer(REFLECTED_LAYER),

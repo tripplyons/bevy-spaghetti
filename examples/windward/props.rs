@@ -12,7 +12,8 @@ use bevy::{
     world_serialization::WorldInstanceReady,
 };
 use bevy_spaghetti::{
-    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiLighting, SpaghettiReceiveShadows,
+    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout, SpaghettiLighting,
+    SpaghettiReceiveShadows,
 };
 
 use crate::{
@@ -332,6 +333,8 @@ fn spawn_stumps(
             .with_child((
                 Name::new("Reflected stump"),
                 Spaghetti3d(reflection.clone()),
+                // The rippled lake blurs the reflection, so it skips the sorted path.
+                SpaghettiCutout,
                 LIGHTING,
                 SpaghettiReceiveShadows,
                 RenderLayers::layer(REFLECTED_LAYER),
@@ -453,6 +456,8 @@ pub fn spawn_prop(
             parent.spawn((
                 Name::new("Reflected prop"),
                 Spaghetti3d(clouds[2].clone()),
+                // The rippled lake blurs the reflection, so it skips the sorted path.
+                SpaghettiCutout,
                 LIGHTING,
                 SpaghettiReceiveShadows,
                 RenderLayers::layer(REFLECTED_LAYER),
