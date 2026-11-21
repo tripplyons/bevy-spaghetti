@@ -198,6 +198,16 @@ fn spawn_camera(
 /// Turns the sky cubemap so its sun disc lines up with the directional light.
 const SKY_ROTATION: Quat = Quat::from_xyzw(0.0, 1.0, 0.0, 0.0);
 
+// Keys and what they do, in the order the controls line lists them.
+const CONTROLS: [(&str, &str); 6] = [
+    ("WASD", "Move"),
+    ("Shift", "Run"),
+    ("Space", "Jump"),
+    ("Mouse", "Look"),
+    ("Esc", "Free cursor"),
+    ("R", "Reset"),
+];
+
 fn spawn_hud(mut commands: Commands) {
     commands
         .spawn(Node {
@@ -227,10 +237,24 @@ fn spawn_hud(mut commands: Commands) {
                     Node { padding: UiRect::axes(px(14), px(8)), ..default() },
                     BackgroundColor(Color::srgba(0.02, 0.025, 0.035, 0.68)),
                 ))
-                .with_child((
-                    Text::new("WASD  Move    ·    Shift  Run    ·    Space  Jump    ·    Mouse  Look    ·    Esc  Free cursor    ·    R  Reset"),
-                    TextFont::from_font_size(13.0),
-                    TextColor(Color::srgb(0.94, 0.94, 0.93)),
-                ));
+                .with_children(|controls| {
+                    // Bevy's default font holds only printable ASCII, so
+                    // color and spacing separate the controls, not symbols.
+                    let font = TextFont::from_font_size(13.0);
+                    let mut line = controls.spawn((
+                        Text::default(),
+                        font.clone(),
+                        TextColor(Color::srgb(0.80, 0.80, 0.79)),
+                    ));
+                    for (index, (key, action)) in CONTROLS.iter().enumerate() {
+                        let gap = if index == 0 { "" } else { "      " };
+                        line.with_child((
+                            TextSpan::new(format!("{gap}{key}")),
+                            font.clone(),
+                            TextColor(Color::srgb(1.0, 0.95, 0.83)),
+                        ));
+                        line.with_child((TextSpan::new(format!(" {action}")), font.clone()));
+                    }
+                });
         });
 }

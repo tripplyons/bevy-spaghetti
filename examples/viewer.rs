@@ -124,7 +124,7 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, asset: Res<ViewerAsse
             }
             header.spawn((
                 Status,
-                Text::new("Loading splats…"),
+                Text::new("Loading splats..."),
                 TextFont::from_font_size(13.0),
                 TextColor(Color::srgb_u8(175, 182, 193)),
             ));
