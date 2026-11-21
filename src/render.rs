@@ -10,9 +10,9 @@ use bevy::{
         },
     },
     color::ColorToComponents,
-    core_pipeline::{
-        core_3d::{AlphaMask3d, CORE_3D_DEPTH_FORMAT, Transparent3d, TransparentSortingInfo3d},
-        prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
+    core_pipeline::core_3d::{
+        CORE_3D_DEPTH_FORMAT, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, Transparent3d,
+        TransparentSortingInfo3d,
     },
     ecs::{
         query::QueryItem,
@@ -279,7 +279,7 @@ impl Plugin for SpaghettiPlugin {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .add_render_command::<Transparent3d, (SetItemPipeline, DrawCloud)>()
-                .add_render_command::<AlphaMask3d, (SetItemPipeline, DrawCloud)>()
+                .add_render_command::<Opaque3d, (SetItemPipeline, DrawCloud)>()
                 .add_render_command::<Shadow, (SetItemPipeline, DrawCloud)>()
                 .init_resource::<SpecializedRenderPipelines<SplatPipeline>>()
                 .init_resource::<ViewDraws>()
@@ -1357,7 +1357,7 @@ type SplatView = (
 
 /// The retained binned phase that holds a view's depth-writing cutouts.
 enum CutoutPhase<'a> {
-    Main(&'a mut BinnedRenderPhase<AlphaMask3d>, DrawFunctionId),
+    Main(&'a mut BinnedRenderPhase<Opaque3d>, DrawFunctionId),
     Shadow(&'a mut BinnedRenderPhase<Shadow>, DrawFunctionId),
 }
 
@@ -1370,13 +1370,14 @@ impl CutoutPhase<'_> {
     ) {
         match self {
             Self::Main(phase, draw_function) => phase.add(
-                OpaqueNoLightmap3dBatchSetKey {
+                Opaque3dBatchSetKey {
                     pipeline,
                     draw_function: *draw_function,
                     material_bind_group_index: None,
+                    lightmap_slab: None,
                     slabs: default(),
                 },
-                OpaqueNoLightmap3dBinKey { asset_id: asset.untyped() },
+                Opaque3dBinKey { asset_id: asset.untyped() },
                 entity,
                 default(),
                 BinnedRenderPhaseType::NonMesh,
@@ -1414,8 +1415,8 @@ fn queue_clouds(
     mut phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     draw_functions: Res<DrawFunctions<Transparent3d>>,
     (mut cutout_phases, cutout_draw_functions, mut shadow_phases, shadow_draw_functions): (
-        ResMut<ViewBinnedRenderPhases<AlphaMask3d>>,
-        Res<DrawFunctions<AlphaMask3d>>,
+        ResMut<ViewBinnedRenderPhases<Opaque3d>>,
+        Res<DrawFunctions<Opaque3d>>,
         ResMut<ViewBinnedRenderPhases<Shadow>>,
         Res<DrawFunctions<Shadow>>,
     ),

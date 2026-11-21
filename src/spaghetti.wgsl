@@ -620,16 +620,26 @@ fn fragment(in: Raster) -> @location(0) vec4<f32> {
 
 struct CutoutRaster {
     @builtin(position) position: vec4<f32>,
-    // Along-segment coordinate in end-cap units, across coordinate, and leaf streak phase.
-    @location(0) coordinate: vec3<f32>,
-    // Length in end-cap units, fade coverage, and packed detail interval.
-    @location(1) @interpolate(flat) shape: vec3<f32>,
+    // Across coordinate and leaf streak phase.
+    @location(0) leaf: vec2<f32>,
     // Shaded color, plus packed (leaf seed phase, vein visibility) when close.
-    @location(2) @interpolate(flat, first) color_leaf: vec4<f32>,
+    @location(1) @interpolate(flat, first) color_leaf: vec4<f32>,
 }
 
-// Evaluate a Gaussian cutout in projected segment coordinates. Fixed-function
-// depth interpolates along the segment, so hidden grass can be rejected early.
+fn hash_unit(value: u32) -> f32 {
+    var h = value;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return f32(h >> 8u) * (1.0 / 16777216.0);
+}
+
+// Evaluate a Gaussian cutout in projected segment coordinates with no fragment
+// discard, enabling hardware early-Z and TBDR hidden-surface removal. End caps
+// are shortened by pi/4 to match the area of rounded capsule caps, and LOD /
+// range / near fades drop segments stochastically before projection and shading.
 @vertex
 fn cutout_vertex(
     @builtin(vertex_index) vertex_index: u32,
@@ -664,10 +674,28 @@ fn cutout_vertex(
     }
     let midpoint = (a + b) * 0.5;
     let detail = detail_interval(instance, midpoint.w);
-    let coverage = view.motion.z * near_fade(midpoint.w);
-    if detail.x >= detail.y || coverage <= 0.0 {
+    if detail.x >= detail.y {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
+    }
+    if detail.x > 0.0 || detail.y < 1.0 {
+        let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x517cc1b7u);
+        if threshold < detail.x || threshold >= detail.y {
+            out.position = vec4(2.0, 2.0, 0.0, 1.0);
+            return out;
+        }
+    }
+    let coverage = view.motion.z * near_fade(midpoint.w);
+    if coverage <= 0.0 {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
+    if coverage < 1.0 {
+        let threshold = hash_unit(instance * 0xcb1ab31fu ^ 0x9e3779b9u);
+        if select(threshold >= coverage, (threshold < 1.0 - coverage), view.motion.w > 0.0) {
+            out.position = vec4(2.0, 2.0, 0.0, 1.0);
+            return out;
+        }
     }
     let a_ndc = a.xyz / a.w;
     let b_ndc = b.xyz / b.w;
@@ -701,7 +729,7 @@ fn cutout_vertex(
     let width_scale = mix(1.0, profile.y, select(span.x, span.y, tip));
     let clip_w = select(a.w, b.w, tip);
     let width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
-    let cap = clamp(along_sigma * radius, 0.45, max(cross_sigma * radius, 0.45) * 1.4);
+    let cap = clamp(along_sigma * radius, 0.45, max(cross_sigma * radius, 0.45) * 1.4) * 0.78539816;
     let along = select(-cap, cap, tip);
     let endpoint = select(a_ndc, b_ndc, tip);
     out.position = vec4(
@@ -709,18 +737,9 @@ fn cutout_vertex(
         endpoint.z,
         1.0,
     );
-    let length_cap = length_px / cap;
     let t_vertex = mix(splat.end.w, splat.sigma.w, select(span.x, span.y, tip));
     let streak_phase = select(0.0, t_vertex * 3.8 / max(profile.x, 1e-5) + profile.x * 127.0, profile.x > 0.0);
-    out.coordinate = vec3(select(-1.0, length_cap + 1.0, tip), edge, streak_phase);
-    // Close segments dissolve through the same dither as the LOD fades.
-    let packed_detail = round(clamp(detail.x, 0.0, 1.0) * 4095.0) * 4096.0
-        + round(clamp(detail.y, 0.0, 1.0) * 4095.0);
-    out.shape = vec3(
-        length_cap,
-        select(coverage, -coverage, view.motion.w > 0.0),
-        packed_detail,
-    );
+    out.leaf = vec2(edge, streak_phase);
 
     out.color_leaf = vec4(0.0);
     if vertex_index == 1u {
@@ -752,39 +771,9 @@ fn cutout_vertex(
     return out;
 }
 
-// Whether a fragment lies inside the cutout and survives the fade dithers.
-fn cutout_covers(in: CutoutRaster) -> bool {
-    let pixel = in.position.xy - view.pixel_origin.xy;
-    if in.shape.z != 4095.0 {
-        let bits = u32(in.shape.z);
-        let detail = vec2(f32(bits >> 12u), f32(bits & 4095u)) * (1.0 / 4095.0);
-        if !detail_visible(pixel, detail) {
-            return false;
-        }
-    }
-    let along = in.coordinate.x;
-    let across = in.coordinate.y;
-    let beyond = max(0.0, max(-along, along - in.shape.x));
-    if beyond * beyond + across * across > 1.0 {
-        return false;
-    }
-    let coverage = in.shape.y;
-    if abs(coverage) < 1.0 {
-        // A shared screen-space threshold makes paired LOD fades complementary.
-        let threshold = screen_threshold(pixel);
-        if select(threshold >= coverage, threshold < 1.0 + coverage, coverage < 0.0) {
-            return false;
-        }
-    }
-    return true;
-}
-
 @fragment
 fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
-    if !cutout_covers(in) {
-        discard;
-    }
-    let across = in.coordinate.y;
+    let across = in.leaf.x;
     // Tapered leaf kernels have a pale midrib and thinner, warmer edges.
     var color = in.color_leaf.rgb;
     if in.color_leaf.w > 0.0 {
@@ -794,7 +783,7 @@ fn cutout_fragment(in: CutoutRaster) -> @location(0) vec4<f32> {
         let rib = max(1.0 - abs(across) * 3.0, 0.0);
         let edge = across * across;
         let vein = 0.93 + 0.07 * sin(across * 23.0 + seed);
-        let streak = 0.95 + 0.06 * sin(across * 9.0 + sin(in.coordinate.z));
+        let streak = 0.95 + 0.06 * sin(across * 9.0 + sin(in.leaf.y));
         let fold = 0.90 + 0.10 * smoothstep(-0.10, 0.10, across);
         color *= (vec3(fold) + 0.23 * rib + vec3(0.05, 0.01, -0.12) * edge)
             * mix(1.0, vein * streak, visible_detail);
