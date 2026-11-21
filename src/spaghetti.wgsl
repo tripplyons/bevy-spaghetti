@@ -69,13 +69,6 @@ struct View {
 
 override SCENE_SHADOWS: bool = false;
 override BAKED_OCCLUSION: bool = false;
-// Draws depth-only cutouts into an orthographic directional shadow cascade.
-override SHADOW_CASTER: bool = false;
-// The optical depth at the edge of a shadow caster's footprint.
-const SHADOW_EDGE_DEPTH: f32 = 0.03;
-// A sub-texel needle still spans at least 1.3 texels across. This limits
-// raster work while giving thin strips room to move across the texel grid.
-const SHADOW_MIN_WIDTH: f32 = 0.65;
 // Segments per culling cluster, matching the renderer.
 const CLUSTER_SIZE: u32 = 128u;
 
@@ -635,14 +628,6 @@ struct CutoutRaster {
     @location(2) @interpolate(flat, first) color_leaf: vec4<f32>,
 }
 
-struct CutoutCorner {
-    position: vec4<f32>,
-    coordinate: vec3<f32>,
-    shape: vec3<f32>,
-    color_leaf: vec4<f32>,
-    shadow: vec3<f32>,
-}
-
 // Evaluate a Gaussian cutout in projected segment coordinates. Fixed-function
 // depth interpolates along the segment, so hidden grass can be rejected early.
 @vertex
@@ -650,24 +635,11 @@ fn cutout_vertex(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) slot: u32,
 ) -> CutoutRaster {
-    let full = cutout_corner(vertex_index, slot);
-    return CutoutRaster(full.position, full.coordinate, full.shape, full.color_leaf);
-}
-
-fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
-    var out: CutoutCorner;
+    var out: CutoutRaster;
     // Each visible cluster owns CLUSTER_SIZE instances, and a short cluster
     // leaves the rest empty.
-    // clusters.y holds the slots per cluster, fewer in thinned cascades.
-    var cluster_slot: u32;
-    var offset: u32;
-    if !SHADOW_CASTER {
-        cluster_slot = slot >> 7u;
-        offset = slot & (CLUSTER_SIZE - 1u);
-    } else {
-        cluster_slot = slot / view.clusters.y;
-        offset = slot % view.clusters.y;
-    }
+    let cluster_slot = slot >> 7u;
+    let offset = slot & (CLUSTER_SIZE - 1u);
     let cluster = order[view.clusters.x + cluster_slot];
     if offset > (cluster & (CLUSTER_SIZE - 1u)) {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
@@ -681,31 +653,24 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
     let transform = view.clip_from_local;
     let start = transform * vec4(local_a, 1.0);
     let end = transform * vec4(local_b, 1.0);
-    var near = vec2(0.0, 1.0);
-    if !SHADOW_CASTER {
-        near = clip_interval(near, start.w - start.z, end.w - end.z);
-    }
+    let near = clip_interval(vec2(0.0, 1.0), start.w - start.z, end.w - end.z);
     let span = clip_interval(near, start.z, end.z);
     let a = mix(start, end, span.x);
     let b = mix(start, end, span.y);
 
-    if span.x >= span.y || (!SHADOW_CASTER && min(a.w, b.w) <= 0.0) || splat.start_mass.w == 0.0 {
+    if span.x >= span.y || min(a.w, b.w) <= 0.0 || splat.start_mass.w == 0.0 {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
     }
     let midpoint = (a + b) * 0.5;
-    var detail = vec2(0.0, 1.0);
-    var coverage = view.motion.z;
-    if !SHADOW_CASTER {
-        detail = detail_interval(instance, midpoint.w);
-        coverage *= near_fade(midpoint.w);
-        if detail.x >= detail.y || coverage <= 0.0 {
-            out.position = vec4(2.0, 2.0, 0.0, 1.0);
-            return out;
-        }
+    let detail = detail_interval(instance, midpoint.w);
+    let coverage = view.motion.z * near_fade(midpoint.w);
+    if detail.x >= detail.y || coverage <= 0.0 {
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
     }
-    let a_ndc = select(a.xyz / a.w, a.xyz, SHADOW_CASTER);
-    let b_ndc = select(b.xyz / b.w, b.xyz, SHADOW_CASTER);
+    let a_ndc = a.xyz / a.w;
+    let b_ndc = b.xyz / b.w;
     let half_viewport = view.viewport.xy * 0.5;
     let line = (b_ndc.xy - a_ndc.xy) * half_viewport;
     let length_px = length(line);
@@ -714,18 +679,9 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
     let across = vec2(-tangent.y, tangent.x);
     let q = splat.rotation;
     let local_to_kernel = vec4(-q.xyz, q.w);
-    var jx: vec2<f32>;
-    var jy: vec2<f32>;
-    var jz: vec2<f32>;
-    if SHADOW_CASTER {
-        jx = transform[0].xy * half_viewport;
-        jy = transform[1].xy * half_viewport;
-        jz = transform[2].xy * half_viewport;
-    } else {
-        jx = project_axis(transform[0], midpoint, half_viewport);
-        jy = project_axis(transform[1], midpoint, half_viewport);
-        jz = project_axis(transform[2], midpoint, half_viewport);
-    }
+    let jx = project_axis(transform[0], midpoint, half_viewport);
+    let jy = project_axis(transform[1], midpoint, half_viewport);
+    let jz = project_axis(transform[2], midpoint, half_viewport);
     let cross_axis = vec3(dot(across, jx), dot(across, jy), dot(across, jz));
     let along_axis = vec3(dot(tangent, jx), dot(tangent, jy), dot(tangent, jz));
     let cross_sigma = length(rotate(local_to_kernel, cross_axis) * splat.sigma.xyz);
@@ -733,11 +689,8 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
     // The cross section's isocontour is where optical depth falls below one.
     let area = 2.506628 * splat.sigma.x
         * max(distance(splat.start_mass.xyz, splat.end.xyz), 2.506628 * splat.sigma.y);
-    var peak = splat.start_mass.w / area;
-    // A shadow caster draws out to a faint optical depth, because sparse
-    // coarse levels never reach one but still dim the light.
-    let edge_depth = select(1.0, SHADOW_EDGE_DEPTH, SHADOW_CASTER);
-    let radius = sqrt(max(0.0, 2.0 * log(peak / edge_depth)));
+    let peak = splat.start_mass.w / area;
+    let radius = sqrt(max(0.0, 2.0 * log(peak)));
     if radius <= 0.0 {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
@@ -747,33 +700,18 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
     let edge = select(-1.0, 1.0, (vertex_index & 2u) != 0u);
     let width_scale = mix(1.0, profile.y, select(span.x, span.y, tip));
     let clip_w = select(a.w, b.w, tip);
-    var width: f32;
-    if SHADOW_CASTER {
-        // Spread a needle thinner than a texel over a wider, fainter strip so
-        // that its integrated optical depth is kept.
-        let exact = cross_sigma * radius * width_scale;
-        width = max(exact, SHADOW_MIN_WIDTH);
-        peak *= exact / width;
-    } else {
-        width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
-    }
+    let width = max(cross_sigma * radius * width_scale * midpoint.w / clip_w, 0.42);
     let cap = clamp(along_sigma * radius, 0.45, max(cross_sigma * radius, 0.45) * 1.4);
     let along = select(-cap, cap, tip);
     let endpoint = select(a_ndc, b_ndc, tip);
-    var depth = endpoint.z;
-    if SHADOW_CASTER {
-        // A caster between the sun and the cascade still shades it, so it
-        // flattens onto the near plane instead of clipping.
-        depth = min(depth, 1.0);
-    }
     out.position = vec4(
         endpoint.xy + (across * edge * width + tangent * along) / half_viewport,
-        depth,
+        endpoint.z,
         1.0,
     );
     let length_cap = length_px / cap;
     let t_vertex = mix(splat.end.w, splat.sigma.w, select(span.x, span.y, tip));
-    let streak_phase = select(0.0, t_vertex * 3.8 / max(profile.x, 1e-5) + profile.x * 127.0, !SHADOW_CASTER && profile.x > 0.0);
+    let streak_phase = select(0.0, t_vertex * 3.8 / max(profile.x, 1e-5) + profile.x * 127.0, profile.x > 0.0);
     out.coordinate = vec3(select(-1.0, length_cap + 1.0, tip), edge, streak_phase);
     // Close segments dissolve through the same dither as the LOD fades.
     let packed_detail = round(clamp(detail.x, 0.0, 1.0) * 4095.0) * 4096.0
@@ -783,15 +721,9 @@ fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutCorner {
         select(coverage, -coverage, view.motion.w > 0.0),
         packed_detail,
     );
-    if SHADOW_CASTER {
-        // The shadow fragment needs no color profile. It needs the optical
-        // depth falloff and a per-segment seed for its random test. A float
-        // holds the index exactly, where a bitcast could flush to zero.
-        out.shadow = vec3(f32(instance), peak, -0.5 * radius * radius);
-    }
 
     out.color_leaf = vec4(0.0);
-    if vertex_index == 1u && !SHADOW_CASTER {
+    if vertex_index == 1u {
         let max_width = max(cross_sigma * radius * midpoint.w / min(a.w, b.w), 0.42);
         let pad = (abs(across) * max_width + abs(tangent) * cap) / half_viewport;
         if max(a_ndc.x, b_ndc.x) + pad.x >= -1.0 && min(a_ndc.x, b_ndc.x) - pad.x <= 1.0
@@ -845,71 +777,6 @@ fn cutout_covers(in: CutoutRaster) -> bool {
         }
     }
     return true;
-}
-
-// A shadow caster passes only what its random test reads, in two compact
-// varyings, because shadow cascades snap detail levels and the vertex stage
-// is bound by fixed-function work that grows with the vertex output size.
-struct ShadowRaster {
-    @builtin(position) position: vec4<f32>,
-    // Along-segment coordinate in end-cap units and across coordinate.
-    @location(0) @interpolate(linear) coordinate: vec2<f32>,
-    // Seed, peak optical depth, -0.5 * squared radius, and length in end-cap units.
-    @location(1) @interpolate(flat) blocking: vec4<f32>,
-}
-
-@vertex
-fn cutout_shadow_vertex(
-    @builtin(vertex_index) vertex_index: u32,
-    @builtin(instance_index) slot: u32,
-) -> ShadowRaster {
-    let full = cutout_corner(vertex_index, slot);
-    var out: ShadowRaster;
-    out.position = full.position;
-    out.coordinate = full.coordinate.xy;
-    out.blocking = vec4(full.shadow, full.shape.x);
-    return out;
-}
-
-// Each segment blocks a texel with probability 1 - exp(-optical depth).
-// Independent seeds per segment make overlapping segments multiply their
-// transmittance, and shadow filtering averages the texels into partial shade.
-@fragment
-fn cutout_shadow_fragment(in: ShadowRaster) {
-    let beyond = max(0.0, max(-in.coordinate.x, in.coordinate.x - in.blocking.w));
-    let distance_squared = beyond * beyond + in.coordinate.y * in.coordinate.y;
-    if distance_squared > 1.0 {
-        discard;
-    }
-    let pixel_f = in.position.xy - view.pixel_origin.xy;
-    if view.motion.z < 1.0 {
-        let threshold = screen_threshold(pixel_f);
-        if select(threshold >= view.motion.z, (threshold < 1.0 - view.motion.z), view.motion.w > 0.0) {
-            discard;
-        }
-    }
-    let depth = in.blocking.y * exp(in.blocking.z * distance_squared);
-    let pixel = bitcast<vec2<u32>>(vec2<i32>(floor(pixel_f)));
-    let seed = u32(in.blocking.x);
-    // A thinned cascade keeps a fraction of the segments, and each one
-    // blocks that much more often, so the expected transmittance holds
-    // wherever no single segment is nearly opaque.
-    let inv_kept = bitcast<f32>(view.clusters.z);
-    let block = min(1.0, (1.0 - exp(-depth)) * inv_kept);
-    if hash_unit(pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u ^ seed * 0xcb1ab31fu) >= block {
-        discard;
-    }
-}
-
-// A uniform value in [0, 1) from a well-mixed 32-bit hash.
-fn hash_unit(value: u32) -> f32 {
-    var h = value;
-    h ^= h >> 16u;
-    h *= 0x7feb352du;
-    h ^= h >> 15u;
-    h *= 0x846ca68bu;
-    h ^= h >> 16u;
-    return f32(h >> 8u) * (1.0 / 16777216.0);
 }
 
 @fragment

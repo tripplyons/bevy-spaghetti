@@ -94,6 +94,16 @@ impl GaussianSegment {
         self.end[3] * 0.5 + self.sigma[3] * 0.5
     }
 
+    #[cfg(feature = "render")]
+    pub(crate) fn bend_heights(&self) -> [f32; 2] {
+        [self.end[3], self.sigma[3]]
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn profile_bits(&self) -> u32 {
+        self.color[3].to_bits()
+    }
+
     /// Sets the end width relative to the start width in the cutout renderer.
     ///
     /// One keeps a constant width and zero gives the narrowest tip. Use this

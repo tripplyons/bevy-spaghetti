@@ -111,11 +111,12 @@ pub struct SpaghettiCutout;
 
 /// Casts the cloud's shadow into Bevy's directional shadow maps.
 ///
-/// Each segment blocks a shadow texel with probability 1 - exp(-τ), where τ
-/// is the segment's optical depth across that texel. Every segment draws its
-/// own random pattern, so overlapping segments multiply their transmittance,
-/// and shadow filtering averages the texels into partial shade. Thin or sparse
-/// clouds cast light shadows and dense ones cast dark shadows.
+/// The shadow pass runs depth-only without a fragment shader: each segment
+/// draws one area-matched triangle at a deterministic stochastic radius whose
+/// coverage probability at normalized distance `d` equals `1 - exp(-τ(d))`.
+/// Overlapping segments multiply their transmittance and shadow filtering
+/// averages texels into partial shade, while hardware early-Z and TBDR HSR
+/// reject occluded geometry without fragment-stage discard.
 ///
 /// Shadows bend with wind and sway and ignore [`SpaghettiFlow`]. They use a
 /// finer detail level than the shadow map's texel size alone selects, because
@@ -273,6 +274,7 @@ impl Plugin for SpaghettiPlugin {
                 ExtractComponentPlugin::<NoSpaghettiShadows>::default(),
             ));
         embedded_asset!(app, "spaghetti.wgsl");
+        embedded_asset!(app, "shadow.wgsl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -438,8 +440,149 @@ struct Cluster {
     half_extents: Vec3,
 }
 
+/// Compact 32-byte per-segment attributes for the depth-only shadow pass.
+///
+/// Packing quantized AABB-space endpoints, stochastic squared radius base, and
+/// normalized symmetric 3x3 covariance cuts shadow vertex bandwidth 2.5x and
+/// removes quaternion rotations, logarithms, and distance roots from the GPU.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadowSegment {
+    /// unorm16 endpoints in `[bounds.min, bounds.max]` across xyz, f16x2 `(r2, sigma_max)` in w.
+    geom: [u32; 4],
+    /// snorm8x4 `(s00, s01, s02, s11)`, snorm8x4 `(s12, s22, taper, 0)`,
+    /// f16x2 `(bend_start, bend_end)`, f16x2 `(blade_height, 0)`.
+    attr: [u32; 4],
+}
+
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | u16::from(mant != 0);
+    }
+    let half_exp = exp - 112;
+    if half_exp >= 31 {
+        return sign | 0x7bff;
+    }
+    if half_exp <= 0 {
+        if half_exp < -10 {
+            return sign;
+        }
+        let shifted = (mant | 0x0080_0000) >> (13 - half_exp);
+        return sign | ((shifted + 1) >> 1) as u16;
+    }
+    let rounded = mant + 0x1000;
+    if rounded >= 0x0080_0000 {
+        let next_exp = half_exp + 1;
+        return sign | if next_exp >= 31 { 0x7bff } else { (next_exp as u16) << 10 };
+    }
+    sign | ((half_exp as u16) << 10) | ((rounded >> 13) as u16)
+}
+
+fn pack_f16x2(a: f32, b: f32) -> u32 {
+    u32::from(f32_to_f16_bits(a)) | (u32::from(f32_to_f16_bits(b)) << 16)
+}
+
+fn pack_unorm16x2(a: f32, b: f32) -> u32 {
+    let pack = |v: f32| (v.clamp(0.0, 1.0) * 65535.0).round() as u16 as u32;
+    pack(a) | (pack(b) << 16)
+}
+
+fn pack_snorm8x4(a: f32, b: f32, c: f32, d: f32) -> u32 {
+    let pack = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8 as u32;
+    pack(a) | (pack(b) << 8) | (pack(c) << 16) | (pack(d) << 24)
+}
+
+fn hash_phase(mut value: u32) -> f64 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^= value >> 16;
+    f64::from(value >> 8) * (1.0 / 16_777_216.0)
+}
+
+fn build_shadow_segments(
+    sorted: &[GaussianSegment],
+    clusters: &[Cluster],
+    min: Vec3,
+    max: Vec3,
+) -> Vec<ShadowSegment> {
+    let extent = (max - min).max(Vec3::splat(1e-6));
+    let inv_extent = 1.0 / extent;
+    let inv_asset_scale = 1.0 / extent.max_element();
+    let mut out = Vec::with_capacity(sorted.len());
+    for (cluster_index, cluster) in clusters.iter().enumerate() {
+        let phase = hash_phase(cluster_index as u32);
+        let base = cluster.first as usize;
+        for slot in 0..cluster.count as usize {
+            let segment = &sorted[base + slot];
+            // Stratified golden-ratio sequence per cluster keeps every thinned
+            // prefix evenly distributed in (0, 1) with lower variance than white noise.
+            let u = ((phase + (slot as f64 + 0.5) * 0.618_033_988_749_894_9).fract())
+                .clamp(1e-6, 1.0 - 1e-6) as f32;
+            let start = segment.start();
+            let end = segment.end();
+            let sigma = segment.sigma();
+            let area = 2.506_628 * sigma.x * start.distance(end).max(2.506_628 * sigma.y);
+            let peak = segment.mass() / area.max(1e-12);
+            let r2 = if peak > 0.0 {
+                2.0 * (peak / -(1.0 - u).ln()).ln()
+            } else {
+                -65000.0
+            };
+            let sigma_max = sigma.max_element().max(1e-12);
+            let s = sigma / sigma_max;
+            let rot = Mat3::from_quat(segment.rotation());
+            let r0 = rot.x_axis;
+            let r1 = rot.y_axis;
+            let r2_axis = rot.z_axis;
+            let s0 = s.x * s.x;
+            let s1 = s.y * s.y;
+            let s2 = s.z * s.z;
+            let s00 = s0 * r0.x * r0.x + s1 * r1.x * r1.x + s2 * r2_axis.x * r2_axis.x;
+            let s01 = s0 * r0.x * r0.y + s1 * r1.x * r1.y + s2 * r2_axis.x * r2_axis.y;
+            let s02 = s0 * r0.x * r0.z + s1 * r1.x * r1.z + s2 * r2_axis.x * r2_axis.z;
+            let s11 = s0 * r0.y * r0.y + s1 * r1.y * r1.y + s2 * r2_axis.y * r2_axis.y;
+            let s12 = s0 * r0.y * r0.z + s1 * r1.y * r1.z + s2 * r2_axis.y * r2_axis.z;
+            let s22 = s0 * r0.z * r0.z + s1 * r1.z * r1.z + s2 * r2_axis.z * r2_axis.z;
+            let [bend_start, bend_end] = segment.bend_heights();
+            let profile_bits = segment.profile_bits();
+            let (blade_height, taper) = if (profile_bits & 0xff80_0000) == 0x3f80_0000 {
+                (
+                    ((profile_bits >> 10) & 8191) as f32 * 0.001,
+                    (profile_bits & 1023) as f32 / 1023.0,
+                )
+            } else {
+                (0.0, 1.0)
+            };
+            let ua = (start - min) * inv_extent;
+            let ub = (end - min) * inv_extent;
+            out.push(ShadowSegment {
+                geom: [
+                    pack_unorm16x2(ua.x, ua.y),
+                    pack_unorm16x2(ua.z, ub.x),
+                    pack_unorm16x2(ub.y, ub.z),
+                    pack_f16x2(r2, sigma_max * inv_asset_scale),
+                ],
+                attr: [
+                    pack_snorm8x4(s00, s01, s02, s11),
+                    pack_snorm8x4(s12, s22, taper, 0.0),
+                    pack_f16x2(bend_start, bend_end),
+                    pack_f16x2(blade_height, 0.0),
+                ],
+            });
+        }
+    }
+    out
+}
+
 struct GpuCloud {
     segments: Option<Buffer>,
+    shadow_segments: Option<Buffer>,
     occlusion: Option<Buffer>,
     // XYZ is the segment midpoint. W is its average endpoint bend height.
     centers: Box<[Vec4]>,
@@ -456,7 +599,11 @@ impl RenderAsset for GpuCloud {
     type Param = (SRes<RenderDevice>, SRes<RenderQueue>);
 
     fn byte_len(asset: &Self::SourceAsset) -> Option<usize> {
-        Some(std::mem::size_of_val(asset.segments()) + asset.occlusion().len() * size_of::<u32>())
+        Some(
+            std::mem::size_of_val(asset.segments())
+                + asset.segments().len() * size_of::<ShadowSegment>()
+                + asset.occlusion().len() * size_of::<u32>(),
+        )
     }
 
     fn prepare_asset(
@@ -477,6 +624,7 @@ impl RenderAsset for GpuCloud {
             );
             return Ok(Self {
                 segments: None,
+                shadow_segments: None,
                 occlusion: None,
                 centers: Box::new([]),
                 clusters: Box::new([]),
@@ -506,6 +654,21 @@ impl RenderAsset for GpuCloud {
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             })
         };
+        let shadow_sorted = build_shadow_segments(&sorted, &clusters, min, max);
+        let shadow_data: &[u8] = bytemuck::cast_slice(&shadow_sorted);
+        let existing_shadow = previous
+            .and_then(|cloud| cloud.shadow_segments.as_ref())
+            .filter(|buffer| buffer.size() == shadow_data.len() as u64);
+        let shadow_segments = if let Some(buffer) = existing_shadow {
+            queue.write_buffer(buffer, 0, shadow_data);
+            buffer.clone()
+        } else {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("spaghetti shadow segment data"),
+                contents: shadow_data,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            })
+        };
         let occlusion = (!asset.occlusion().is_empty()).then(|| {
             let packed: Vec<_> = order
                 .iter()
@@ -523,6 +686,7 @@ impl RenderAsset for GpuCloud {
         });
         Ok(Self {
             segments: Some(segments),
+            shadow_segments: Some(shadow_segments),
             occlusion,
             centers,
             clusters,
@@ -746,7 +910,9 @@ impl GpuCloud {
 #[derive(Resource)]
 struct SplatPipeline {
     shader: Handle<Shader>,
+    shadow_shader: Handle<Shader>,
     bindings: BindGroupLayoutDescriptor,
+    shadow_bindings: BindGroupLayoutDescriptor,
     shadows: ShadowBindings,
     quad_indices: Buffer,
 }
@@ -759,6 +925,7 @@ fn init_pipeline(
 ) {
     commands.insert_resource(SplatPipeline {
         shader: load_embedded_asset!(asset_server.as_ref(), "spaghetti.wgsl"),
+        shadow_shader: load_embedded_asset!(asset_server.as_ref(), "shadow.wgsl"),
         bindings: BindGroupLayoutDescriptor::new(
             "spaghetti bindings",
             &BindGroupLayoutEntries::sequential(
@@ -766,6 +933,17 @@ fn init_pipeline(
                 (
                     uniform_buffer_sized(true, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
                     storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                ),
+            ),
+        ),
+        shadow_bindings: BindGroupLayoutDescriptor::new(
+            "spaghetti shadow bindings",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::VERTEX,
+                (
+                    uniform_buffer_sized(true, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
                 ),
@@ -814,20 +992,14 @@ impl SpecializedRenderPipeline for SplatPipeline {
     fn specialize(&self, key: PipelineKey) -> RenderPipelineDescriptor {
         if key.shadow {
             return RenderPipelineDescriptor {
-                label: Some("spaghetti shadow cutouts".into()),
-                layout: vec![self.bindings.clone(), self.shadows.layout.clone()],
+                label: Some("spaghetti shadow depth".into()),
+                layout: vec![self.shadow_bindings.clone()],
                 vertex: VertexState {
-                    shader: self.shader.clone(),
-                    entry_point: Some("cutout_shadow_vertex".into()),
-                    constants: vec![("SHADOW_CASTER".into(), 1.0)],
+                    shader: self.shadow_shader.clone(),
+                    entry_point: Some("shadow_vertex".into()),
                     ..default()
                 },
-                fragment: Some(FragmentState {
-                    shader: self.shader.clone(),
-                    entry_point: Some("cutout_shadow_fragment".into()),
-                    targets: vec![],
-                    ..default()
-                }),
+                fragment: None,
                 primitive: PrimitiveState {
                     topology: PrimitiveTopology::TriangleList,
                     ..default()
@@ -895,10 +1067,34 @@ const FOG_LIGHT_CAPACITY: usize = 10;
 /// are wide and cover many texels each, so a finer level costs less to draw
 /// and stays closer to the full asset's shade.
 const SHADOW_DETAIL: f32 = 3.0;
-// Segments drawn per cluster of CLUSTER_SIZE in each directional cascade.
-// Far cascades have coarse texels where a spread subset with stronger
-// blocking casts the same average shade.
-const SHADOW_KEEP: [u32; 4] = [128, 48, 32, 32];
+// Power-of-two segments drawn per cluster of CLUSTER_SIZE in each directional
+// cascade so the shadow vertex shader indexes clusters with a shift and mask.
+const SHADOW_KEEP: [u32; 4] = [128, 64, 32, 32];
+/// Minimum drawn segments per projected shadow-map texel of a cloud's OBB
+/// before density-based thinning kicks in. Sparse foliage stays untouched,
+/// while dense scanned props and small far-cascade objects thin automatically
+/// with optical depth scaled to match.
+const TARGET_SHADOW_SEGMENTS_PER_TEXEL: f32 = 2.0;
+
+fn shadow_keep(
+    cascade_index: usize,
+    segment_count: u32,
+    clip_from_local: Mat4,
+    bounds: Aabb,
+    size: UVec2,
+) -> u32 {
+    let max_keep = SHADOW_KEEP[cascade_index.min(SHADOW_KEEP.len() - 1)];
+    let half = Vec3::from(bounds.half_extents);
+    let scale = size.as_vec2() * 0.5;
+    let ax = clip_from_local.x_axis.truncate().truncate() * (half.x * scale);
+    let ay = clip_from_local.y_axis.truncate().truncate() * (half.y * scale);
+    let az = clip_from_local.z_axis.truncate().truncate() * (half.z * scale);
+    let area = 4.0 * (ax.perp_dot(ay).abs() + ay.perp_dot(az).abs() + az.perp_dot(ax).abs());
+    let target = (area * TARGET_SHADOW_SEGMENTS_PER_TEXEL).max(1.0);
+    let ratio = (segment_count as f32 / target).max(1.0);
+    let desired = (CLUSTER_SIZE as f32 / ratio).ceil().max(1.0) as u32;
+    desired.next_power_of_two().min(max_keep).max(1)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1248,6 +1444,7 @@ fn queue_clouds(
     let cutout_draw_function = cutout_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let shadow_draw_function = shadow_draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
     let bind_group_layout = cache.get_bind_group_layout(&pipeline.bindings);
+    let shadow_bind_group_layout = cache.get_bind_group_layout(&pipeline.shadow_bindings);
     let default_layers = RenderLayers::default();
     // Each directional cascade measures visibility ranges from its camera.
     let eyes: HashMap<MainEntity, Vec3> = views
@@ -1319,7 +1516,11 @@ fn queue_clouds(
             let Some(gpu) = gpu_clouds.get(cloud.asset) else {
                 continue;
             };
-            let Some(source) = &gpu.segments else {
+            let Some(source) = (if shadow_view {
+                gpu.shadow_segments.as_ref()
+            } else {
+                gpu.segments.as_ref()
+            }) else {
                 continue;
             };
             let [coverage, reverse_dither] = cloud.range.as_ref().map_or([1.0, 0.0], |range| {
@@ -1501,20 +1702,55 @@ fn queue_clouds(
                 &mut uniform,
             );
             let mut instances = 0..segments.len() as u32;
+            if shadow_view {
+                // Bake the asset AABB normalization [min, max] into the shadow
+                // transform so unorm16 endpoints dequantize for free on the GPU.
+                let min = Vec3::from(gpu.bounds.min());
+                let extent = (Vec3::from(gpu.bounds.max()) - min).max(Vec3::splat(1e-6));
+                let asset_scale = extent.max_element();
+                let local_from_unit = Mat4::from_cols(
+                    Vec4::new(extent.x, 0.0, 0.0, 0.0),
+                    Vec4::new(0.0, extent.y, 0.0, 0.0),
+                    Vec4::new(0.0, 0.0, extent.z, 0.0),
+                    min.extend(1.0),
+                );
+                uniform.clip_from_local = (clip_from_local * local_from_unit).to_cols_array_2d();
+                let half_viewport = size.as_vec2() * 0.5;
+                let row0 = clip_from_local.row(0).truncate();
+                let row1 = clip_from_local.row(1).truncate();
+                uniform.normal_from_local[0] =
+                    (row0 * (half_viewport.x * asset_scale)).extend(0.0).to_array();
+                uniform.normal_from_local[1] =
+                    (row1 * (half_viewport.y * asset_scale)).extend(0.0).to_array();
+                uniform.pixel_origin =
+                    [row0.length() * asset_scale, row1.length() * asset_scale, 0.0, 0.0];
+                if let Some(sway) = sway {
+                    uniform.pusher = (clip_from_local * sway.extend(0.0)).to_array();
+                } else if cloud.wind.is_some() && inverse_basis.is_some() {
+                    uniform.world_from_local =
+                        (cloud.world_from_local * local_from_unit).to_cols_array_2d();
+                    uniform.eye_relative_from_local = clip_from_world.to_cols_array_2d();
+                }
+            }
             if cutout {
                 // Flow moves segments out of their clusters' boxes.
                 let cull = !cloud.disable_culling && cloud.flow.is_none();
-                // Far cascades draw a spread subset of each cluster, and the
-                // shader raises the kept segments' blocking to match.
+                // Thin far cascades and over-dense clouds to a power-of-two subset
+                // of each cluster, raising kept segments' optical depth to match.
                 let keep = match light {
-                    Some(&LightEntity::Directional { cascade_index, .. }) => {
-                        SHADOW_KEEP[cascade_index.min(SHADOW_KEEP.len() - 1)]
-                    }
+                    Some(&LightEntity::Directional { cascade_index, .. }) => shadow_keep(
+                        cascade_index,
+                        segments.len() as u32,
+                        clip_from_local,
+                        bounds,
+                        size,
+                    ),
                     _ => CLUSTER_SIZE,
                 };
                 uniform.clusters[0] = draws.clusters.len() as u32;
-                uniform.clusters[1] = keep;
-                uniform.clusters[2] = (CLUSTER_SIZE as f32 / keep as f32).to_bits();
+                uniform.clusters[1] = if shadow_view { keep.trailing_zeros() } else { keep };
+                uniform.clusters[2] =
+                    (2.0 * (CLUSTER_SIZE as f32 / keep as f32).ln()).to_bits();
                 let count = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
@@ -1677,16 +1913,28 @@ fn queue_clouds(
             }) {
                 continue;
             }
-            let bindings = device.create_bind_group(
-                "spaghetti draw bindings",
-                &bind_group_layout,
-                &BindGroupEntries::sequential((
-                    uniform.clone(),
-                    draw.source.as_entire_binding(),
-                    listed.as_entire_binding(),
-                    draw.occlusion.as_ref().unwrap_or(&draw.source).as_entire_binding(),
-                )),
-            );
+            let bindings = if draw.shadow {
+                device.create_bind_group(
+                    "spaghetti shadow draw bindings",
+                    &shadow_bind_group_layout,
+                    &BindGroupEntries::sequential((
+                        uniform.clone(),
+                        draw.source.as_entire_binding(),
+                        listed.as_entire_binding(),
+                    )),
+                )
+            } else {
+                device.create_bind_group(
+                    "spaghetti draw bindings",
+                    &bind_group_layout,
+                    &BindGroupEntries::sequential((
+                        uniform.clone(),
+                        draw.source.as_entire_binding(),
+                        listed.as_entire_binding(),
+                        draw.occlusion.as_ref().unwrap_or(&draw.source).as_entire_binding(),
+                    )),
+                )
+            };
             draw.bindings = Some((uniforms.id(), listed.id(), bindings));
         }
     }
@@ -1767,13 +2015,17 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCloud {
             return RenderCommandResult::Success;
         }
         pass.set_bind_group(0, bindings, &[draw.uniform_offset]);
-        pass.set_bind_group(1, &draw.shadows, &[]);
         let instances = draw.instances.clone();
-        pass.set_index_buffer(
-            pipeline.into_inner().quad_indices.slice(..),
-            IndexFormat::Uint16,
-        );
-        pass.draw_indexed(0..6, 0, instances);
+        if draw.shadow {
+            pass.draw(instances.start * 3..instances.end * 3, 0..1);
+        } else {
+            pass.set_bind_group(1, &draw.shadows, &[]);
+            pass.set_index_buffer(
+                pipeline.into_inner().quad_indices.slice(..),
+                IndexFormat::Uint16,
+            );
+            pass.draw_indexed(0..6, 0, instances);
+        }
         RenderCommandResult::Success
     }
 }
@@ -1819,6 +2071,7 @@ mod tests {
     fn cluster_draw_omits_padding_only_after_last_visible_cluster() {
         let cloud = GpuCloud {
             segments: None,
+            shadow_segments: None,
             occlusion: None,
             centers: Box::new([]),
             clusters: Box::new([
@@ -1856,5 +2109,94 @@ mod tests {
         assert_eq!(cull(0..47, CLUSTER_SIZE), CLUSTER_SIZE + 15);
         assert_eq!(cull(0..47, 48), 48 + 6);
         assert_eq!(cull(47..47, 48), 0);
+    }
+
+    fn f16_bits_to_f32(bits: u16) -> f32 {
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exp = (bits >> 10) & 0x1f;
+        let mant = (bits & 0x03ff) as u32;
+        if exp == 0 {
+            if mant == 0 {
+                return f32::from_bits(sign);
+            }
+            let val = (mant as f32) * 2.0_f32.powi(-24);
+            return if sign != 0 { -val } else { val };
+        }
+        if exp == 0x1f {
+            return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
+        }
+        f32::from_bits(sign | (((exp as u32) + 112) << 23) | (mant << 13))
+    }
+
+    #[test]
+    fn shadow_segment_packing_preserves_covariance_and_f16_precision() {
+        for value in [0.0_f32, -0.0, 1.0, -3.5, 0.0025, 1e-5, 15.75, -65000.0] {
+            let decoded = f16_bits_to_f32(f32_to_f16_bits(value));
+            let tol = value.abs() * 2e-3 + 1e-6;
+            assert!(
+                (decoded - value).abs() <= tol,
+                "f16 round-trip for {value}: got {decoded}"
+            );
+        }
+
+        let rot = Quat::from_euler(EulerRot::YXZ, 0.7, -0.4, 1.1).normalize();
+        let sigma = Vec3::new(0.035, 0.05, 0.011);
+        let segment = GaussianSegment::new(
+            Vec3::new(-0.2, 0.1, 0.3),
+            Vec3::new(0.25, 0.4, -0.1),
+            sigma,
+            rot,
+            0.5,
+            Vec3::ONE,
+        )
+        .with_cutout_taper(0.35);
+        let asset = SpaghettiAsset::new(vec![segment]).unwrap();
+        let (min, max) = asset.bounds();
+        let (_, clusters) = cluster_segments(&asset);
+        let packed = build_shadow_segments(asset.segments(), &clusters, min, max);
+        let seg = packed[0];
+        let unpack_snorm8 = |word: u32, shift: u32| -> f32 {
+            ((word >> shift) as u8 as i8 as f32 / 127.0).max(-1.0)
+        };
+        let s00 = unpack_snorm8(seg.attr[0], 0);
+        let s01 = unpack_snorm8(seg.attr[0], 8);
+        let s02 = unpack_snorm8(seg.attr[0], 16);
+        let s11 = unpack_snorm8(seg.attr[0], 24);
+        let s12 = unpack_snorm8(seg.attr[1], 0);
+        let s22 = unpack_snorm8(seg.attr[1], 8);
+        let taper = unpack_snorm8(seg.attr[1], 16);
+        assert!((taper - 0.35).abs() < 0.01);
+
+        let asset_scale = (max - min).max_element();
+        let sigma_max = f16_bits_to_f32((seg.geom[3] >> 16) as u16) * asset_scale;
+        for dir in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(0.5, -0.7, 0.5).normalize()] {
+            let exact = (rot.conjugate() * dir * sigma).length();
+            let su = Vec3::new(
+                dir.x * s00 + dir.y * s01 + dir.z * s02,
+                dir.x * s01 + dir.y * s11 + dir.z * s12,
+                dir.x * s02 + dir.y * s12 + dir.z * s22,
+            );
+            let approx = sigma_max * dir.dot(su).max(0.0).sqrt();
+            assert!(
+                (approx - exact).abs() < 0.002,
+                "projected sigma mismatch along {dir:?}: exact={exact}, approx={approx}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_keep_preserves_sparse_clouds_and_thins_dense_props() {
+        let size = UVec2::splat(2048);
+        // Orthographic 40m wide cascade -> ~51.2 px/m.
+        let clip = Mat4::from_scale(Vec3::splat(1.0 / 20.0));
+        // Sparse 10m conifer with 4000 segments (~0.015 segs/texel) stays full in cascade 0.
+        let conifer = Aabb::from_min_max(Vec3::splat(-4.0), Vec3::splat(4.0));
+        assert_eq!(shadow_keep(0, 4_000, clip, conifer, size), 128);
+        assert_eq!(shadow_keep(1, 4_000, clip, conifer, size), 64);
+        assert_eq!(shadow_keep(2, 4_000, clip, conifer, size), 32);
+        // Dense 0.25m stone with 6000 segments in ~160 texels thins strongly to a power of two.
+        let stone = Aabb::from_min_max(Vec3::splat(-0.125), Vec3::splat(0.125));
+        let kept = shadow_keep(0, 6_000, clip, stone, size);
+        assert!(kept.is_power_of_two() && kept <= 16, "expected thin keep, got {kept}");
     }
 }
