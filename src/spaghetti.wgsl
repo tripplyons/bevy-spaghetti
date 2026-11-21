@@ -632,6 +632,10 @@ fn cutout_vertex(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) slot: u32,
 ) -> CutoutRaster {
+    return cutout_corner(vertex_index, slot);
+}
+
+fn cutout_corner(vertex_index: u32, slot: u32) -> CutoutRaster {
     var out: CutoutRaster;
     // Each visible cluster owns CLUSTER_SIZE instances, and a short cluster
     // leaves the rest empty.
@@ -761,39 +765,75 @@ fn cutout_vertex(
 
 // Whether a fragment lies inside the cutout and survives the fade dithers.
 fn cutout_covers(in: CutoutRaster) -> bool {
-    let pixel = in.position.xy - view.pixel_origin.xy;
-    if !detail_visible(pixel, in.detail) {
+    return cutout_inside(in.position.xy, in.coordinate, in.shape.xy, in.shape.w, in.detail);
+}
+
+fn cutout_inside(
+    position: vec2<f32>,
+    coordinate: vec2<f32>,
+    extent: vec2<f32>,
+    coverage: f32,
+    detail: vec2<f32>,
+) -> bool {
+    let pixel = position - view.pixel_origin.xy;
+    if !detail_visible(pixel, detail) {
         return false;
     }
-    let along = in.coordinate.x;
-    let across = in.coordinate.y;
-    let beyond = max(0.0, max(-along, along - in.shape.x)) / in.shape.y;
+    let along = coordinate.x;
+    let across = coordinate.y;
+    let beyond = max(0.0, max(-along, along - extent.x)) / extent.y;
     if dot(vec2(beyond, across), vec2(beyond, across)) > 1.0 {
         return false;
     }
-    if abs(in.shape.w) < 1.0 {
+    if abs(coverage) < 1.0 {
         // A shared screen-space threshold makes paired LOD fades complementary.
         let threshold = screen_threshold(pixel);
-        if select(threshold >= in.shape.w, threshold < 1.0 + in.shape.w, in.shape.w < 0.0) {
+        if select(threshold >= coverage, threshold < 1.0 + coverage, coverage < 0.0) {
             return false;
         }
     }
     return true;
 }
 
+// A shadow caster passes only what its random test reads, in three
+// varyings instead of five, because the shadow vertex stage is bound by
+// fixed-function work that grows with the vertex output size.
+struct ShadowRaster {
+    @builtin(position) position: vec4<f32>,
+    // Segment coordinates, then length and end cap.
+    @location(0) cutout: vec4<f32>,
+    // Seed, peak optical depth, squared radius, and fade coverage.
+    @location(1) @interpolate(flat) blocking: vec4<f32>,
+    @location(2) @interpolate(flat) detail: vec2<f32>,
+}
+
+@vertex
+fn cutout_shadow_vertex(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) slot: u32,
+) -> ShadowRaster {
+    let full = cutout_corner(vertex_index, slot);
+    var out: ShadowRaster;
+    out.position = full.position;
+    out.cutout = vec4(full.coordinate, full.shape.xy);
+    out.blocking = vec4(full.profile.xyz, full.shape.w);
+    out.detail = full.detail;
+    return out;
+}
+
 // Each segment blocks a texel with probability 1 - exp(-optical depth).
 // Independent seeds per segment make overlapping segments multiply their
 // transmittance, and shadow filtering averages the texels into partial shade.
 @fragment
-fn cutout_shadow_fragment(in: CutoutRaster) {
-    if !cutout_covers(in) {
+fn cutout_shadow_fragment(in: ShadowRaster) {
+    if !cutout_inside(in.position.xy, in.cutout.xy, in.cutout.zw, in.blocking.w, in.detail) {
         discard;
     }
-    let beyond = max(0.0, max(-in.coordinate.x, in.coordinate.x - in.shape.x)) / in.shape.y;
-    let distance_squared = beyond * beyond + in.coordinate.y * in.coordinate.y;
-    let depth = in.profile.y * exp(-0.5 * in.profile.z * distance_squared);
+    let beyond = max(0.0, max(-in.cutout.x, in.cutout.x - in.cutout.z)) / in.cutout.w;
+    let distance_squared = beyond * beyond + in.cutout.y * in.cutout.y;
+    let depth = in.blocking.y * exp(-0.5 * in.blocking.z * distance_squared);
     let pixel = bitcast<vec2<u32>>(vec2<i32>(floor(in.position.xy - view.pixel_origin.xy)));
-    let seed = u32(in.profile.x);
+    let seed = u32(in.blocking.x);
     // A thinned cascade keeps a fraction of the segments, and each one
     // blocks that much more often, so the expected transmittance holds
     // wherever no single segment is nearly opaque.

@@ -813,7 +813,7 @@ impl SpecializedRenderPipeline for SplatPipeline {
                 layout: vec![self.bindings.clone(), self.shadows.layout.clone()],
                 vertex: VertexState {
                     shader: self.shader.clone(),
-                    entry_point: Some("cutout_vertex".into()),
+                    entry_point: Some("cutout_shadow_vertex".into()),
                     constants: vec![("SHADOW_CASTER".into(), 1.0)],
                     ..default()
                 },
