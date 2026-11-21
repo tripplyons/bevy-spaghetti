@@ -5,15 +5,14 @@
 
 use bevy::prelude::*;
 use bevy_spaghetti::{
-    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout, SpaghettiLighting,
-    SpaghettiSpecular, SpaghettiTransmission,
+    DetailTransition, Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout,
+    SpaghettiLighting, SpaghettiSpecular, SpaghettiTransmission,
 };
 
 use crate::{
-    detail::{CameraView, ScreenDetail},
     fern,
     landscape::{SUN, WATER_LEVEL, ground, hash01, noise, shore_distance, trail_x},
-    player::{Hiker, HikerCamera},
+    player::Hiker,
 };
 
 /// Reach and height of each fern variant. These match the scenes in the
@@ -37,35 +36,55 @@ pub struct Understory {
     phase: f32,
 }
 
-#[derive(Component)]
-pub struct UnderstoryDetail {
-    clouds: [Handle<SpaghettiAsset>; fern::LEVEL_COUNT],
-    /// Unscaled width of the clump.
-    size: f32,
-    level: usize,
-}
-
 struct Variant {
-    clouds: [Handle<SpaghettiAsset>; fern::LEVEL_COUNT],
-    size: f32,
+    cloud: Handle<SpaghettiAsset>,
     /// Whether the plant is tall enough to cast a shadow.
     casts_shadow: bool,
+}
+
+/// Projected pixels across the clump's width where each finer level hands over.
+const LOD_PIXELS: [[f32; 2]; fern::LEVEL_COUNT - 1] = [[150.0, 175.0], [45.0, 55.0]];
+
+fn plant_cloud(
+    assets: &mut Assets<SpaghettiAsset>,
+    size: f32,
+    levels: [Vec<bevy_spaghetti::GaussianSegment>; fern::LEVEL_COUNT],
+) -> Handle<SpaghettiAsset> {
+    let total = levels.iter().map(Vec::len).sum();
+    let mut segments = Vec::with_capacity(total);
+    let mut transitions = [DetailTransition {
+        finer_end: 0,
+        pixels_per_unit: [0.0, 0.0],
+    }; fern::LEVEL_COUNT - 1];
+    for (level, mut splats) in levels.into_iter().enumerate() {
+        segments.append(&mut splats);
+        if level < transitions.len() {
+            let [low, high] = LOD_PIXELS[level];
+            transitions[level] = DetailTransition {
+                finer_end: segments.len() as u32,
+                pixels_per_unit: [low / size, high / size],
+            };
+        }
+    }
+    assets.add(
+        SpaghettiAsset::with_detail(segments, &transitions)
+            .expect("procedural plants have valid detail levels"),
+    )
 }
 
 pub fn spawn_understory(
     mut commands: Commands,
     mut assets: ResMut<Assets<SpaghettiAsset>>,
 ) {
-    let mut cloud =
-        |segments| assets.add(SpaghettiAsset::new(segments).expect("procedural plants are valid"));
     let ferns: Vec<Variant> = FERN_SHAPES
         .iter()
         .enumerate()
         .map(|(index, &(radius, height))| Variant {
-            clouds: std::array::from_fn(|level| {
-                cloud(fern::fern(index as u32 * 37 + 5, radius, height, level))
-            }),
-            size: 2.0 * radius,
+            cloud: plant_cloud(
+                &mut assets,
+                2.0 * radius,
+                std::array::from_fn(|level| fern::fern(index as u32 * 37 + 5, radius, height, level)),
+            ),
             casts_shadow: true,
         })
         .collect();
@@ -74,15 +93,13 @@ pub fn spawn_understory(
         .iter()
         .enumerate()
         .map(|(index, &(radius, height))| Variant {
-            clouds: std::array::from_fn(|level| {
-                cloud(fern::groundcover(
-                    index as u32 * 53 + 11,
-                    radius,
-                    height,
-                    level,
-                ))
-            }),
-            size: 2.0 * radius,
+            cloud: plant_cloud(
+                &mut assets,
+                2.0 * radius,
+                std::array::from_fn(|level| {
+                    fern::groundcover(index as u32 * 53 + 11, radius, height, level)
+                }),
+            ),
             casts_shadow: false,
         })
         .collect();
@@ -190,13 +207,8 @@ fn add_plant(
     };
     let mut plant = commands.spawn((
         Name::new(if fern { "Fern" } else { "Woodland groundcover" }),
-        Spaghetti3d(variant.clouds[1].clone()),
+        Spaghetti3d(variant.cloud.clone()),
         SpaghettiCutout,
-        UnderstoryDetail {
-            clouds: variant.clouds.clone(),
-            size: variant.size,
-            level: 1,
-        },
         lighting,
         // Thin fronds glow when the low sun is behind them, like the grass.
         SpaghettiTransmission(0.5),
@@ -217,34 +229,6 @@ fn add_plant(
     ));
     if variant.casts_shadow {
         plant.insert(SpaghettiCastShadows);
-    }
-}
-
-pub fn select_understory_detail(
-    camera: Single<CameraView, With<HikerCamera>>,
-    mut plants: Query<(&Transform, &mut UnderstoryDetail, &mut Spaghetti3d)>,
-) {
-    let Some(view) = ScreenDetail::new(*camera) else {
-        return;
-    };
-    for (transform, mut detail, mut cloud) in &mut plants {
-        let size = detail.size * transform.scale.x;
-        let center = transform.translation + Vec3::Y * 0.15 * size;
-        let pixels = view.span_pixels(center, size, 0.5 * size);
-        // Hysteresis keeps the level stable as the shoulder camera bobs.
-        let near = if detail.level == 0 { 150.0 } else { 175.0 };
-        let middle = if detail.level == 2 { 55.0 } else { 45.0 };
-        let level = if pixels >= near {
-            0
-        } else if pixels >= middle {
-            1
-        } else {
-            2
-        };
-        if level != detail.level {
-            cloud.0 = detail.clouds[level].clone();
-            detail.level = level;
-        }
     }
 }
 
