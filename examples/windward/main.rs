@@ -16,6 +16,7 @@ mod lake;
 mod landscape;
 mod litter;
 mod meadow;
+mod nurse;
 mod player;
 mod props;
 mod reeds;
@@ -99,6 +100,7 @@ fn add_scene(app: &mut App) {
             props::spawn_props,
             camp::spawn_camp,
             litter::spawn_litter,
+            nurse::spawn_nurse_logs,
             webs::spawn_webs,
             air::spawn_air,
             meadow::spawn_meadow,

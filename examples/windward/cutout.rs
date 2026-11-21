@@ -69,6 +69,18 @@ pub fn rod(out: &mut Vec<GaussianSegment>, a: Vec3, b: Vec3, face: Vec3, radius:
     out.extend(band(a, b, face, 2.0 * radius, 1.0, color));
 }
 
+/// A round rod that narrows to `taper` times its radius at `b`.
+pub fn tapered_rod(
+    out: &mut Vec<GaussianSegment>,
+    (a, b): (Vec3, Vec3),
+    face: Vec3,
+    radius: f32,
+    taper: f32,
+    color: Vec3,
+) {
+    out.extend(band(a, b, face, 2.0 * radius, 1.0, color).map(|rod| rod.with_cutout_taper(taper)));
+}
+
 /// A round disc of visible radius `radius` that faces `face`.
 pub fn disc(out: &mut Vec<GaussianSegment>, at: Vec3, face: Vec3, radius: f32, color: Vec3) {
     blob(out, at, face, radius, 0.4, color);
