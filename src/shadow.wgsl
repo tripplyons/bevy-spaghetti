@@ -21,57 +21,34 @@ struct ShadowSegment {
     attr: vec4<u32>,
 }
 
-struct FogLight {
-    direction: vec4<f32>,
-    color: vec4<f32>,
-}
-
-struct Fog {
-    color: vec4<f32>,
-    extinction: vec3<f32>,
-    mode: u32,
-    inscattering: vec3<f32>,
-    directional_exponent: f32,
-    light_count: vec4<u32>,
-    lights: array<FogLight, 10>,
-}
-
-struct View {
+// Compact 256-byte uniform for shadow draws (4x smaller than DrawUniform).
+struct ShadowView {
     // clip_from_unit: maps asset-AABB [0, 1]^3 directly to orthographic clip space.
-    clip_from_local: mat4x4<f32>,
-    viewport: vec4<f32>,
-    // Column 0 = j0 * asset_scale (px per asset_scale along clip X), Column 1 = j1 * asset_scale.
-    normal_from_local: mat3x3<f32>,
-    direction_to_light: vec4<f32>,
-    ambient: vec4<f32>,
-    directional: vec4<f32>,
-    ground_ambient_delta: vec4<f32>,
-    // clip_from_world, used only when procedural wind (motion.y == 1.0) is active.
-    eye_relative_from_local: mat4x4<f32>,
-    fog: Fog,
-    // world_from_unit, used only when procedural wind (motion.y == 1.0) is active.
-    world_from_local: mat4x4<f32>,
-    local_from_world: mat3x3<f32>,
+    clip_from_unit: mat4x4<f32>,
+    // Rows 0..2 of world_from_unit (used only when procedural wind motion.y == 1.0 is active).
+    world_from_unit_r0: vec4<f32>,
+    world_from_unit_r1: vec4<f32>,
+    world_from_unit_r2: vec4<f32>,
+    // Rows 0..2 of orthographic clip_from_world (used only when motion.y == 1.0).
+    clip_from_world_r0: vec4<f32>,
+    clip_from_world_r1: vec4<f32>,
+    clip_from_world_r2: vec4<f32>,
+    // j0 * asset_scale (px per asset_scale along clip X), then half_viewport.x in w.
+    j0_half_x: vec4<f32>,
+    // j1 * asset_scale (px per asset_scale along clip Y), then half_viewport.y in w.
+    j1_half_y: vec4<f32>,
     // Pre-transformed clip-space sway per meter (motion.y == 2.0) or world pusher (motion.y == 1.0).
     pusher: vec4<f32>,
+    // Time, wind mode, range coverage, reverse range dither.
     motion: vec4<f32>,
-    detail_depths: array<vec4<f32>, 3>,
-    detail_ends: vec4<u32>,
-    eye_world: vec4<f32>,
-    material: vec4<f32>,
-    flow_span: vec4<f32>,
-    flow_shape: vec4<f32>,
-    flow_fade: vec4<f32>,
-    flow_tint: vec4<f32>,
-    lamp: vec4<f32>,
-    lamp_color: vec4<f32>,
-    // x: offset in cluster list, y: log2(keep), z: bitcast<u32>(2 * ln(CLUSTER_SIZE / keep)).
+    // x: offset in cluster list, y: log2(keep), z: bitcast<u32>(2 * ln(CLUSTER_SIZE / keep)),
+    // w: unused.
     clusters: vec4<u32>,
-    // xy: NDC pad scale per asset_scale (length of clip_from_local rows 0 and 1 * asset_scale).
-    pixel_origin: vec4<f32>,
+    // xy: NDC pad scale per asset_scale.
+    pad_scale: vec4<f32>,
 }
 
-@group(0) @binding(0) var<uniform> view: View;
+@group(0) @binding(0) var<uniform> view: ShadowView;
 @group(0) @binding(1) var<storage, read> segments: array<ShadowSegment>;
 @group(0) @binding(2) var<storage, read> order: array<u32>;
 
@@ -174,12 +151,24 @@ fn shadow_vertex(
     if view.motion.y == 1.0 {
         let bend = unpack2x16float(attr.z);
         let height = unpack2x16float(attr.w).x;
-        let world_a = bend_world((view.world_from_local * vec4(unit_a, 1.0)).xyz, bend.x, height);
-        let world_b = bend_world((view.world_from_local * vec4(unit_b, 1.0)).xyz, bend.y, height);
-        start = (view.eye_relative_from_local * vec4(world_a, 1.0)).xyz;
-        end = (view.eye_relative_from_local * vec4(world_b, 1.0)).xyz;
+        let ua4 = vec4(unit_a, 1.0);
+        let ub4 = vec4(unit_b, 1.0);
+        let world_a = bend_world(
+            vec3(dot(view.world_from_unit_r0, ua4), dot(view.world_from_unit_r1, ua4), dot(view.world_from_unit_r2, ua4)),
+            bend.x,
+            height,
+        );
+        let world_b = bend_world(
+            vec3(dot(view.world_from_unit_r0, ub4), dot(view.world_from_unit_r1, ub4), dot(view.world_from_unit_r2, ub4)),
+            bend.y,
+            height,
+        );
+        let wa4 = vec4(world_a, 1.0);
+        let wb4 = vec4(world_b, 1.0);
+        start = vec3(dot(view.clip_from_world_r0, wa4), dot(view.clip_from_world_r1, wa4), dot(view.clip_from_world_r2, wa4));
+        end = vec3(dot(view.clip_from_world_r0, wb4), dot(view.clip_from_world_r1, wb4), dot(view.clip_from_world_r2, wb4));
     } else {
-        let m = view.clip_from_local;
+        let m = view.clip_from_unit;
         start = (m * vec4(unit_a, 1.0)).xyz;
         end = (m * vec4(unit_b, 1.0)).xyz;
         if view.motion.y == 2.0 {
@@ -206,14 +195,14 @@ fn shadow_vertex(
     }
 
     let max_reach = r2_sigma.y * sqrt(min(r2, MAX_SHADOW_RADIUS_SQ));
-    let pad = view.pixel_origin.xy * max_reach;
+    let pad = view.pad_scale.xy * max_reach;
     if max(a.x, b.x) + pad.x < -1.0 || min(a.x, b.x) - pad.x > 1.0
         || max(a.y, b.y) + pad.y < -1.0 || min(a.y, b.y) - pad.y > 1.0
     {
         return vec4(2.0, 2.0, 0.0, 1.0);
     }
 
-    let half_viewport = view.viewport.xy * 0.5;
+    let half_viewport = vec2(view.j0_half_x.w, view.j1_half_y.w);
     let line = (b.xy - a.xy) * half_viewport;
     let length_sq = dot(line, line);
     let inv_len = inverseSqrt(max(length_sq, 1e-8));
@@ -223,8 +212,8 @@ fn shadow_vertex(
 
     let c0 = unpack4x8snorm(attr.x);
     let c1 = unpack4x8snorm(attr.y);
-    let j0 = view.normal_from_local[0];
-    let j1 = view.normal_from_local[1];
+    let j0 = view.j0_half_x.xyz;
+    let j1 = view.j1_half_y.xyz;
     let u = across.x * j0 + across.y * j1;
     let v = tangent.x * j0 + tangent.y * j1;
     let su = vec3(

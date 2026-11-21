@@ -1,11 +1,8 @@
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU64,
-    ops::Range,
-};
+use std::{num::NonZeroU64, ops::Range};
 
 use bevy::{
     asset::{AssetLoader, LoadContext, embedded_asset, io::Reader, load_embedded_asset},
+    platform::collections::{HashMap, HashSet},
     camera::{
         Exposure, MainPassResolutionOverride,
         primitives::{Aabb, Frustum},
@@ -915,12 +912,14 @@ impl GpuCloud {
         }
         let planes = &planes[..plane_count];
         let bands = if cull_bands { uniform.detail_ends[3] as usize } else { 0 };
+        visible.reserve(clusters.len());
         if planes.is_empty() && bands == 0 {
             visible.extend(clusters.iter().map(pack));
         } else {
             let depth = clip_from_local.row(3);
             let depth_xyz = depth.truncate();
             let depth_abs = depth_xyz.abs();
+            let mut level = 0;
             for cluster in clusters {
                 let half = cluster.half_extents + bending;
                 if planes
@@ -930,13 +929,11 @@ impl GpuCloud {
                     continue;
                 }
                 if bands > 0 {
+                    while level < bands && uniform.detail_ends[level] <= cluster.first {
+                        level += 1;
+                    }
                     let center = depth_xyz.dot(cluster.center) + depth.w;
                     let radius = depth_abs.dot(half);
-                    // Transitions before this cluster set its level within the draw.
-                    let level = uniform.detail_ends[..bands]
-                        .iter()
-                        .filter(|&&end| end <= cluster.first)
-                        .count();
                     // A level shows nearer than its own transition's far edge and
                     // farther than the previous transition's near edge.
                     if (level < bands && center - radius >= uniform.detail_depths[level][1])
@@ -1042,7 +1039,10 @@ fn init_pipeline(
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::VERTEX,
                 (
-                    uniform_buffer_sized(true, NonZeroU64::new(size_of::<DrawUniform>() as u64)),
+                    uniform_buffer_sized(
+                        true,
+                        NonZeroU64::new(size_of::<ShadowDrawUniform>() as u64),
+                    ),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
                 ),
@@ -1346,6 +1346,24 @@ fn extract_point_lights(
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadowDrawUniform {
+    clip_from_unit: [[f32; 4]; 4],
+    world_from_unit_r0: [f32; 4],
+    world_from_unit_r1: [f32; 4],
+    world_from_unit_r2: [f32; 4],
+    clip_from_world_r0: [f32; 4],
+    clip_from_world_r1: [f32; 4],
+    clip_from_world_r2: [f32; 4],
+    j0_half_x: [f32; 4],
+    j1_half_y: [f32; 4],
+    pusher: [f32; 4],
+    motion: [f32; 4],
+    clusters: [u32; 4],
+    pad_scale: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
     clip_from_local: [[f32; 4]; 4],
     viewport: [f32; 4],
@@ -1431,10 +1449,12 @@ struct CloudDraw {
 #[derive(Resource, Default)]
 struct ViewDraws {
     draws: HashMap<(RetainedViewEntity, Entity), CloudDraw>,
-    // Every draw's uniform for this frame, at a dynamic offset. One upload
-    // replaces a staging buffer and a copy for each draw.
+    // Every main/reflection draw's uniform for this frame, at a dynamic offset.
     uniforms: Option<Buffer>,
     staging: Vec<u8>,
+    // Compact 256-byte shadow uniforms for this frame, at a dynamic offset.
+    shadow_uniforms: Option<Buffer>,
+    shadow_staging: Vec<u8>,
     // Packed visible clusters of every cutout draw in this frame. Each entry
     // is the cluster's first segment shifted left by seven bits, plus its
     // count minus one.
@@ -1539,7 +1559,9 @@ fn queue_clouds(
     }
     let alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
     let stride = size_of::<DrawUniform>().next_multiple_of(alignment);
+    let shadow_stride = size_of::<ShadowDrawUniform>().next_multiple_of(alignment);
     draws.staging.clear();
+    draws.shadow_staging.clear();
     draws.clusters.clear();
 
     let draw_function = draw_functions.read().id::<(SetItemPipeline, DrawCloud)>();
@@ -1548,6 +1570,22 @@ fn queue_clouds(
     let bind_group_layout = cache.get_bind_group_layout(&pipeline.bindings);
     let shadow_bind_group_layout = cache.get_bind_group_layout(&pipeline.shadow_bindings);
     let default_layers = RenderLayers::default();
+    // Resolve each cloud's GpuCloud once per frame instead of once per view,
+    // and split shadow casters so cascade views skip non-casting clouds.
+    let active_clouds: Vec<(Entity, MainEntity, &ExtractedCloud, &GpuCloud)> = clouds
+        .iter()
+        .filter_map(|(entity, main_entity, cloud)| {
+            let gpu = gpu_clouds.get(cloud.asset)?;
+            Some((entity, *main_entity, cloud, gpu))
+        })
+        .collect();
+    let shadow_clouds: Vec<usize> = active_clouds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &(_, _, cloud, gpu))| {
+            (cloud.cast_shadows && gpu.shadow_segments.is_some()).then_some(index)
+        })
+        .collect();
     // Each directional cascade measures visibility ranges from its camera.
     let eyes: HashMap<MainEntity, Vec3> = views
         .iter()
@@ -1600,19 +1638,218 @@ fn queue_clouds(
         let eye_world = view.world_from_view.translation();
         let mut view_shadows = None;
 
-        for (entity, main_entity, cloud) in &clouds {
-            if !layers.intersects(&cloud.layers) || (shadow_view && !cloud.cast_shadows) {
-                continue;
-            }
-            let cutout = cloud.cutout || shadow_view;
-            let Some(gpu) = gpu_clouds.get(cloud.asset) else {
+        if shadow_view {
+            let Some(phase) = cutout_phase.as_mut() else {
                 continue;
             };
-            let Some(source) = (if shadow_view {
-                gpu.shadow_segments.as_ref()
-            } else {
-                gpu.segments.as_ref()
-            }) else {
+            let cascade_index = match light {
+                Some(&LightEntity::Directional { cascade_index, .. }) => cascade_index,
+                _ => 0,
+            };
+            let half_viewport = size.as_vec2() * 0.5;
+            let shadow_pipeline_id = *pipeline_ids[16].get_or_insert_with(|| {
+                pipelines.specialize(
+                    &cache,
+                    &pipeline,
+                    PipelineKey {
+                        target: view.target_format,
+                        samples: msaa.map_or(1, Msaa::samples),
+                        cutout: true,
+                        shadowed: false,
+                        baked_occlusion: false,
+                        additive: false,
+                        shadow: true,
+                    },
+                )
+            });
+            let empty_uniform = DrawUniform::zeroed();
+            for &cloud_index in &shadow_clouds {
+                let (entity, main_entity, cloud, gpu) = active_clouds[cloud_index];
+                if !layers.intersects(&cloud.layers) {
+                    continue;
+                }
+                let source = gpu.shadow_segments.as_ref().unwrap();
+                let [coverage, reverse_dither] = cloud.range.as_ref().map_or([1.0, 0.0], |range| {
+                    let center = if range.use_aabb {
+                        cloud.world_from_local.transform_point3(gpu.bounds.center.into())
+                    } else {
+                        cloud.world_from_local.w_axis.truncate()
+                    };
+                    let distance = eye.distance(center);
+                    if range.is_culled(distance) {
+                        [0.0, 0.0]
+                    } else if distance < range.start_margin.end {
+                        [(distance - range.start_margin.start) / (range.start_margin.end - range.start_margin.start), 0.0]
+                    } else if distance > range.end_margin.start {
+                        [(range.end_margin.end - distance) / (range.end_margin.end - range.end_margin.start), 1.0]
+                    } else {
+                        [1.0, 0.0]
+                    }
+                });
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let inverse_basis = cloud.inverse_basis;
+                let sway = cloud.local_sway;
+                let mut bounds = gpu.bounds;
+                if let Some(sway) = sway {
+                    bounds.half_extents += Vec3A::from(sway.abs() * gpu.max_bend_height);
+                } else if let (Some(_), Some(inverse)) = (cloud.wind, inverse_basis) {
+                    let rows = inverse.transpose();
+                    let stretch = Vec3::new(rows.x_axis.length(), rows.y_axis.length(), rows.z_axis.length());
+                    bounds.half_extents += Vec3A::from(stretch * (gpu.max_bend_height * 1.11));
+                }
+                if !cloud.disable_culling
+                    && frustum.is_some_and(|frustum| {
+                        !frustum.intersects_obb(
+                            &bounds,
+                            &Affine3A::from_mat4(cloud.world_from_local),
+                            true,
+                            true,
+                        )
+                    })
+                {
+                    continue;
+                }
+                let clip_from_local = clip_from_world * cloud.world_from_local;
+                let mut scratch_detail = empty_uniform;
+                let segments = gpu.select_segments(
+                    clip_from_local,
+                    size.y as f32,
+                    cloud.detail_scale * SHADOW_DETAIL,
+                    bounds,
+                    true,
+                    &mut scratch_detail,
+                );
+                let keep = shadow_keep(
+                    cascade_index,
+                    segments.len() as u32,
+                    clip_from_local,
+                    bounds,
+                    size,
+                );
+                let cluster_offset = draws.clusters.len() as u32;
+                let cull = !cloud.disable_culling && cloud.flow.is_none();
+                let count = gpu.cull_clusters(
+                    segments.clone(),
+                    cull.then_some(()).and(frustum),
+                    false,
+                    (cloud.world_from_local, clip_from_local),
+                    Vec3::from(bounds.half_extents - gpu.bounds.half_extents),
+                    &empty_uniform,
+                    keep,
+                    &mut draws.clusters,
+                );
+                if count == 0 {
+                    continue;
+                }
+                let min = Vec3::from(gpu.bounds.min());
+                let extent = (Vec3::from(gpu.bounds.max()) - min).max(Vec3::splat(1e-6));
+                let asset_scale = extent.max_element();
+                let local_from_unit = Mat4::from_cols(
+                    Vec4::new(extent.x, 0.0, 0.0, 0.0),
+                    Vec4::new(0.0, extent.y, 0.0, 0.0),
+                    Vec4::new(0.0, 0.0, extent.z, 0.0),
+                    min.extend(1.0),
+                );
+                let row0 = clip_from_local.row(0).truncate();
+                let row1 = clip_from_local.row(1).truncate();
+                let mut shadow_uniform = ShadowDrawUniform {
+                    clip_from_unit: (clip_from_local * local_from_unit).to_cols_array_2d(),
+                    world_from_unit_r0: [0.0; 4],
+                    world_from_unit_r1: [0.0; 4],
+                    world_from_unit_r2: [0.0; 4],
+                    clip_from_world_r0: [0.0; 4],
+                    clip_from_world_r1: [0.0; 4],
+                    clip_from_world_r2: [0.0; 4],
+                    j0_half_x: (row0 * (half_viewport.x * asset_scale))
+                        .extend(half_viewport.x)
+                        .to_array(),
+                    j1_half_y: (row1 * (half_viewport.y * asset_scale))
+                        .extend(half_viewport.y)
+                        .to_array(),
+                    pusher: [0.0; 4],
+                    motion: [0.0, 0.0, coverage, reverse_dither],
+                    clusters: [
+                        cluster_offset,
+                        keep.trailing_zeros(),
+                        (2.0 * (CLUSTER_SIZE as f32 / keep as f32).ln()).to_bits(),
+                        0,
+                    ],
+                    pad_scale: [row0.length() * asset_scale, row1.length() * asset_scale, 0.0, 0.0],
+                };
+                if let Some(sway) = sway {
+                    shadow_uniform.motion[1] = 2.0;
+                    shadow_uniform.pusher = (clip_from_local * sway.extend(0.0)).to_array();
+                } else if let (Some(wind), Some(_)) = (cloud.wind, inverse_basis) {
+                    let world_from_unit = cloud.world_from_local * local_from_unit;
+                    shadow_uniform.world_from_unit_r0 = world_from_unit.row(0).to_array();
+                    shadow_uniform.world_from_unit_r1 = world_from_unit.row(1).to_array();
+                    shadow_uniform.world_from_unit_r2 = world_from_unit.row(2).to_array();
+                    shadow_uniform.clip_from_world_r0 = clip_from_world.row(0).to_array();
+                    shadow_uniform.clip_from_world_r1 = clip_from_world.row(1).to_array();
+                    shadow_uniform.clip_from_world_r2 = clip_from_world.row(2).to_array();
+                    if wind.push_radius > 0.0 {
+                        let transform = cloud.world_from_local;
+                        let center = transform.transform_point3(gpu.bounds.center.into());
+                        let half = gpu.bounds.half_extents;
+                        let extent = transform.x_axis.truncate().abs() * half.x
+                            + transform.y_axis.truncate().abs() * half.y
+                            + transform.z_axis.truncate().abs() * half.z;
+                        let outside =
+                            ((wind.pusher - center).xz().abs() - extent.xz()).max(Vec2::ZERO);
+                        if outside.length_squared() < wind.push_radius * wind.push_radius {
+                            shadow_uniform.pusher = wind.pusher.extend(wind.push_radius).to_array();
+                        }
+                    }
+                    shadow_uniform.motion[0] = wind.time;
+                    shadow_uniform.motion[1] = 1.0;
+                }
+                let key = (view.retained_view_entity, entity);
+                let new_draw = || {
+                    make_draw(
+                        &device,
+                        source,
+                        gpu,
+                        main_entity,
+                        true,
+                        true,
+                        &pipeline.shadows.fallback,
+                    )
+                };
+                let draw = draws.draws.entry(key).or_insert_with(new_draw);
+                if draw.source.id() != source.id() || !draw.shadow {
+                    if draw.cutout_pipeline.is_some() {
+                        phase.remove(draw.main_entity);
+                    }
+                    *draw = new_draw();
+                }
+                draw.segments = segments;
+                draw.instances = 0..count;
+                draw.uniform_offset = draws.shadow_staging.len() as u32;
+                draws
+                    .shadow_staging
+                    .extend_from_slice(bytemuck::bytes_of(&shadow_uniform));
+                draws
+                    .shadow_staging
+                    .resize(draw.uniform_offset as usize + shadow_stride, 0);
+                draw.idle_frames = 0;
+                if draw.cutout_pipeline != Some(shadow_pipeline_id) {
+                    if draw.cutout_pipeline.replace(shadow_pipeline_id).is_some() {
+                        phase.remove(main_entity);
+                    }
+                    phase.add(shadow_pipeline_id, cloud.asset, (entity, main_entity));
+                }
+            }
+            continue;
+        }
+
+        for &(entity, main_entity, cloud, gpu) in &active_clouds {
+            if !layers.intersects(&cloud.layers) {
+                continue;
+            }
+            let cutout = cloud.cutout;
+            let Some(source) = gpu.segments.as_ref() else {
                 continue;
             };
             let [coverage, reverse_dither] = cloud.range.as_ref().map_or([1.0, 0.0], |range| {
@@ -1781,63 +2018,17 @@ fn queue_clouds(
             let segments = gpu.select_segments(
                 clip_from_local,
                 size.y as f32,
-                cloud.detail_scale * if shadow_view { SHADOW_DETAIL } else { 1.0 },
+                cloud.detail_scale,
                 bounds,
-                // A cascade is orthographic, so every segment sits at one
-                // detail depth and a fade would draw two whole levels.
-                shadow_view,
+                false,
                 &mut uniform,
             );
             let mut instances = 0..segments.len() as u32;
-            if shadow_view {
-                // Bake the asset AABB normalization [min, max] into the shadow
-                // transform so unorm16 endpoints dequantize for free on the GPU.
-                let min = Vec3::from(gpu.bounds.min());
-                let extent = (Vec3::from(gpu.bounds.max()) - min).max(Vec3::splat(1e-6));
-                let asset_scale = extent.max_element();
-                let local_from_unit = Mat4::from_cols(
-                    Vec4::new(extent.x, 0.0, 0.0, 0.0),
-                    Vec4::new(0.0, extent.y, 0.0, 0.0),
-                    Vec4::new(0.0, 0.0, extent.z, 0.0),
-                    min.extend(1.0),
-                );
-                uniform.clip_from_local = (clip_from_local * local_from_unit).to_cols_array_2d();
-                let half_viewport = size.as_vec2() * 0.5;
-                let row0 = clip_from_local.row(0).truncate();
-                let row1 = clip_from_local.row(1).truncate();
-                uniform.normal_from_local[0] =
-                    (row0 * (half_viewport.x * asset_scale)).extend(0.0).to_array();
-                uniform.normal_from_local[1] =
-                    (row1 * (half_viewport.y * asset_scale)).extend(0.0).to_array();
-                uniform.pixel_origin =
-                    [row0.length() * asset_scale, row1.length() * asset_scale, 0.0, 0.0];
-                if let Some(sway) = sway {
-                    uniform.pusher = (clip_from_local * sway.extend(0.0)).to_array();
-                } else if cloud.wind.is_some() && inverse_basis.is_some() {
-                    uniform.world_from_local =
-                        (cloud.world_from_local * local_from_unit).to_cols_array_2d();
-                    uniform.eye_relative_from_local = clip_from_world.to_cols_array_2d();
-                }
-            }
             if cutout {
                 // Flow moves segments out of their clusters' boxes.
                 let cull = !cloud.disable_culling && cloud.flow.is_none();
-                // Thin far cascades and over-dense clouds to a power-of-two subset
-                // of each cluster, raising kept segments' optical depth to match.
-                let keep = match light {
-                    Some(&LightEntity::Directional { cascade_index, .. }) => shadow_keep(
-                        cascade_index,
-                        segments.len() as u32,
-                        clip_from_local,
-                        bounds,
-                        size,
-                    ),
-                    _ => CLUSTER_SIZE,
-                };
                 uniform.clusters[0] = draws.clusters.len() as u32;
-                uniform.clusters[1] = if shadow_view { keep.trailing_zeros() } else { keep };
-                uniform.clusters[2] =
-                    (2.0 * (CLUSTER_SIZE as f32 / keep as f32).ln()).to_bits();
+                uniform.clusters[1] = CLUSTER_SIZE;
                 let count = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
@@ -1845,7 +2036,7 @@ fn queue_clouds(
                     (cloud.world_from_local, clip_from_local),
                     Vec3::from(bounds.half_extents - gpu.bounds.half_extents),
                     &uniform,
-                    keep,
+                    CLUSTER_SIZE,
                     &mut draws.clusters,
                 );
                 if count == 0 {
@@ -1853,7 +2044,7 @@ fn queue_clouds(
                 }
                 instances = 0..count;
             }
-            let new_draw = || make_draw(&device, source, gpu, *main_entity, cutout, shadow_view, shadows);
+            let new_draw = || make_draw(&device, source, gpu, main_entity, cutout, false, shadows);
             let draw = draws.draws.entry(key).or_insert_with(new_draw);
             if draw.source.id() != source.id()
                 || draw.order.is_none() != cutout
@@ -1936,9 +2127,9 @@ fn queue_clouds(
             if let Some(phase) = cutout_phase.as_mut().filter(|_| cutout) {
                 if draw.cutout_pipeline != Some(pipeline_id) {
                     if draw.cutout_pipeline.replace(pipeline_id).is_some() {
-                        phase.remove(*main_entity);
+                        phase.remove(main_entity);
                     }
-                    phase.add(pipeline_id, cloud.asset, (entity, *main_entity));
+                    phase.add(pipeline_id, cloud.asset, (entity, main_entity));
                 }
                 continue;
             }
@@ -1954,7 +2145,7 @@ fn queue_clouds(
                 },
                 distance: 0.0,
                 pipeline: pipeline_id,
-                entity: (entity, *main_entity),
+                entity: (entity, main_entity),
                 draw_function,
                 batch_range: 0..1,
                 extra_index: PhaseItemExtraIndex::None,
@@ -1962,23 +2153,53 @@ fn queue_clouds(
             });
         }
     }
-    if !draws.staging.is_empty() {
-        let size = draws.staging.len() as u64;
-        if draws.uniforms.as_ref().is_none_or(|buffer| buffer.size() < size) {
-            draws.uniforms = Some(device.create_buffer(&BufferDescriptor {
-                label: Some("spaghetti draw uniforms"),
-                size: size.next_power_of_two(),
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-        let uniforms = draws.uniforms.as_ref().unwrap();
-        queue.write_buffer(uniforms, 0, &draws.staging);
-        let uniform = BufferBinding {
-            buffer: uniforms,
-            offset: 0,
-            size: NonZeroU64::new(size_of::<DrawUniform>() as u64),
-        };
+    if !draws.staging.is_empty() || !draws.shadow_staging.is_empty() {
+        let uniform = (!draws.staging.is_empty()).then(|| {
+            let size = draws.staging.len() as u64;
+            if draws.uniforms.as_ref().is_none_or(|buffer| buffer.size() < size) {
+                draws.uniforms = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("spaghetti draw uniforms"),
+                    size: size.next_power_of_two(),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let uniforms = draws.uniforms.as_ref().unwrap();
+            queue.write_buffer(uniforms, 0, &draws.staging);
+            (
+                uniforms.id(),
+                BufferBinding {
+                    buffer: uniforms,
+                    offset: 0,
+                    size: NonZeroU64::new(size_of::<DrawUniform>() as u64),
+                },
+            )
+        });
+        let shadow_uniform = (!draws.shadow_staging.is_empty()).then(|| {
+            let size = draws.shadow_staging.len() as u64;
+            if draws
+                .shadow_uniforms
+                .as_ref()
+                .is_none_or(|buffer| buffer.size() < size)
+            {
+                draws.shadow_uniforms = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("spaghetti shadow draw uniforms"),
+                    size: size.next_power_of_two(),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let shadow_uniforms = draws.shadow_uniforms.as_ref().unwrap();
+            queue.write_buffer(shadow_uniforms, 0, &draws.shadow_staging);
+            (
+                shadow_uniforms.id(),
+                BufferBinding {
+                    buffer: shadow_uniforms,
+                    offset: 0,
+                    size: NonZeroU64::new(size_of::<ShadowDrawUniform>() as u64),
+                },
+            )
+        });
         let cluster_size = (draws.clusters.len() * size_of::<u32>()).max(256) as u64;
         if draws.cluster_buffer.as_ref().is_none_or(|buffer| buffer.size() < cluster_size) {
             draws.cluster_buffer = Some(device.create_buffer(&BufferDescriptor {
@@ -1995,34 +2216,46 @@ fn queue_clouds(
         for draw in draws.draws.values_mut().filter(|draw| draw.idle_frames == 0) {
             // Cutouts read their cluster list where sorted draws read the order.
             let listed = draw.order.as_ref().unwrap_or(clusters);
-            if draw.bindings.as_ref().is_some_and(|(uniform_id, listed_id, _)| {
-                *uniform_id == uniforms.id() && *listed_id == listed.id()
-            }) {
-                continue;
-            }
-            let bindings = if draw.shadow {
-                device.create_bind_group(
+            if draw.shadow {
+                let Some((uniform_id, shadow_binding)) = &shadow_uniform else {
+                    continue;
+                };
+                if draw.bindings.as_ref().is_some_and(|(u_id, listed_id, _)| {
+                    *u_id == *uniform_id && *listed_id == listed.id()
+                }) {
+                    continue;
+                }
+                let bindings = device.create_bind_group(
                     "spaghetti shadow draw bindings",
                     &shadow_bind_group_layout,
                     &BindGroupEntries::sequential((
-                        uniform.clone(),
+                        shadow_binding.clone(),
                         draw.source.as_entire_binding(),
                         listed.as_entire_binding(),
                     )),
-                )
+                );
+                draw.bindings = Some((*uniform_id, listed.id(), bindings));
             } else {
-                device.create_bind_group(
+                let Some((uniform_id, uniform_binding)) = &uniform else {
+                    continue;
+                };
+                if draw.bindings.as_ref().is_some_and(|(u_id, listed_id, _)| {
+                    *u_id == *uniform_id && *listed_id == listed.id()
+                }) {
+                    continue;
+                }
+                let bindings = device.create_bind_group(
                     "spaghetti draw bindings",
                     &bind_group_layout,
                     &BindGroupEntries::sequential((
-                        uniform.clone(),
+                        uniform_binding.clone(),
                         draw.source.as_entire_binding(),
                         listed.as_entire_binding(),
                         draw.occlusion.as_ref().unwrap_or(&draw.source).as_entire_binding(),
                     )),
-                )
-            };
-            draw.bindings = Some((uniforms.id(), listed.id(), bindings));
+                );
+                draw.bindings = Some((*uniform_id, listed.id(), bindings));
+            }
         }
     }
     // Binned phases retain draws across frames. Remove entries that fell out

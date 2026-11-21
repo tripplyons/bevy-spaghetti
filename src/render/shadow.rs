@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use bevy::{
+    platform::collections::HashMap,
     prelude::*,
     render::{
         render_resource::{binding_types::*, *},
