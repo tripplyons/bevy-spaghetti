@@ -595,7 +595,12 @@ fn cluster_segments(asset: &SpaghettiAsset) -> (Vec<u32>, Box<[Cluster]>) {
                 center: (low + high) * 0.5,
                 half_extents: (high - low) * 0.5,
             });
-            order.extend(chunk.iter().map(|&(_, index)| index));
+            // Store each cluster in bit-reversed curve order, so that any
+            // prefix of it is an evenly spread subset for thinned shadows.
+            let bits = (chunk.len() as u32).next_power_of_two().trailing_zeros();
+            let mut spread_order: Vec<u32> = (0..chunk.len() as u32).collect();
+            spread_order.sort_by_key(|&slot| slot.reverse_bits() >> (32 - bits.max(1)));
+            order.extend(spread_order.iter().map(|&slot| chunk[slot as usize].1));
         }
     }
     (order, clusters.into())
@@ -614,12 +619,17 @@ impl GpuCloud {
         (world_from_local, clip_from_local): (Mat4, Mat4),
         bending: Vec3,
         uniform: &DrawUniform,
+        keep: u32,
         visible: &mut Vec<u32>,
     ) -> u32 {
         let first = self.clusters.partition_point(|cluster| cluster.first < segments.start);
         let last = self.clusters.partition_point(|cluster| cluster.first < segments.end);
         let clusters = &self.clusters[first..last];
-        let pack = |cluster: &Cluster| (cluster.first << 7) | (cluster.count - 1);
+        // A thinned draw keeps the leading `keep` of every CLUSTER_SIZE.
+        let pack = |cluster: &Cluster| {
+            let count = (cluster.count * keep).div_ceil(CLUSTER_SIZE).max(1);
+            (cluster.first << 7) | (count - 1)
+        };
         // Local planes that the whole cloud does not already satisfy. An
         // infinite plane, such as a cascade's pushed-out near plane, never culls.
         let object = Aabb {
@@ -876,6 +886,10 @@ const FOG_LIGHT_CAPACITY: usize = 10;
 /// Detail scale of shadow casters relative to the main view. Shadow filtering
 /// blurs needles over several texels, so a coarser level casts the same shade.
 const SHADOW_DETAIL: f32 = 2.0;
+// Segments drawn per cluster of CLUSTER_SIZE in each directional cascade.
+// Far cascades have coarse texels where a spread subset with stronger
+// blocking casts the same average shade.
+const SHADOW_KEEP: [u32; 4] = [128, 48, 32, 32];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1478,7 +1492,17 @@ fn queue_clouds(
             if cutout {
                 // Flow moves segments out of their clusters' boxes.
                 let cull = !cloud.disable_culling && cloud.flow.is_none();
+                // Far cascades draw a spread subset of each cluster, and the
+                // shader raises the kept segments' blocking to match.
+                let keep = match light {
+                    Some(&LightEntity::Directional { cascade_index, .. }) => {
+                        SHADOW_KEEP[cascade_index.min(SHADOW_KEEP.len() - 1)]
+                    }
+                    _ => CLUSTER_SIZE,
+                };
                 uniform.clusters[0] = draws.clusters.len() as u32;
+                uniform.clusters[1] = keep;
+                uniform.clusters[2] = (keep as f32 / CLUSTER_SIZE as f32).to_bits();
                 let visible = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
@@ -1486,9 +1510,10 @@ fn queue_clouds(
                     (cloud.world_from_local, clip_from_local),
                     Vec3::from(bounds.half_extents - gpu.bounds.half_extents),
                     &uniform,
+                    keep,
                     &mut draws.clusters,
                 );
-                instances = 0..visible * CLUSTER_SIZE;
+                instances = 0..visible * keep;
             }
             let new_draw = || make_draw(&device, source, gpu, *main_entity, cutout, shadow_view, shadows);
             let draw = draws.draws.entry(key).or_insert_with(new_draw);

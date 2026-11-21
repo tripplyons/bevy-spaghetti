@@ -635,8 +635,9 @@ fn cutout_vertex(
     var out: CutoutRaster;
     // Each visible cluster owns CLUSTER_SIZE instances, and a short cluster
     // leaves the rest empty.
-    let cluster = order[view.clusters.x + slot / CLUSTER_SIZE];
-    let offset = slot % CLUSTER_SIZE;
+    // clusters.y holds the slots per cluster, fewer in thinned cascades.
+    let cluster = order[view.clusters.x + slot / view.clusters.y];
+    let offset = slot % view.clusters.y;
     if offset > (cluster & (CLUSTER_SIZE - 1u)) {
         out.position = vec4(2.0, 2.0, 0.0, 1.0);
         return out;
@@ -793,7 +794,12 @@ fn cutout_shadow_fragment(in: CutoutRaster) {
     let depth = in.profile.y * exp(-0.5 * in.profile.z * distance_squared);
     let pixel = bitcast<vec2<u32>>(vec2<i32>(floor(in.position.xy - view.pixel_origin.xy)));
     let seed = u32(in.profile.x);
-    if hash_unit(pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u ^ seed * 0xcb1ab31fu) >= 1.0 - exp(-depth) {
+    // A thinned cascade keeps a fraction of the segments, and each one
+    // blocks that much more often, so the expected transmittance holds
+    // wherever no single segment is nearly opaque.
+    let kept = bitcast<f32>(view.clusters.z);
+    let block = min(1.0, (1.0 - exp(-depth)) / kept);
+    if hash_unit(pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u ^ seed * 0xcb1ab31fu) >= block {
         discard;
     }
 }
