@@ -625,21 +625,6 @@ pub fn select_rock_detail(
     }
 }
 
-pub fn mark_rock_shadow(
-    ready: On<bevy::world_serialization::WorldInstanceReady>,
-    children: Query<&Children>,
-    meshes: Query<(), With<Mesh3d>>,
-    mut commands: Commands,
-) {
-    for child in children.iter_descendants(ready.entity) {
-        if meshes.contains(child) {
-            commands
-                .entity(child)
-                .insert(RenderLayers::layer(SHADOW_ONLY));
-        }
-    }
-}
-
 pub fn reflected_layers() -> RenderLayers {
     RenderLayers::default().with(REFLECTED_LAYER)
 }

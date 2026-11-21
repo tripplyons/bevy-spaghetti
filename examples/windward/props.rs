@@ -11,7 +11,9 @@ use bevy::{
     prelude::*,
     world_serialization::WorldInstanceReady,
 };
-use bevy_spaghetti::{Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows};
+use bevy_spaghetti::{
+    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiLighting, SpaghettiReceiveShadows,
+};
 
 use crate::{
     debris::LogDetail,
@@ -19,8 +21,7 @@ use crate::{
     forest::ForestDetail,
     lake::REFLECTED_LAYER,
     landscape::{
-        LAKE, LAKE_RADII, Obstacles, ROCKS, SUN, WATER_LEVEL, ground, hash01, mark_rock_shadow,
-        noise, shore_distance, trail_x,
+        LAKE, LAKE_RADII, Obstacles, ROCKS, SUN, WATER_LEVEL, ground, hash01, noise, shore_distance, trail_x,
     },
     player::HikerCamera,
 };
@@ -271,8 +272,8 @@ pub fn spawn_core(commands: &mut Commands, scan: Handle<WorldAsset>, scale: Vec3
         .id()
 }
 
-/// The splats carry the lighting, and the separate scan casts the shadow, so
-/// the core neither casts nor receives shadows.
+/// The splats carry the lighting and cast the shadow, so the core neither
+/// casts nor receives shadows.
 pub fn mark_prop_core(
     ready: On<WorldInstanceReady>,
     children: Query<&Children>,
@@ -354,10 +355,10 @@ pub fn stone_kinds(server: &AssetServer) -> [StoneKind; 4] {
             format!("windward/stone-{name}-far.spag"),
         ]
         .map(|path| load_lit_cloud(server, path));
-        let shadow = server.load(
+        let scan = server.load(
             GltfAssetLabel::Scene(0).from_asset(format!("windward/stones/stone_{name}.gltf")),
         );
-        (clouds, shadow, size)
+        (clouds, scan, size)
     })
 }
 
@@ -392,7 +393,7 @@ fn spawn_stones(
             continue;
         }
         let kind = (hash01(id + 4) * STONES.len() as f32) as usize % STONES.len();
-        let (clouds, shadow, size) = &kinds[kind];
+        let (clouds, scan, size) = &kinds[kind];
         let length = 0.2 + 0.38 * hash01(id + 5).powi(2);
         let scale = length / size.x;
         let reach = 0.5 * length;
@@ -412,7 +413,7 @@ fn spawn_stones(
             "Loose stone",
             transform,
             clouds,
-            shadow,
+            scan,
             (80.0, 30.0),
         );
         clearance.props.push((at, reach));
@@ -429,10 +430,10 @@ pub fn spawn_prop(
     name: &'static str,
     transform: Transform,
     clouds: &[Handle<SpaghettiAsset>; 3],
-    shadow: &Handle<WorldAsset>,
+    scan: &Handle<WorldAsset>,
     (near, middle): (f32, f32),
 ) {
-    let core = spawn_core(commands, shadow.clone(), Vec3::splat(CORE_SCALE));
+    let core = spawn_core(commands, scan.clone(), Vec3::splat(CORE_SCALE));
     commands
         .spawn((
             Name::new(name),
@@ -445,13 +446,10 @@ pub fn spawn_prop(
             },
             LIGHTING,
             SpaghettiReceiveShadows,
+            SpaghettiCastShadows,
             transform,
         ))
         .with_children(|parent| {
-            // This copy of the glTF only casts the shadow.
-            parent
-                .spawn(WorldAssetRoot(shadow.clone()))
-                .observe(mark_rock_shadow);
             parent.spawn((
                 Name::new("Reflected prop"),
                 Spaghetti3d(clouds[2].clone()),

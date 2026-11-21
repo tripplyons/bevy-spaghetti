@@ -8,8 +8,8 @@ use bevy::{
     prelude::*,
 };
 use bevy_spaghetti::{
-    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCutout, SpaghettiLighting,
-    SpaghettiReceiveShadows,
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiCutout,
+    SpaghettiLighting, SpaghettiReceiveShadows,
 };
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
     props,
 };
 
-/// Poly Haven "Dead Tree Trunk" (CC0), kept as the shadow caster.
+/// Poly Haven "Dead Tree Trunk" (CC0), kept as the opaque core under the splats.
 const TRUNK: &str = "windward/deadfall/dead_tree_trunk_1k.gltf";
 /// The same scan converted with spaghetti-convert at 30k, 9k, and 2.5k samples.
 const TRUNK_CLOUDS: [&str; 3] = [
@@ -66,7 +66,7 @@ pub fn spawn_debris(
     ];
     fallen.extend(stand_logs(&fallen));
     // The scan is 3.05 m long and about 0.28 m thick, lying along +X.
-    let shadow = server.load(GltfAssetLabel::Scene(0).from_asset(TRUNK));
+    let scan = server.load(GltfAssetLabel::Scene(0).from_asset(TRUNK));
     let clouds = TRUNK_CLOUDS.map(|path| load_lit_cloud(&server, path));
     for (index, (at, angle, length, radius)) in fallen.into_iter().enumerate() {
         let girth = radius / 0.14;
@@ -79,7 +79,7 @@ pub fn spawn_debris(
         // Keep the length so the core's sawn ends stay under the splats.
         let core = props::spawn_core(
             &mut commands,
-            shadow.clone(),
+            scan.clone(),
             Vec3::new(0.985, props::CORE_SCALE, props::CORE_SCALE),
         );
         commands
@@ -92,6 +92,7 @@ pub fn spawn_debris(
                 },
                 LOG_LIGHTING,
                 SpaghettiReceiveShadows,
+                SpaghettiCastShadows,
                 Transform::from_xyz(at.x, lowest + 0.02 * girth, at.y)
                     .with_rotation(
                         Quat::from_rotation_y(-angle) * Quat::from_rotation_x(roll * 0.15),
@@ -99,9 +100,6 @@ pub fn spawn_debris(
                     .with_scale(Vec3::new(length / 3.05, girth, girth)),
             ))
             .with_children(|parent| {
-                parent
-                    .spawn(WorldAssetRoot(shadow.clone()))
-                    .observe(crate::landscape::mark_rock_shadow);
                 parent.spawn((
                     Name::new("Reflected deadfall"),
                     Spaghetti3d(clouds[2].clone()),

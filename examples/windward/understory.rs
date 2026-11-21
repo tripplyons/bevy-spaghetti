@@ -1,26 +1,23 @@
 //! Ferns and broad-leaf groundcover along the trail.
 //!
-//! The plants are procedural splat clouds from `fern.rs`. Splats cast no
-//! shadows, so each fern keeps the old glTF fern as a shadow-only child.
+//! The plants are procedural splat clouds from `fern.rs`. The ferns cast
+//! their own shadows from the fronds.
 
 use bevy::prelude::*;
 use bevy_spaghetti::{
-    Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiSpecular, SpaghettiTransmission,
+    Spaghetti3d, SpaghettiAsset, SpaghettiCastShadows, SpaghettiLighting, SpaghettiSpecular,
+    SpaghettiTransmission,
 };
 
 use crate::{
     detail::{CameraView, ScreenDetail},
     fern,
-    landscape::{
-        SUN, WATER_LEVEL, ground, hash01, mark_rock_shadow, noise, shore_distance, trail_x,
-    },
+    landscape::{SUN, WATER_LEVEL, ground, hash01, noise, shore_distance, trail_x},
     player::{Hiker, HikerCamera},
 };
 
-const FERN: &str = "windward/fern_02.glb";
-
-/// Reach and height of each fern variant. These match the scenes in
-/// `fern_02.glb` so the shadow-only children fit the splat fronds.
+/// Reach and height of each fern variant. These match the scenes in the
+/// `fern_02.glb` model that the splat fronds replaced.
 const FERN_SHAPES: [(f32, f32); 4] = [(0.48, 0.40), (0.43, 0.32), (0.30, 0.26), (0.31, 0.20)];
 
 /// Reach and height of each broad-leaf variant. These match the scale of the
@@ -51,12 +48,12 @@ pub struct UnderstoryDetail {
 struct Variant {
     clouds: [Handle<SpaghettiAsset>; fern::LEVEL_COUNT],
     size: f32,
-    shadow: Option<Handle<WorldAsset>>,
+    /// Whether the plant is tall enough to cast a shadow.
+    casts_shadow: bool,
 }
 
 pub fn spawn_understory(
     mut commands: Commands,
-    server: Res<AssetServer>,
     mut assets: ResMut<Assets<SpaghettiAsset>>,
 ) {
     let mut cloud =
@@ -69,7 +66,7 @@ pub fn spawn_understory(
                 cloud(fern::fern(index as u32 * 37 + 5, radius, height, level))
             }),
             size: 2.0 * radius,
-            shadow: Some(server.load(GltfAssetLabel::Scene(index).from_asset(FERN))),
+            casts_shadow: true,
         })
         .collect();
     // The groundcover is a few centimeters tall and never cast a shadow.
@@ -86,7 +83,7 @@ pub fn spawn_understory(
                 ))
             }),
             size: 2.0 * radius,
-            shadow: None,
+            casts_shadow: false,
         })
         .collect();
     for (index, at) in [
@@ -217,12 +214,8 @@ fn add_plant(
             phase: hash01(seed + 7),
         },
     ));
-    if let Some(shadow) = &variant.shadow {
-        plant.with_children(|parent| {
-            parent
-                .spawn(WorldAssetRoot(shadow.clone()))
-                .observe(mark_rock_shadow);
-        });
+    if variant.casts_shadow {
+        plant.insert(SpaghettiCastShadows);
     }
 }
 
