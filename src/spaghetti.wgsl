@@ -73,8 +73,9 @@ override BAKED_OCCLUSION: bool = false;
 override SHADOW_CASTER: bool = false;
 // The optical depth at the edge of a shadow caster's footprint.
 const SHADOW_EDGE_DEPTH: f32 = 0.03;
-// The narrowest shadow strip in texels before optical depth is spread.
-const SHADOW_MIN_WIDTH: f32 = 1.0;
+// A sub-texel needle still spans at least 1.3 texels across. This limits
+// raster work while giving thin strips room to move across the texel grid.
+const SHADOW_MIN_WIDTH: f32 = 0.65;
 // Segments per culling cluster, matching the renderer.
 const CLUSTER_SIZE: u32 = 128u;
 

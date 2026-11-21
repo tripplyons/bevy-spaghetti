@@ -607,9 +607,9 @@ fn cluster_segments(asset: &SpaghettiAsset) -> (Vec<u32>, Box<[Cluster]>) {
 }
 
 impl GpuCloud {
-    /// Appends the clusters of `segments` that can draw and returns their
-    /// count. A cluster is dropped when it lies outside a frustum plane or
-    /// outside the depth band where its detail level shows.
+    /// Appends the clusters of `segments` that can draw and returns the
+    /// instance count. A cluster is dropped when it lies outside a frustum
+    /// plane or outside the depth band where its detail level shows.
     #[expect(clippy::too_many_arguments, reason = "one draw's culling inputs")]
     fn cull_clusters(
         &self,
@@ -630,6 +630,7 @@ impl GpuCloud {
             let count = (cluster.count * keep).div_ceil(CLUSTER_SIZE).max(1);
             (cluster.first << 7) | (count - 1)
         };
+        let start = visible.len();
         // Local planes that the whole cloud does not already satisfy. An
         // infinite plane, such as a cascade's pushed-out near plane, never culls.
         let object = Aabb {
@@ -655,37 +656,41 @@ impl GpuCloud {
         let bands = if cull_bands { uniform.detail_ends[3] as usize } else { 0 };
         if planes.is_empty() && bands == 0 {
             visible.extend(clusters.iter().map(pack));
-            return clusters.len() as u32;
-        }
-        let depth = clip_from_local.row(3);
-        let start = visible.len();
-        for cluster in clusters {
-            let half = cluster.half_extents + bending;
-            if planes.iter().any(|plane| {
-                let normal = plane.truncate();
-                normal.dot(cluster.center) + plane.w + normal.abs().dot(half) < 0.0
-            }) {
-                continue;
-            }
-            if bands > 0 {
-                let center = depth.truncate().dot(cluster.center) + depth.w;
-                let radius = depth.truncate().abs().dot(half);
-                // Transitions before this cluster set its level within the draw.
-                let level = uniform.detail_ends[..bands]
-                    .iter()
-                    .filter(|&&end| end <= cluster.first)
-                    .count();
-                // A level shows nearer than its own transition's far edge and
-                // farther than the previous transition's near edge.
-                if (level < bands && center - radius >= uniform.detail_depths[level][1])
-                    || (level > 0 && center + radius <= uniform.detail_depths[level - 1][0])
-                {
+        } else {
+            let depth = clip_from_local.row(3);
+            for cluster in clusters {
+                let half = cluster.half_extents + bending;
+                if planes.iter().any(|plane| {
+                    let normal = plane.truncate();
+                    normal.dot(cluster.center) + plane.w + normal.abs().dot(half) < 0.0
+                }) {
                     continue;
                 }
+                if bands > 0 {
+                    let center = depth.truncate().dot(cluster.center) + depth.w;
+                    let radius = depth.truncate().abs().dot(half);
+                    // Transitions before this cluster set its level within the draw.
+                    let level = uniform.detail_ends[..bands]
+                        .iter()
+                        .filter(|&&end| end <= cluster.first)
+                        .count();
+                    // A level shows nearer than its own transition's far edge and
+                    // farther than the previous transition's near edge.
+                    if (level < bands && center - radius >= uniform.detail_depths[level][1])
+                        || (level > 0 && center + radius <= uniform.detail_depths[level - 1][0])
+                    {
+                        continue;
+                    }
+                }
+                visible.push(pack(cluster));
             }
-            visible.push(pack(cluster));
         }
-        (visible.len() - start) as u32
+        // Earlier clusters still need a fixed stride, but no vertex needs
+        // to run for empty slots after the last cluster.
+        let Some((&last, full_stride)) = visible[start..].split_last() else {
+            return 0;
+        };
+        full_stride.len() as u32 * keep + (last & (CLUSTER_SIZE - 1)) + 1
     }
 
     // Drop complete levels whose bands are outside the depth interval of the
@@ -1510,7 +1515,7 @@ fn queue_clouds(
                 uniform.clusters[0] = draws.clusters.len() as u32;
                 uniform.clusters[1] = keep;
                 uniform.clusters[2] = (CLUSTER_SIZE as f32 / keep as f32).to_bits();
-                let visible = gpu.cull_clusters(
+                let count = gpu.cull_clusters(
                     segments.clone(),
                     cull.then_some(()).and(frustum),
                     cull,
@@ -1520,7 +1525,10 @@ fn queue_clouds(
                     keep,
                     &mut draws.clusters,
                 );
-                instances = 0..visible * keep;
+                if count == 0 {
+                    continue;
+                }
+                instances = 0..count;
             }
             let new_draw = || make_draw(&device, source, gpu, *main_entity, cutout, shadow_view, shadows);
             let draw = draws.draws.entry(key).or_insert_with(new_draw);
@@ -1805,5 +1813,48 @@ mod tests {
             next = range.end;
         }
         assert_eq!(next, 420);
+    }
+
+    #[test]
+    fn cluster_draw_omits_padding_only_after_last_visible_cluster() {
+        let cloud = GpuCloud {
+            segments: None,
+            occlusion: None,
+            centers: Box::new([]),
+            clusters: Box::new([
+                Cluster {
+                    first: 0,
+                    count: 32,
+                    center: Vec3::ZERO,
+                    half_extents: Vec3::ONE,
+                },
+                Cluster {
+                    first: 32,
+                    count: 15,
+                    center: Vec3::ZERO,
+                    half_extents: Vec3::ONE,
+                },
+            ]),
+            bounds: Aabb::from_min_max(-Vec3::ONE, Vec3::ONE),
+            max_bend_height: 0.0,
+            detail: Box::new([]),
+            revision: 0,
+        };
+        let mut visible = vec![0];
+        let mut cull = |segments, keep| {
+            cloud.cull_clusters(
+                segments,
+                None,
+                false,
+                (Mat4::IDENTITY, Mat4::IDENTITY),
+                Vec3::ZERO,
+                &DrawUniform::zeroed(),
+                keep,
+                &mut visible,
+            )
+        };
+        assert_eq!(cull(0..47, CLUSTER_SIZE), CLUSTER_SIZE + 15);
+        assert_eq!(cull(0..47, 48), 48 + 6);
+        assert_eq!(cull(47..47, 48), 0);
     }
 }
