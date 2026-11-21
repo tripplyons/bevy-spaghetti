@@ -31,7 +31,6 @@ struct View {
     directional: vec4<f32>,
     ground_ambient_delta: vec4<f32>,
     eye_relative_from_local: mat4x4<f32>,
-    fog: Fog,
     world_from_local: mat4x4<f32>,
     local_from_world: mat3x3<f32>,
     pusher: vec4<f32>,
@@ -55,9 +54,6 @@ struct View {
     lamp_color: vec4<f32>,
     // Offset of this draw's visible clusters in `order`.
     clusters: vec4<u32>,
-    // The pixel that holds the world origin. Shadow views set it so their
-    // random patterns stay fixed to the ground when the cascade moves.
-    pixel_origin: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -84,6 +80,7 @@ struct SunShadows {
 @group(1) @binding(0) var<uniform> sun_shadow: SunShadows;
 @group(1) @binding(1) var sun_depth: texture_depth_2d_array;
 @group(1) @binding(2) var sun_compare: sampler_comparison;
+@group(1) @binding(3) var<uniform> view_fog: Fog;
 
 fn scene_shadow(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     let depth = dot(sun_shadow.view_depth, vec4(world, 1.0));
@@ -393,18 +390,18 @@ fn clip_interval(range: vec2<f32>, a: f32, b: f32) -> vec2<f32> {
 fn apply_distance_fog(color: vec3<f32>, local_midpoint: vec3<f32>) -> vec3<f32> {
     let eye_to_splat = (view.eye_relative_from_local * vec4(local_midpoint, 1.0)).xyz;
     let distance = length(eye_to_splat);
-    var fog_color = view.fog.color.rgb;
-    if distance > 0.0 && view.fog.light_count.x > 0u {
+    var fog_color = view_fog.color.rgb;
+    if distance > 0.0 && view_fog.light_count.x > 0u {
         let ray = eye_to_splat / distance;
-        for (var i = 0u; i < view.fog.light_count.x; i += 1u) {
-            let light = view.fog.lights[i];
+        for (var i = 0u; i < view_fog.light_count.x; i += 1u) {
+            let light = view_fog.lights[i];
             let alignment = max(dot(ray, light.direction.xyz), 0.0);
-            fog_color += pow(alignment, view.fog.directional_exponent) * light.color.rgb;
+            fog_color += pow(alignment, view_fog.directional_exponent) * light.color.rgb;
         }
     }
-    let strength = view.fog.color.a;
-    let be = view.fog.extinction;
-    switch view.fog.mode {
+    let strength = view_fog.color.a;
+    let be = view_fog.extinction;
+    switch view_fog.mode {
         case 1u: {
             let amount = 1.0 - clamp((be.y - distance) / (be.y - be.x), 0.0, 1.0);
             return mix(color, fog_color, amount * strength);
@@ -418,7 +415,7 @@ fn apply_distance_fog(color: vec3<f32>, local_midpoint: vec3<f32>) -> vec3<f32> 
         }
         case 4u: {
             let extinction = 1.0 - exp(-distance * be);
-            let inscattering = 1.0 - exp(-distance * view.fog.inscattering);
+            let inscattering = 1.0 - exp(-distance * view_fog.inscattering);
             return color * (1.0 - extinction * strength) + fog_color * inscattering * strength;
         }
         default: {
@@ -553,7 +550,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
             let world = (view.world_from_local * vec4((local_start + local_end) * 0.5, 1.0)).xyz;
             color = segment_light(index, color, world, unit, local_end - local_start);
         }
-        if view.fog.mode != 0u {
+        if view_fog.mode != 0u {
             let local_midpoint = mix(local_start, local_end, (span.x + span.y) * 0.5);
             let fogged = apply_distance_fog(color, local_midpoint);
             if view.material.w > 0.0 {
@@ -774,7 +771,7 @@ fn cutout_vertex(
             let world = (view.world_from_local * vec4(local_mid, 1.0)).xyz;
             color = segment_light(instance, color, world, unit, local_b - local_a);
         }
-        if view.fog.mode != 0u {
+        if view_fog.mode != 0u {
             color = apply_distance_fog(color, local_mid);
         }
         var packed_leaf = 0.0;

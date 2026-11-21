@@ -19,7 +19,15 @@ pub struct ReedPatch {
     center: Vec3,
     longest_blade: f32,
     pieces: usize,
+    cat_tails: usize,
     blades: Vec<Blade>,
+}
+
+#[derive(Clone, Copy)]
+struct LinkPreset {
+    sigma: Vec3,
+    mass: f32,
+    tint: Vec3,
 }
 
 struct Blade {
@@ -29,15 +37,77 @@ struct Blade {
     bend: Vec2,
     velocity: Vec2,
     width: f32,
-    color: Vec3,
     twist_rotation: Quat,
     stiffness: f32,
     cat_tail: bool,
-    /// How far the tip has dried to straw, from 0 to 1.
-    dry: f32,
+    /// Precomputed per-link sigma, mass, and tint across pieces = 1, 2, 3
+    /// (offsets 0, 1, 3) so per-tick rebuilds only update positions and rotations.
+    presets: [LinkPreset; 6],
 }
 
+#[inline]
+fn rotation_from_y(axis: Vec3) -> Quat {
+    // `axis` is unit-length with `axis.y > 0`, so the half-angle quaternion
+    // from +Y to `axis` never hits the anti-parallel singularity.
+    Quat::from_xyzw(axis.z, 0.0, -axis.x, 1.0 + axis.y).normalize()
+}
+
+const PRESET_OFFSETS: [usize; PIECES] = [0, 1, 3];
+
 impl Blade {
+    #[expect(clippy::too_many_arguments, reason = "blade construction parameters")]
+    fn new(
+        root: Vec3,
+        length: f32,
+        rest_slope: Vec2,
+        bend: Vec2,
+        width: f32,
+        color: Vec3,
+        twist_rotation: Quat,
+        stiffness: f32,
+        cat_tail: bool,
+        dry: f32,
+    ) -> Self {
+        let mut presets = [LinkPreset {
+            sigma: Vec3::ZERO,
+            mass: 0.0,
+            tint: Vec3::ZERO,
+        }; 6];
+        for pieces in 1..=PIECES {
+            let link_length = length / pieces as f32;
+            let offset = PRESET_OFFSETS[pieces - 1];
+            for (i, &LinkShape { t, .. }) in LINK_SHAPES[pieces - 1][..pieces].iter().enumerate() {
+                let w = width * if cat_tail { 1.0 } else { 1.07 - 0.91 * t };
+                let mut tint =
+                    color * (0.52 + 0.72 * t) + Vec3::new(0.018, 0.022, 0.005) * t * t;
+                if !cat_tail {
+                    // Uneven pigment along the blade, and sun-bleached tips.
+                    let mottle = (root.x * 913.7 + root.z * 377.1 + t * 23.0).sin();
+                    tint *= 1.0 + 0.11 * mottle;
+                    let tip = ((t - 0.68) / 0.32).clamp(0.0, 1.0) * dry;
+                    tint = tint.lerp(Vec3::new(0.30, 0.235, 0.115), tip * tip);
+                }
+                presets[offset + i] = LinkPreset {
+                    sigma: Vec3::new(w, w * 0.64, w * if cat_tail { 1.0 } else { 0.52 }),
+                    mass: link_length * w * 5.2,
+                    tint,
+                };
+            }
+        }
+        Self {
+            root,
+            length,
+            rest_slope,
+            bend,
+            velocity: Vec2::ZERO,
+            width,
+            twist_rotation,
+            stiffness,
+            cat_tail,
+            presets,
+        }
+    }
+
     fn step(&mut self, time: f32, dt: f32, hiker: Vec3) {
         let at = self.root.xz();
         let front = (at.dot(Vec2::new(-0.29, 0.19)) + time * 1.8).sin();
@@ -63,47 +133,41 @@ impl Blade {
         self.bend = (self.bend + self.velocity * dt).clamp_length_max(2.8);
     }
 
-    fn append_splats(&self, links: &[LinkShape], out: &mut Vec<GaussianSegment>) {
+    fn append_splats(
+        &self,
+        links: &[LinkShape],
+        preset_offset: usize,
+        out: &mut Vec<GaussianSegment>,
+    ) {
         let mut start = self.root;
         let link_length = self.length / links.len() as f32;
         let mut axis = Vec3::Y;
-        for &LinkShape { t, bend_weight } in links {
+        let presets = &self.presets[preset_offset..preset_offset + links.len()];
+        for (&LinkShape { t, bend_weight }, preset) in links.iter().zip(presets) {
             let slope = self.rest_slope * t + self.bend * bend_weight;
             axis = Vec3::new(slope.x, 1.0, slope.y).normalize();
             let end = start + axis * link_length;
-            let width = self.width * if self.cat_tail { 1.0 } else { 1.07 - 0.91 * t };
-            let rotation = Quat::from_rotation_arc(Vec3::Y, axis) * self.twist_rotation;
-            let mut tint = self.color * (0.52 + 0.72 * t) + Vec3::new(0.018, 0.022, 0.005) * t * t;
-            if !self.cat_tail {
-                // Uneven pigment along the blade, and sun-bleached tips.
-                let mottle = (self.root.x * 913.7 + self.root.z * 377.1 + t * 23.0).sin();
-                tint *= 1.0 + 0.11 * mottle;
-                let tip = ((t - 0.68) / 0.32).clamp(0.0, 1.0) * self.dry;
-                tint = tint.lerp(Vec3::new(0.30, 0.235, 0.115), tip * tip);
-            }
+            let rotation = rotation_from_y(axis) * self.twist_rotation;
             out.push(GaussianSegment::new(
                 start,
                 end,
-                Vec3::new(
-                    width,
-                    width * 0.64,
-                    width * if self.cat_tail { 1.0 } else { 0.52 },
-                ),
+                preset.sigma,
                 rotation,
-                link_length * width * 5.2,
-                tint,
+                preset.mass,
+                preset.tint,
             ));
             start = end;
         }
         if self.cat_tail {
             let width = self.width * 2.8;
-            let tip = start + axis * (self.length * 0.15);
+            let tip_length = self.length * 0.15;
+            let tip = start + axis * tip_length;
             out.push(GaussianSegment::new(
                 start,
                 tip,
                 Vec3::new(width, width * 0.67, width),
-                Quat::from_rotation_arc(Vec3::Y, axis),
-                tip.distance(start) * width * 6.3,
+                rotation_from_y(axis),
+                tip_length * width * 6.3,
                 Vec3::new(0.045, 0.025, 0.014),
             ));
         }
@@ -175,19 +239,18 @@ pub fn spawn_reeds(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiAs
                 0.0033 + 0.0092 * hash01(s + 4)
             };
             let twist = hash01(s + 5) * std::f32::consts::TAU;
-            bucket.push(Blade {
-                root: Vec3::new(origin.x, ground(origin) - 0.015, origin.y),
+            bucket.push(Blade::new(
+                Vec3::new(origin.x, ground(origin) - 0.015, origin.y),
                 length,
-                rest_slope: direction * spread,
-                bend: Vec2::new(0.13, 0.07),
-                velocity: Vec2::ZERO,
+                direction * spread,
+                Vec2::new(0.13, 0.07),
                 width,
-                color: tint * (0.78 + 0.32 * hash01(s + 6)),
-                twist_rotation: Quat::from_rotation_y(twist),
-                stiffness: blade_stiffness(cat_tail, twist),
+                tint * (0.78 + 0.32 * hash01(s + 6)),
+                Quat::from_rotation_y(twist),
+                blade_stiffness(cat_tail, twist),
                 cat_tail,
-                dry: (hash01(s + 7) * 1.6 - 0.6).max(0.0),
-            });
+                (hash01(s + 7) * 1.6 - 0.6).max(0.0),
+            ));
         }
     }
 
@@ -200,7 +263,8 @@ pub fn spawn_reeds(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiAs
             .iter()
             .map(|blade| blade.length)
             .fold(0.0_f32, f32::max);
-        let cloud = clouds.add(build_cloud(&blades, PIECES));
+        let cat_tails = blades.iter().filter(|blade| blade.cat_tail).count();
+        let cloud = clouds.add(build_cloud(&blades, PIECES, cat_tails));
         commands.spawn((
             Name::new("Root-pinned reed bed"),
             Spaghetti3d(cloud.clone()),
@@ -224,6 +288,7 @@ pub fn spawn_reeds(mut commands: Commands, mut clouds: ResMut<Assets<SpaghettiAs
                 center: Vec3::new(center.x, ground(center) + longest_blade * 0.5, center.y),
                 longest_blade,
                 pieces: PIECES,
+                cat_tails,
             },
         ));
     }
@@ -260,11 +325,12 @@ const LINK_SHAPES: [[LinkShape; PIECES]; PIECES] = [
     ],
 ];
 
-fn build_cloud(blades: &[Blade], pieces: usize) -> SpaghettiAsset {
+fn build_cloud(blades: &[Blade], pieces: usize, cat_tails: usize) -> SpaghettiAsset {
     let links = &LINK_SHAPES[pieces - 1][..pieces];
-    let mut splats = Vec::with_capacity(blades.len() * pieces);
+    let preset_offset = PRESET_OFFSETS[pieces - 1];
+    let mut splats = Vec::with_capacity(blades.len() * pieces + cat_tails);
     for blade in blades {
-        blade.append_splats(links, &mut splats);
+        blade.append_splats(links, preset_offset, &mut splats);
     }
     SpaghettiAsset::new(splats).expect("finite, nonempty reed patch")
 }
@@ -303,7 +369,10 @@ pub fn step_reeds(
         }
         if patch.pieces != pieces || tick.is_multiple_of(interval) {
             clouds
-                .insert(patch.cloud.id(), build_cloud(&patch.blades, pieces))
+                .insert(
+                    patch.cloud.id(),
+                    build_cloud(&patch.blades, pieces, patch.cat_tails),
+                )
                 .expect("the reed entity owns the asset handle");
             patch.pieces = pieces;
         }
@@ -316,25 +385,24 @@ mod tests {
 
     #[test]
     fn gusts_and_contact_bend_the_stem_without_moving_its_root_or_stretching_links() {
-        let mut blade = Blade {
-            root: Vec3::new(2.0, 0.0, -1.0),
-            length: 1.1,
-            rest_slope: Vec2::new(0.17, 0.04),
-            bend: Vec2::ZERO,
-            velocity: Vec2::ZERO,
-            width: 0.011,
-            color: Vec3::new(0.15, 0.22, 0.08),
-            twist_rotation: Quat::from_rotation_y(1.4),
-            stiffness: blade_stiffness(false, 1.4),
-            cat_tail: false,
-            dry: 0.0,
-        };
-        let original = build_cloud(std::slice::from_ref(&blade), PIECES);
+        let mut blade = Blade::new(
+            Vec3::new(2.0, 0.0, -1.0),
+            1.1,
+            Vec2::new(0.17, 0.04),
+            Vec2::ZERO,
+            0.011,
+            Vec3::new(0.15, 0.22, 0.08),
+            Quat::from_rotation_y(1.4),
+            blade_stiffness(false, 1.4),
+            false,
+            0.0,
+        );
+        let original = build_cloud(std::slice::from_ref(&blade), PIECES, 0);
         let dt = 1.0 / 64.0;
         for step in 0..64 {
             blade.step(step as f32 * dt, dt, blade.root - 0.22 * Vec3::X);
         }
-        let brushed = build_cloud(std::slice::from_ref(&blade), PIECES);
+        let brushed = build_cloud(std::slice::from_ref(&blade), PIECES, 0);
         assert!(brushed.segments()[2].end().x > original.segments()[2].end().x + 0.10);
         for pair in brushed.segments().windows(2) {
             assert_eq!(pair[0].end(), pair[1].start());
@@ -348,7 +416,7 @@ mod tests {
         for step in 64..180 {
             blade.step(step as f32 * dt, dt, Vec3::splat(50.0));
         }
-        let recovered = build_cloud(std::slice::from_ref(&blade), PIECES);
+        let recovered = build_cloud(std::slice::from_ref(&blade), PIECES, 0);
         assert!(recovered.segments()[2].end().x < brushed.segments()[2].end().x - 0.09);
     }
 }

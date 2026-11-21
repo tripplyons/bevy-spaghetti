@@ -445,9 +445,14 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
                     && flow.time.is_finite()
                     && flow.velocity.is_finite()
             });
-            let inverse_basis = (sway.is_some() || wind.is_some() || flow.is_some())
-                .then(|| Mat3::from_mat4(world_from_local).inverse())
-                .filter(|inverse| inverse.is_finite());
+            let lighting = lighting.map(|lighting| SpaghettiLighting {
+                direction_to_light: lighting.direction_to_light.normalize_or_zero(),
+                ..*lighting
+            });
+            let inverse_basis =
+                (sway.is_some() || wind.is_some() || flow.is_some() || lighting.is_some())
+                    .then(|| Mat3::from_mat4(world_from_local).inverse())
+                    .filter(|inverse| inverse.is_finite());
             let local_sway = sway
                 .zip(inverse_basis)
                 .map(|(slope, inverse)| inverse * slope)
@@ -459,7 +464,7 @@ impl ExtractComponent<RenderApp> for Spaghetti3d {
                 local_sway,
                 layers: layers.cloned().unwrap_or_default(),
                 disable_culling,
-                lighting: lighting.copied(),
+                lighting,
                 ground_ambient: ground_ambient.copied(),
                 receive_shadows,
                 transmission: transmission.map_or(0.0, |t| t.0.max(0.0)),
@@ -1204,7 +1209,7 @@ struct FogLight {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct FogUniform {
+pub(super) struct FogUniform {
     color: [f32; 4],
     extinction: [f32; 3],
     mode: u32,
@@ -1373,7 +1378,6 @@ struct DrawUniform {
     directional: [f32; 4],
     ground_ambient_delta: [f32; 4],
     eye_relative_from_local: [[f32; 4]; 4],
-    fog: FogUniform,
     world_from_local: [[f32; 4]; 4],
     local_from_world: [[f32; 4]; 3],
     // Pusher position and radius for procedural wind, or local sway vector.
@@ -1401,23 +1405,16 @@ struct DrawUniform {
     lamp_color: [f32; 4],
     // Offset of this draw's visible clusters in the frame's cluster list.
     clusters: [u32; 4],
-    // The pixel that holds the world origin, in whole pixels. Shadow views
-    // key their random patterns to pixels relative to it.
-    pixel_origin: [f32; 4],
 }
 
 impl DrawUniform {
-    fn set_lighting(&mut self, lighting: SpaghettiLighting, world_from_local: Mat4) {
-        let transform = Mat3::from_mat4(world_from_local).inverse().transpose();
-        if transform.is_finite() {
+    fn set_lighting(&mut self, lighting: SpaghettiLighting, inverse_basis: Option<Mat3>) {
+        if let Some(inverse) = inverse_basis {
+            let transform = inverse.transpose();
             self.normal_from_local = [transform.x_axis, transform.y_axis, transform.z_axis]
                 .map(|axis| axis.extend(0.0).to_array());
         }
-        self.direction_to_light = lighting
-            .direction_to_light
-            .normalize_or_zero()
-            .extend(1.0)
-            .to_array();
+        self.direction_to_light = lighting.direction_to_light.extend(1.0).to_array();
         self.ambient = lighting.ambient.extend(0.0).to_array();
         self.directional = lighting.directional.extend(0.0).to_array();
     }
@@ -1462,6 +1459,8 @@ struct ViewDraws {
     cluster_buffer: Option<Buffer>,
     // Reused per-view shadow uniform buffers and bind groups.
     cached_shadows: HashMap<(Entity, u32), CachedShadowBinding>,
+    // Reused per-view distance fog uniform buffers.
+    cached_fog: HashMap<Entity, Buffer>,
 }
 
 type SplatView = (
@@ -1546,7 +1545,12 @@ fn queue_clouds(
     mut pipelines: ResMut<SpecializedRenderPipelines<SplatPipeline>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    (mut depths, mut order): (Local<Vec<(u16, u32)>>, Local<Vec<u32>>),
+    (mut depths, mut order, mut shadow_clouds, mut eyes): (
+        Local<Vec<(u16, u32)>>,
+        Local<Vec<u32>>,
+        Local<Vec<usize>>,
+        Local<Vec<(MainEntity, Vec3)>>,
+    ),
     (cascade_views, sun_lights, shadowless): (
         Query<&LightEntity>,
         Query<&ExtractedDirectionalLight>,
@@ -1579,19 +1583,23 @@ fn queue_clouds(
             Some((entity, *main_entity, cloud, gpu))
         })
         .collect();
-    let shadow_clouds: Vec<usize> = active_clouds
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &(_, _, cloud, gpu))| {
-            (cloud.cast_shadows && gpu.shadow_segments.is_some()).then_some(index)
-        })
-        .collect();
+    shadow_clouds.clear();
+    shadow_clouds.extend(
+        active_clouds
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(_, _, cloud, gpu))| {
+                (cloud.cast_shadows && gpu.shadow_segments.is_some()).then_some(index)
+            }),
+    );
     // Each directional cascade measures visibility ranges from its camera.
-    let eyes: HashMap<MainEntity, Vec3> = views
-        .iter()
-        .filter(|view| view.8.is_none())
-        .map(|view| (view.1.retained_view_entity.main_entity, view.1.world_from_view.translation()))
-        .collect();
+    eyes.clear();
+    eyes.extend(
+        views
+            .iter()
+            .filter(|view| view.8.is_none())
+            .map(|view| (view.1.retained_view_entity.main_entity, view.1.world_from_view.translation())),
+    );
     for (view_entity, view, msaa, frustum, layers, jitter, resolution, shadow_data, light) in &views {
         let shadow_view = match light {
             Some(&LightEntity::Directional { light_entity, .. }) => {
@@ -1606,7 +1614,9 @@ fn queue_clouds(
             let Some(phase) = shadow_phases.get_mut(&view.retained_view_entity) else {
                 continue;
             };
-            let Some(&eye) = view.retained_view_entity.auxiliary_entity.and_then(|camera| eyes.get(&camera)) else {
+            let Some(eye) = view.retained_view_entity.auxiliary_entity.and_then(|camera| {
+                eyes.iter().find_map(|&(entity, pos)| (entity == camera).then_some(pos))
+            }) else {
                 continue;
             };
             (None, Some(CutoutPhase::Shadow(phase, shadow_draw_function)), eye)
@@ -1663,7 +1673,7 @@ fn queue_clouds(
                 )
             });
             let empty_uniform = DrawUniform::zeroed();
-            for &cloud_index in &shadow_clouds {
+            for &cloud_index in shadow_clouds.iter() {
                 let (entity, main_entity, cloud, gpu) = active_clouds[cloud_index];
                 if !layers.intersects(&cloud.layers) {
                     continue;
@@ -1844,6 +1854,21 @@ fn queue_clouds(
             continue;
         }
 
+        let fog_buffer = pipeline.shadows.view_fog_buffer(
+            &device,
+            &queue,
+            &mut draws.cached_fog,
+            view_entity,
+            fog,
+        );
+        let default_shadows = pipeline.shadows.unshadowed_for_view(
+            &device,
+            &cache,
+            &mut draws.cached_shadows,
+            view_entity,
+            fog_buffer,
+        );
+
         for &(entity, main_entity, cloud, gpu) in &active_clouds {
             if !layers.intersects(&cloud.layers) {
                 continue;
@@ -1947,10 +1972,10 @@ fn queue_clouds(
                 uniform.motion[0] = wind.time;
                 uniform.motion[1] = 1.0;
             }
-            let mut shadows = &pipeline.shadows.fallback;
+            let mut shadows = &default_shadows;
             let mut shadowed = false;
-            if let Some(lighting) = cloud.lighting.filter(|_| !shadow_view) {
-                uniform.set_lighting(lighting, cloud.world_from_local);
+            if let Some(lighting) = cloud.lighting {
+                uniform.set_lighting(lighting, inverse_basis);
                 uniform.ambient[3] = cloud.transmission;
                 if let Some(specular) = cloud.specular {
                     uniform.material[0] = specular.strength;
@@ -1993,12 +2018,13 @@ fn queue_clouds(
                             &mut draws.cached_shadows,
                             view_entity,
                             data,
+                            fog_buffer,
                             -view_from_world.row(2),
                             &cascade_views,
                             &sun_lights,
                         )
                     });
-                    let direction = lighting.direction_to_light.normalize_or_zero();
+                    let direction = lighting.direction_to_light;
                     if let Some((_, binding)) = view_shadows.iter()
                         .filter(|(sun, _)| sun.dot(direction) > 0.999)
                         .max_by(|(a, _), (b, _)| a.dot(direction).total_cmp(&b.dot(direction)))
@@ -2008,11 +2034,10 @@ fn queue_clouds(
                     }
                 }
             }
-            if let Some(fog) = fog {
+            if fog.is_some() {
                 let mut eye_relative = cloud.world_from_local;
                 eye_relative.w_axis -= view.world_from_view.translation().extend(0.0);
                 uniform.eye_relative_from_local = eye_relative.to_cols_array_2d();
-                uniform.fog = *fog;
             }
             let key = (view.retained_view_entity, entity);
             let segments = gpu.select_segments(
@@ -2275,6 +2300,9 @@ fn queue_clouds(
     draws
         .cached_shadows
         .retain(|&(view_entity, _), _| views.contains(view_entity));
+    draws
+        .cached_fog
+        .retain(|&view_entity, _| views.contains(view_entity));
 }
 
 fn make_draw(
