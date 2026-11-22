@@ -18,10 +18,11 @@ use bevy::{
     world_serialization::WorldInstanceReady,
 };
 use bevy_spaghetti::{
-    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiSpecular,
+    GaussianSegment, Spaghetti3d, SpaghettiAsset, SpaghettiLighting, SpaghettiReceiveShadows,
+    SpaghettiSpecular,
 };
 
-use crate::landscape::{SUN, hash01};
+use crate::landscape::{SUN, hash01, reflected_layers};
 
 /// A small counter-based stream over `hash01`.
 struct Rng(u32);
@@ -111,12 +112,14 @@ pub fn grow_hair(
             ambient: Vec3::new(0.26, 0.28, 0.31),
             directional: Vec3::new(0.80, 0.68, 0.52),
         },
+        SpaghettiReceiveShadows,
         // Strands reflect the sun in a band across the crown, not a spot.
         SpaghettiSpecular {
             strength: 0.085,
             shininess: 70.0,
             strand: 1.0,
         },
+        reflected_layers(),
         Transform::from_matrix(bindposes[index]),
     ));
 }

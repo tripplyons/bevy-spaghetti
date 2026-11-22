@@ -79,6 +79,7 @@ fn add_scene(app: &mut App) {
         MaterialPlugin::<landscape::GroundMaterial>::default(),
         MaterialPlugin::<lake::LakeMaterial>::default(),
         MaterialPlugin::<backdrop::HighlandMaterial>::default(),
+        MaterialPlugin::<player::HikerMaterial>::default(),
     ))
     .add_plugins(player::HikerPosePlugin)
     .init_resource::<player::Controls>()
@@ -134,6 +135,7 @@ fn add_scene(app: &mut App) {
         (
             animate_hiker,
             follow_hiker,
+            player::sync_hiker_material.after(follow_hiker),
             landscape::select_rock_detail.after(follow_hiker),
             debris::select_log_detail.after(follow_hiker),
             lake::reflect_lake.after(follow_hiker),

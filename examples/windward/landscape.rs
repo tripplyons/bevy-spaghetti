@@ -422,6 +422,7 @@ pub struct RockDetail {
     clouds: [Handle<SpaghettiAsset>; 2],
     scan: Entity,
     level: RockLevel,
+    smooth_normals: bool,
 }
 
 fn spawn_rocks(
@@ -460,6 +461,7 @@ fn spawn_rocks(
     let stone = [
         materials.add(StandardMaterial {
             base_color_texture: Some(load_tile(server, "windward/basalt-color.dds", true)),
+            normal_map_texture: Some(load_tile(server, "windward/trail-normal.dds", false)),
             perceptual_roughness: 0.90,
             reflectance: 0.26,
             ..default()
@@ -520,6 +522,7 @@ fn spawn_rocks(
                     clouds: clouds.clone(),
                     scan,
                     level: RockLevel::Medium,
+                    smooth_normals: variant == 0,
                 },
                 lighting,
                 SpaghettiReceiveShadows,
@@ -550,7 +553,9 @@ pub fn select_rock_detail(
     camera: Single<CameraView, With<crate::player::HikerCamera>>,
     assets: Res<Assets<SpaghettiAsset>>,
     server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<Assets<StandardMaterial>>,
+    mut smoothed_basalt: Local<bool>,
     mut rocks: Query<(
         &Transform,
         &mut RockDetail,
@@ -570,6 +575,14 @@ pub fn select_rock_detail(
         return;
     };
     for (transform, mut detail, mut cloud, mut layers) in &mut rocks {
+        if detail.smooth_normals
+            && !*smoothed_basalt
+            && let Ok((mesh, _, _)) = scans.get(detail.scan)
+            && let Some(mut mesh_asset) = meshes.get_mut(&mesh.0)
+        {
+            crate::detail::smooth_mesh_normals(&mut mesh_asset);
+            *smoothed_basalt = true;
+        }
         let Some(asset) = assets.get(&detail.clouds[0]) else {
             continue;
         };

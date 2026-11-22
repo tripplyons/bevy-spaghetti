@@ -4,13 +4,35 @@ use bevy::{
     animation::{graph::AnimationNodeIndex, transition::AnimationTransitions},
     app::AnimationSystems,
     input::mouse::AccumulatedMouseMotion,
+    pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
+    render::render_resource::{AsBindGroup, ShaderType},
+    shader::ShaderRef,
     transform::TransformSystems,
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
     world_serialization::WorldInstanceReady,
 };
 
-use crate::landscape::{Obstacles, WATER_LEVEL, ground, trail_x};
+use crate::landscape::{Obstacles, SUN, WATER_LEVEL, ground, trail_x};
+
+pub type HikerMaterial = ExtendedMaterial<StandardMaterial, HikerSurface>;
+
+#[derive(ShaderType, Clone, Copy, Debug)]
+struct HikerUniform {
+    sun_and_feet: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+pub struct HikerSurface {
+    #[uniform(100)]
+    uniform: HikerUniform,
+}
+
+impl MaterialExtension for HikerSurface {
+    fn fragment_shader() -> ShaderRef {
+        "windward/hiker.wesl".into()
+    }
+}
 
 const MODEL: &str = "windward/hiker.glb";
 const WALK_SPEED: f32 = 1.9;
@@ -127,8 +149,59 @@ pub fn spawn_hiker(
             },
         ))
         .observe(crate::landscape::mark_reflected_meshes)
+        .observe(upgrade_hiker_material)
         .observe(start_animation)
         .observe(crate::hair::grow_hair);
+}
+
+fn upgrade_hiker_material(
+    ready: On<WorldInstanceReady>,
+    mut commands: Commands,
+    children: Query<&Children>,
+    hikers: Query<&Transform, With<Hiker>>,
+    mesh_materials: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    standard_materials: Res<Assets<StandardMaterial>>,
+    mut hiker_materials: ResMut<Assets<HikerMaterial>>,
+) {
+    let feet_y = hikers
+        .get(ready.entity)
+        .map_or(0.0, |transform| transform.translation.y);
+    for child in children.iter_descendants(ready.entity) {
+        let Ok((mesh, handle)) = mesh_materials.get(child) else {
+            continue;
+        };
+        if let Some(mut mesh_asset) = meshes.get_mut(&mesh.0) {
+            crate::detail::smooth_mesh_normals(&mut mesh_asset);
+        }
+        let Some(base) = standard_materials.get(&handle.0).cloned() else {
+            continue;
+        };
+        let upgraded = hiker_materials.add(ExtendedMaterial {
+            base,
+            extension: HikerSurface {
+                uniform: HikerUniform {
+                    sun_and_feet: SUN.extend(feet_y),
+                },
+            },
+        });
+        commands
+            .entity(child)
+            .remove::<MeshMaterial3d<StandardMaterial>>()
+            .insert(MeshMaterial3d(upgraded));
+    }
+}
+
+pub fn sync_hiker_material(
+    hiker: Single<&Transform, With<Hiker>>,
+    mut materials: ResMut<Assets<HikerMaterial>>,
+) {
+    let feet_y = hiker.translation.y;
+    for (_, material) in materials.iter_mut() {
+        if (material.extension.uniform.sun_and_feet.w - feet_y).abs() > 1e-4 {
+            material.extension.uniform.sun_and_feet.w = feet_y;
+        }
+    }
 }
 
 fn start_animation(

@@ -1,5 +1,55 @@
-use bevy::{asset::AssetPath, camera::MainPassResolutionOverride, prelude::*};
+use bevy::{
+    asset::AssetPath,
+    camera::MainPassResolutionOverride,
+    mesh::VertexAttributeValues,
+    prelude::*,
+};
 use bevy_spaghetti::SpaghettiAsset;
+use std::collections::HashMap;
+
+/// Recomputes area-weighted smooth vertex normals welded by quantized 3D position,
+/// removing hard shading seams on meshes whose exporter split normals across UV islands.
+pub fn smooth_mesh_normals(mesh: &mut Mesh) {
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return;
+    };
+    let positions: Vec<Vec3> = positions.iter().map(|&p| Vec3::from_array(p)).collect();
+    let Some(indices) = mesh.indices() else {
+        return;
+    };
+    let tris: Vec<usize> = indices.iter().collect();
+    let key = |p: Vec3| -> [i32; 3] {
+        [
+            (p.x * 10_000.0).round() as i32,
+            (p.y * 10_000.0).round() as i32,
+            (p.z * 10_000.0).round() as i32,
+        ]
+    };
+    let mut accum: HashMap<[i32; 3], Vec3> = HashMap::with_capacity(positions.len());
+    for tri in tris.chunks_exact(3) {
+        let a = positions[tri[0]];
+        let b = positions[tri[1]];
+        let c = positions[tri[2]];
+        let face = (b - a).cross(c - a);
+        for &idx in tri {
+            *accum.entry(key(positions[idx])).or_insert(Vec3::ZERO) += face;
+        }
+    }
+    let normals: Vec<[f32; 3]> = positions
+        .iter()
+        .map(|&p| {
+            accum
+                .get(&key(p))
+                .copied()
+                .unwrap_or(Vec3::Y)
+                .normalize_or(Vec3::Y)
+                .to_array()
+        })
+        .collect();
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+}
 
 pub fn load_lit_cloud(
     server: &AssetServer,
